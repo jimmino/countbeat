@@ -4,15 +4,52 @@ This project adheres to [Semantic Versioning](http://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.0]
+
 ### Added
+- Add ability to skip validation with new `NoValidate` option. #213
+- Add an option to escape paths with new `PathEscape` option. #210
+- Add `Unwrap` to `baseError` for Go error unwrapping support. #218
 
 ### Changed
-
-### Deprecated
-
-### Removed
+- Update CI to Go 1.24/1.25 and latest GitHub Actions versions. #217, #220, #221
+- Remove vendored dependencies in favor of Go modules. #217
 
 ### Fixed
+- Fix panic from custom string types. #219
+- Fix `reifyStruct` to not use configured fields in inline unpacking. #216
+
+## [0.8.8]
+
+### Changed
+- Set `IgnoreCommas` to `Option` type. #203
+
+## [0.8.7]
+
+### Added
+- Add exported `IgnoreCommas` option to fix parser issues. #197
+
+### Fixed
+- Fix numeric configuration keys handling. #198
+
+## [0.8.6]
+
+### Added
+- Added new ReplaceArrValues Option to replace arrays and merge maps. #193
+
+## [0.8.5]
+
+### Added
+- Added new parse.Config flag to disable using commas to imply arrays. #192
+
+### Changed
+- The parse.NoopConfig disables using commas to imply arrays by default. #192
+
+## [0.8.4]
+
+### Fixed
+- Fixed panic on zero Value while processing a collection of interfaces. #159
+- Preserve empty arrays when reifying #188
 
 ## [0.8.3]
 
@@ -268,7 +305,13 @@ This project adheres to [Semantic Versioning](http://semver.org/).
 - Introduced CHANGELOG.md for documenting changes to ucfg.
 
 
-[Unreleased]: https://github.com/elastic/go-ucfg/compare/v0.8.3...HEAD
+[Unreleased]: https://github.com/elastic/go-ucfg/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/elastic/go-ucfg/compare/v0.8.8...v0.9.0
+[0.8.8]: https://github.com/elastic/go-ucfg/compare/v0.8.7...v0.8.8
+[0.8.7]: https://github.com/elastic/go-ucfg/compare/v0.8.6...v0.8.7
+[0.8.6]: https://github.com/elastic/go-ucfg/compare/v0.8.5...v0.8.6
+[0.8.5]: https://github.com/elastic/go-ucfg/compare/v0.8.4...v0.8.5
+[0.8.4]: https://github.com/elastic/go-ucfg/compare/v0.8.3...v0.8.4
 [0.8.3]: https://github.com/elastic/go-ucfg/compare/v0.8.2...v0.8.3
 [0.8.2]: https://github.com/elastic/go-ucfg/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/elastic/go-ucfg/compare/v0.8.0...v0.8.1

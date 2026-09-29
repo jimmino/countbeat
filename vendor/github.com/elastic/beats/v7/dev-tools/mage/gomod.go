@@ -18,10 +18,9 @@
 package mage
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
-
-	"github.com/pkg/errors"
 
 	"github.com/elastic/beats/v7/dev-tools/mage/gotool"
 )
@@ -33,73 +32,12 @@ type CopyModule struct {
 	FilesToCopy []string
 }
 
-var (
-	copyAll = []CopyModule{
-		CopyModule{
-			Name: "github.com/tsg/go-daemon",
-			FilesToCopy: []string{
-				"src",
-			},
-		},
-		CopyModule{
-			Name: "github.com/godror/godror",
-			FilesToCopy: []string{
-				"odpi",
-			},
-		},
-	}
-	filesToRemove = []string{
-		filepath.Join("github.com", "yuin", "gopher-lua", "parse", "Makefile"),
-		filepath.Join("github.com", "yuin", "gopher-lua", "parse", "parser.go.y"),
-	}
-)
-
-// Vendor cleans up go.mod and copies the files not carried over from modules cache.
-func Vendor() error {
-	mod := gotool.Mod
-
-	err := mod.Tidy()
-	if err != nil {
-		return errors.Wrap(err, "error while running go mod tidy")
-	}
-
-	err = mod.Vendor()
-	if err != nil {
-		return errors.Wrap(err, "error while running go mod vendor")
-	}
-
-	err = mod.Verify()
-	if err != nil {
-		return errors.Wrap(err, "error while running go mod verify")
-	}
-
-	repo, err := GetProjectRepoInfo()
-	if err != nil {
-		return errors.Wrap(err, "error while getting repository information")
-	}
-
-	vendorFolder := filepath.Join(repo.RootDir, "vendor")
-	err = CopyFilesToVendor(vendorFolder, copyAll)
-	if err != nil {
-		return errors.Wrap(err, "error copying required files")
-	}
-
-	for _, p := range filesToRemove {
-		p = filepath.Join(vendorFolder, p)
-		err = os.RemoveAll(p)
-		if err != nil {
-			return errors.Wrapf(err, "error while removing file: %s", p)
-		}
-	}
-	return nil
-}
-
 // CopyFilesToVendor copies packages which require the whole tree
 func CopyFilesToVendor(vendorFolder string, modulesToCopy []CopyModule) error {
 	for _, p := range modulesToCopy {
 		path, err := gotool.ListModuleCacheDir(p.Name)
 		if err != nil {
-			return errors.Wrapf(err, "error while looking up cached dir of module: %s", p.Name)
+			return fmt.Errorf("error while looking up cached dir of module: %s: %w", p.Name, err)
 		}
 
 		for _, f := range p.FilesToCopy {
@@ -108,7 +46,7 @@ func CopyFilesToVendor(vendorFolder string, modulesToCopy []CopyModule) error {
 			copyTask := &CopyTask{Source: from, Dest: to, Mode: 0600, DirMode: os.ModeDir | 0750}
 			err = copyTask.Execute()
 			if err != nil {
-				return errors.Wrapf(err, "error while copying file from %s to %s", from, to)
+				return fmt.Errorf("error while copying file from %s to %s: %w", from, to, err)
 			}
 		}
 	}

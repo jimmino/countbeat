@@ -18,28 +18,28 @@
 package mage
 
 import (
+	"fmt"
 	"sort"
 	"strings"
-
-	"github.com/pkg/errors"
 )
 
 // BuildPlatforms is a list of GOOS/GOARCH pairs supported by Go.
 // The list originated from 'go tool dist list -json'.
 var BuildPlatforms = BuildPlatformList{
+	{"aix/ppc64", CGOSupported},
 	{"android/386", CGOSupported},
 	{"android/amd64", CGOSupported},
 	{"android/arm", CGOSupported},
 	{"android/arm64", CGOSupported},
-	{"darwin/386", CGOSupported | CrossBuildSupported},
+	{"darwin/386", 0},
 	{"darwin/amd64", CGOSupported | CrossBuildSupported | Default},
 	{"darwin/arm", CGOSupported},
-	{"darwin/arm64", CGOSupported},
+	{"darwin/arm64", CGOSupported | CrossBuildSupported | Default},
 	{"dragonfly/amd64", CGOSupported},
 	{"freebsd/386", CGOSupported},
 	{"freebsd/amd64", CGOSupported},
 	{"freebsd/arm", 0},
-	{"linux/386", CGOSupported | CrossBuildSupported | Default},
+	{"linux/386", 0},
 	{"linux/amd64", CGOSupported | CrossBuildSupported | Default},
 	{"linux/armv5", CGOSupported | CrossBuildSupported},
 	{"linux/armv6", CGOSupported | CrossBuildSupported},
@@ -65,8 +65,9 @@ var BuildPlatforms = BuildPlatformList{
 	{"plan9/amd64", 0},
 	{"plan9/arm", 0},
 	{"solaris/amd64", CGOSupported},
-	{"windows/386", CGOSupported | CrossBuildSupported | Default},
+	{"windows/386", 0},
 	{"windows/amd64", CGOSupported | CrossBuildSupported | Default},
+	{"windows/arm64", CGOSupported | CrossBuildSupported | Default},
 }
 
 // PlatformFeature specifies features that are supported for a platform.
@@ -151,8 +152,8 @@ func (p BuildPlatform) GOARCH() string {
 // GOARM returns the ARM version.
 func (p BuildPlatform) GOARM() string {
 	arch := p.Arch()
-	if strings.HasPrefix(arch, "armv") {
-		return strings.TrimPrefix(arch, "armv")
+	if after, ok := strings.CutPrefix(arch, "armv"); ok {
+		return after
 	}
 	return ""
 }
@@ -249,6 +250,7 @@ func (list BuildPlatformList) Remove(name string) BuildPlatformList {
 	}
 
 	return list.filter(func(bp BuildPlatform) bool {
+		//nolint:staticcheck // leaving as-is since some find it easier to read
 		return !(bp.GOOS() == attrs.GOOS && bp.Arch() == attrs.Arch)
 	})
 }
@@ -256,7 +258,6 @@ func (list BuildPlatformList) Remove(name string) BuildPlatformList {
 // Select returns a new list containing the platforms that match name.
 func (list BuildPlatformList) Select(name string) BuildPlatformList {
 	attrs := BuildPlatform{Name: name}.Attributes()
-
 	if attrs.Arch == "" {
 		// Filter by GOOS only.
 		return list.filter(func(bp BuildPlatform) bool {
@@ -286,10 +287,10 @@ func newPlatformExpression(expr string) (*platformExpression, error) {
 	// Parse the expression.
 	words := strings.FieldsFunc(expr, isSeparator)
 	for _, w := range words {
-		if strings.HasPrefix(w, "+") {
-			pe.Add = append(pe.Add, strings.TrimPrefix(w, "+"))
-		} else if strings.HasPrefix(w, "!") {
-			pe.Remove = append(pe.Remove, strings.TrimPrefix(w, "!"))
+		if after, ok := strings.CutPrefix(w, "+"); ok {
+			pe.Add = append(pe.Add, after)
+		} else if after, ok := strings.CutPrefix(w, "!"); ok {
+			pe.Remove = append(pe.Remove, after)
 		} else if w == "xbuild" {
 			pe.SelectCrossBuild = true
 		} else {
@@ -317,7 +318,7 @@ func newPlatformExpression(expr string) (*platformExpression, error) {
 		}
 
 		if !valid {
-			return nil, errors.Errorf("invalid platform in expression: %v", name)
+			return nil, fmt.Errorf("invalid platform in expression: %v", name)
 		}
 	}
 
@@ -326,13 +327,13 @@ func newPlatformExpression(expr string) (*platformExpression, error) {
 
 // NewPlatformList returns a new BuildPlatformList based on given expression.
 //
-// By default the initial set include only the platforms designated as defaults.
+// By default, the initial set include only the platforms designated as defaults.
 // To add additional platforms to list use an addition term that is designated
 // with a plug sign (e.g. "+netbsd" or "+linux/armv7"). Or you may use "+all"
 // to change the initial set to include all possible platforms then filter
 // from there (e.g. "+all linux windows").
 //
-// The expression can consists of selections (e.g. "linux") and/or
+// The expression can consist of selections (e.g. "linux") and/or
 // removals (e.g."!windows"). Each term can be valid GOOS or a valid GOOS/Arch
 // pair.
 //
@@ -353,8 +354,11 @@ func NewPlatformList(expr string) BuildPlatformList {
 
 	var out BuildPlatformList
 	if len(pe.Add) == 0 || (len(pe.Select) == 0 && len(pe.Remove) == 0) {
-		// Bootstrap list with default platforms when the expression is
+		// Bootstrap list with platforms when the expression is
 		// exclusively adds OR exclusively selects and removes.
+		out = BuildPlatforms
+	}
+	if len(pe.Remove) > 0 || len(pe.Add) > 0 {
 		out = BuildPlatforms.Defaults()
 	}
 
@@ -375,7 +379,6 @@ func NewPlatformList(expr string) BuildPlatformList {
 		}
 		out = selected
 	}
-
 	for _, name := range pe.Remove {
 		if name == "defaults" {
 			for _, defaultBP := range all.Defaults() {
@@ -411,7 +414,7 @@ func (list BuildPlatformList) Filter(expr string) BuildPlatformList {
 		return list
 	}
 	if len(pe.Add) > 0 {
-		panic(errors.Errorf("adds (%v) cannot be used in filter expressions",
+		panic(fmt.Errorf("adds (%v) cannot be used in filter expressions",
 			strings.Join(pe.Add, ", ")))
 	}
 
@@ -447,8 +450,7 @@ func (list BuildPlatformList) Filter(expr string) BuildPlatformList {
 
 // Merge creates a new list with the two list merged.
 func (list BuildPlatformList) Merge(with BuildPlatformList) BuildPlatformList {
-	out := make(BuildPlatformList, 0, len(list)+len(with))
-	out = append(list, with...)
+	out := append(list, with...)
 	out = append(out, with...)
 	return out.deduplicate()
 }

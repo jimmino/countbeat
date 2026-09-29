@@ -22,34 +22,17 @@ import (
 	"fmt"
 
 	"github.com/elastic/beats/v7/libbeat/beat"
-	"github.com/elastic/beats/v7/libbeat/common"
-)
-
-// Format encodes the type of format to report monitoring data in. This
-// is currently only being used by the elaticsearch reporter.
-// This is a hack that is necessary so we can map certain monitoring
-// configuration options to certain behaviors in reporters. Depending on
-// the configuration option used, the correct format is set, and reporters
-// that know how to interpret the format use it to choose the appropriate
-// reporting behavior.
-type Format int
-
-// Enumerations of various Formats. A reporter can choose whether to
-// interpret this setting or not, and if so, how to interpret it.
-const (
-	FormatUnknown Format = iota // to protect against zero-value errors
-	FormatXPackMonitoringBulk
-	FormatBulk
+	"github.com/elastic/beats/v7/libbeat/beatmonitoring"
+	conf "github.com/elastic/elastic-agent-libs/config"
 )
 
 type config struct {
 	// allow for maximum one reporter being configured
-	Reporter common.ConfigNamespace `config:",inline"`
+	Reporter conf.Namespace `config:",inline"`
 }
 
 type Settings struct {
 	DefaultUsername string
-	Format          Format
 	ClusterUUID     string
 }
 
@@ -57,7 +40,11 @@ type Reporter interface {
 	Stop()
 }
 
-type ReporterFactory func(beat.Info, Settings, *common.Config) (Reporter, error)
+type ReporterFactory func(beat.Info, beatmonitoring.Monitoring, Settings, *conf.C) (Reporter, error)
+
+type hostsCfg struct {
+	Hosts []string `config:"hosts"`
+}
 
 var (
 	defaultConfig = config{}
@@ -74,11 +61,12 @@ func RegisterReporterFactory(name string, f ReporterFactory) {
 
 func New(
 	beat beat.Info,
+	mon beatmonitoring.Monitoring,
 	settings Settings,
-	cfg *common.Config,
-	outputs common.ConfigNamespace,
+	cfg *conf.C,
+	outputs conf.Namespace,
 ) (Reporter, error) {
-	name, cfg, err := getReporterConfig(cfg, settings, outputs)
+	name, cfg, err := getReporterConfig(cfg, outputs)
 	if err != nil {
 		return nil, err
 	}
@@ -88,14 +76,13 @@ func New(
 		return nil, fmt.Errorf("unknown reporter type '%v'", name)
 	}
 
-	return f(beat, settings, cfg)
+	return f(beat, mon, settings, cfg)
 }
 
 func getReporterConfig(
-	monitoringConfig *common.Config,
-	settings Settings,
-	outputs common.ConfigNamespace,
-) (string, *common.Config, error) {
+	monitoringConfig *conf.C,
+	outputs conf.Namespace,
+) (string, *conf.C, error) {
 	cfg := collectSubObject(monitoringConfig)
 	config := defaultConfig
 	if err := cfg.Unpack(&config); err != nil {
@@ -110,23 +97,17 @@ func getReporterConfig(
 
 		// merge reporter config with output config if both are present
 		if outCfg := outputs.Config(); outputs.Name() == name && outCfg != nil {
-			// require monitoring to not configure any hosts if output is configured:
-			hosts := struct {
-				Hosts []string `config:"hosts"`
-			}{}
-			rc.Unpack(&hosts)
-
-			if settings.Format == FormatXPackMonitoringBulk && len(hosts.Hosts) > 0 {
-				pathMonHosts := rc.PathOf("hosts")
-				pathOutHost := outCfg.PathOf("hosts")
-				err := fmt.Errorf("'%v' and '%v' are configured", pathMonHosts, pathOutHost)
-				return "", nil, err
-			}
-
-			merged, err := common.MergeConfigs(outCfg, rc)
+			merged, err := conf.MergeConfigs(outCfg, rc)
 			if err != nil {
 				return "", nil, err
 			}
+
+			// Make sure hosts from reporter configuration get precedence over hosts
+			// from output configuration
+			if err := mergeHosts(merged, outCfg, rc); err != nil {
+				return "", nil, err
+			}
+
 			rc = merged
 		}
 
@@ -141,17 +122,58 @@ func getReporterConfig(
 		}
 	}
 
-	return "", nil, errors.New("No monitoring reporter configured")
+	return "", nil, errors.New("no monitoring reporter configured")
 }
 
-func collectSubObject(cfg *common.Config) *common.Config {
-	out := common.NewConfig()
+func collectSubObject(cfg *conf.C) *conf.C {
+	out := conf.NewConfig()
 	for _, field := range cfg.GetFields() {
 		if obj, err := cfg.Child(field, -1); err == nil {
 			// on error field is no object, but primitive value -> ignore
-			out.SetChild(field, -1, obj)
+			out.SetChild(field, -1, obj) //nolint:errcheck // this error is safe to ignore
 			continue
 		}
 	}
 	return out
+}
+
+func mergeHosts(merged, outCfg, reporterCfg *conf.C) error {
+	if merged == nil {
+		merged = conf.NewConfig()
+	}
+
+	outputHosts := hostsCfg{}
+	if outCfg != nil {
+		if err := outCfg.Unpack(&outputHosts); err != nil {
+			return fmt.Errorf("unable to parse hosts from output config: %w", err)
+		}
+	}
+
+	reporterHosts := hostsCfg{}
+	if reporterCfg != nil {
+		if err := reporterCfg.Unpack(&reporterHosts); err != nil {
+			return fmt.Errorf("unable to parse hosts from reporter config: %w", err)
+		}
+	}
+
+	if len(outputHosts.Hosts) == 0 && len(reporterHosts.Hosts) == 0 {
+		return nil
+	}
+
+	// Give precedence to reporter hosts over output hosts
+	var newHostsCfg *conf.C
+	var err error
+	if len(reporterHosts.Hosts) > 0 {
+		newHostsCfg, err = conf.NewConfigFrom(reporterHosts.Hosts)
+	} else {
+		newHostsCfg, err = conf.NewConfigFrom(outputHosts.Hosts)
+	}
+	if err != nil {
+		return fmt.Errorf("unable to make config from new hosts: %w", err)
+	}
+
+	if err := merged.SetChild("hosts", -1, newHostsCfg); err != nil {
+		return fmt.Errorf("unable to set new hosts into merged config: %w", err)
+	}
+	return nil
 }

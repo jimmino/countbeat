@@ -19,18 +19,18 @@ package console
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"os"
 	"runtime"
-	"time"
 
 	"github.com/elastic/beats/v7/libbeat/beat"
-	"github.com/elastic/beats/v7/libbeat/common"
-	"github.com/elastic/beats/v7/libbeat/logp"
 	"github.com/elastic/beats/v7/libbeat/outputs"
 	"github.com/elastic/beats/v7/libbeat/outputs/codec"
 	"github.com/elastic/beats/v7/libbeat/outputs/codec/json"
 	"github.com/elastic/beats/v7/libbeat/publisher"
+	"github.com/elastic/elastic-agent-libs/config"
+	"github.com/elastic/elastic-agent-libs/logp"
 )
 
 type console struct {
@@ -42,13 +42,6 @@ type console struct {
 	index    string
 }
 
-type consoleEvent struct {
-	Timestamp time.Time `json:"@timestamp" struct:"@timestamp"`
-
-	// Note: stdlib json doesn't support inlining :( -> use `codec: 2`, to generate proper event
-	Fields interface{} `struct:",inline"`
-}
-
 func init() {
 	outputs.RegisterType("console", makeConsole)
 }
@@ -57,10 +50,11 @@ func makeConsole(
 	_ outputs.IndexManager,
 	beat beat.Info,
 	observer outputs.Observer,
-	cfg *common.Config,
+	cfg *config.C,
 ) (outputs.Group, error) {
 	config := defaultConfig
 	err := cfg.Unpack(&config)
+
 	if err != nil {
 		return outputs.Fail(err)
 	}
@@ -79,30 +73,30 @@ func makeConsole(
 	}
 
 	index := beat.Beat
-	c, err := newConsole(index, observer, enc)
+	c, err := newConsole(index, observer, enc, beat.Logger)
 	if err != nil {
-		return outputs.Fail(fmt.Errorf("console output initialization failed with: %v", err))
+		return outputs.Fail(fmt.Errorf("console output initialization failed with: %w", err))
 	}
 
 	// check stdout actually being available
 	if runtime.GOOS != "windows" {
 		if _, err = c.out.Stat(); err != nil {
-			err = fmt.Errorf("console output initialization failed with: %v", err)
+			err = fmt.Errorf("console output initialization failed with: %w", err)
 			return outputs.Fail(err)
 		}
 	}
 
-	return outputs.Success(config.BatchSize, 0, c)
+	return outputs.Success(config.Queue, config.BatchSize, 0, nil, beat.Logger, beat.Paths, c)
 }
 
-func newConsole(index string, observer outputs.Observer, codec codec.Codec) (*console, error) {
-	c := &console{log: logp.NewLogger("console"), out: os.Stdout, codec: codec, observer: observer, index: index}
+func newConsole(index string, observer outputs.Observer, codec codec.Codec, logger *logp.Logger) (*console, error) {
+	c := &console{log: logger.Named("console"), out: os.Stdout, codec: codec, observer: observer, index: index}
 	c.writer = bufio.NewWriterSize(c.out, 8*1024)
 	return c, nil
 }
 
 func (c *console) Close() error { return nil }
-func (c *console) Publish(batch publisher.Batch) error {
+func (c *console) Publish(_ context.Context, batch publisher.Batch) error {
 	st := c.observer
 	events := batch.Events()
 	st.NewBatch(len(events))
@@ -118,8 +112,8 @@ func (c *console) Publish(batch publisher.Batch) error {
 	c.writer.Flush()
 	batch.ACK()
 
-	st.Dropped(dropped)
-	st.Acked(len(events) - dropped)
+	st.PermanentErrors(dropped)
+	st.AckedEvents(len(events) - dropped)
 
 	return nil
 }

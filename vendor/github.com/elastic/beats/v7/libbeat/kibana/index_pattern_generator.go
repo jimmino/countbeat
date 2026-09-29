@@ -19,38 +19,36 @@ package kibana
 
 import (
 	"encoding/json"
-	"io/ioutil"
-	"os"
-	"path/filepath"
 	"regexp"
 
-	"github.com/elastic/beats/v7/libbeat/common"
 	"github.com/elastic/beats/v7/libbeat/mapping"
+	"github.com/elastic/elastic-agent-libs/mapstr"
+	"github.com/elastic/elastic-agent-libs/version"
 )
 
 type IndexPatternGenerator struct {
 	indexName   string
 	beatVersion string
 	fields      []byte
-	version     common.Version
+	version     version.V
 	migration   bool
 }
 
 // Create an instance of the Kibana Index Pattern Generator
-func NewGenerator(indexName, beatName string, fields []byte, beatVersion string, version common.Version, migration bool) (*IndexPatternGenerator, error) {
+func NewGenerator(indexName, beatName string, fields []byte, beatVersion string, v version.V, migration bool) (*IndexPatternGenerator, error) {
 	beatName = clean(beatName)
 
 	return &IndexPatternGenerator{
 		indexName:   indexName + "-*",
 		fields:      fields,
 		beatVersion: beatVersion,
-		version:     version,
+		version:     v,
 		migration:   migration,
 	}, nil
 }
 
 // Generate creates the Index-Pattern for Kibana.
-func (i *IndexPatternGenerator) Generate() (common.MapStr, error) {
+func (i *IndexPatternGenerator) Generate() (mapstr.M, error) {
 	idxPattern, err := i.generate()
 	if err != nil {
 		return nil, err
@@ -59,8 +57,8 @@ func (i *IndexPatternGenerator) Generate() (common.MapStr, error) {
 	return i.generatePattern(idxPattern), nil
 }
 
-func (i *IndexPatternGenerator) generate() (common.MapStr, error) {
-	indexPattern := common.MapStr{
+func (i *IndexPatternGenerator) generate() (mapstr.M, error) {
+	indexPattern := mapstr.M{
 		"timeFieldName": "@timestamp",
 		"title":         i.indexName,
 	}
@@ -78,29 +76,24 @@ func (i *IndexPatternGenerator) generate() (common.MapStr, error) {
 	return indexPattern, nil
 }
 
-func (i *IndexPatternGenerator) generatePattern(attrs common.MapStr) common.MapStr {
-	out := common.MapStr{
-		"version": i.beatVersion,
-		"objects": []common.MapStr{
-			common.MapStr{
-				"type":       "index-pattern",
-				"id":         i.indexName,
-				"version":    "1",
-				"attributes": attrs,
-			},
-		},
+func (i *IndexPatternGenerator) generatePattern(attrs mapstr.M) mapstr.M {
+	out := mapstr.M{
+		"type":       "index-pattern",
+		"id":         i.indexName,
+		"version":    i.beatVersion,
+		"attributes": attrs,
 	}
 
 	return out
 }
 
-func (i *IndexPatternGenerator) addGeneral(indexPattern *common.MapStr) error {
+func (i *IndexPatternGenerator) addGeneral(indexPattern *mapstr.M) error {
 	kibanaEntries, err := loadKibanaEntriesFromYaml(i.fields)
 	if err != nil {
 		return err
 	}
 	transformed := newTransformer(kibanaEntries).transform()
-	if srcFilters, ok := transformed["sourceFilters"].([]common.MapStr); ok {
+	if srcFilters, ok := transformed["sourceFilters"].([]mapstr.M); ok {
 		sourceFiltersBytes, err := json.Marshal(srcFilters)
 		if err != nil {
 			return err
@@ -110,7 +103,7 @@ func (i *IndexPatternGenerator) addGeneral(indexPattern *common.MapStr) error {
 	return nil
 }
 
-func (i *IndexPatternGenerator) addFieldsSpecific(indexPattern *common.MapStr) error {
+func (i *IndexPatternGenerator) addFieldsSpecific(indexPattern *mapstr.M) error {
 	fields, err := mapping.LoadFields(i.fields)
 	if err != nil {
 		return err
@@ -141,28 +134,4 @@ func (i *IndexPatternGenerator) addFieldsSpecific(indexPattern *common.MapStr) e
 func clean(name string) string {
 	reg := regexp.MustCompile("[^a-zA-Z0-9_]+")
 	return reg.ReplaceAllString(name, "")
-}
-
-func dumpToFile(f string, pattern common.MapStr) error {
-	patternIndent, err := json.MarshalIndent(pattern, "", "  ")
-	if err != nil {
-		return err
-	}
-	err = ioutil.WriteFile(f, patternIndent, 0644)
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-func createTargetDir(baseDir string, version common.Version) string {
-	targetDir := filepath.Join(baseDir, getVersionPath(version), "index-pattern")
-	if _, err := os.Stat(targetDir); os.IsNotExist(err) {
-		os.MkdirAll(targetDir, 0755)
-	}
-	return targetDir
-}
-
-func getVersionPath(version common.Version) string {
-	return "7"
 }

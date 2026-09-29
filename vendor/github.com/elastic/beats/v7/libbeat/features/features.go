@@ -1,0 +1,135 @@
+// Licensed to Elasticsearch B.V. under one or more contributor
+// license agreements. See the NOTICE file distributed with
+// this work for additional information regarding copyright
+// ownership. Elasticsearch B.V. licenses this file to you under
+// the Apache License, Version 2.0 (the "License"); you may
+// not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+package features
+
+import (
+	"fmt"
+	"sync"
+	"sync/atomic"
+
+	conf "github.com/elastic/elastic-agent-libs/config"
+)
+
+var (
+	flags = fflags{}
+)
+
+type boolValueOnChangeCallback func(new, old bool)
+
+type fflags struct {
+	// controls access to the callback hashmap
+	callbackMut sync.RWMutex
+
+	// TODO: Refactor to generalize for other feature flags
+	fqdnEnabled   atomic.Bool
+	fqdnCallbacks map[string]boolValueOnChangeCallback
+
+	logRunAsFilestream atomic.Bool
+	awsS3V2            atomic.Bool
+}
+
+// UpdateFromConfig updates the feature flags configuration. If c is nil UpdateFromConfig is no-op.
+func UpdateFromConfig(c *conf.C) error {
+	if c == nil {
+		return nil
+	}
+
+	type cfg struct {
+		Features struct {
+			FQDN               *conf.C `json:"fqdn" yaml:"fqdn" config:"fqdn"`
+			LogRunAsFilestream *conf.C `json:"log_input_run_as_filestream" config:"log_input_run_as_filestream"`
+			AwsS3V2            *conf.C `json:"aws_s3_v2" yaml:"aws_s3_v2" config:"aws_s3_v2"`
+		} `json:"features" yaml:"features" config:"features"`
+	}
+
+	parsedFlags := cfg{}
+	if err := c.Unpack(&parsedFlags); err != nil {
+		return fmt.Errorf("could not unpack features config: %w", err)
+	}
+
+	flags.SetFQDNEnabled(parsedFlags.Features.FQDN.Enabled())
+	flags.SetLogInputRunFilestream(parsedFlags.Features.LogRunAsFilestream.Enabled())
+	flags.SetAwsS3V2(parsedFlags.Features.AwsS3V2.Enabled())
+
+	return nil
+}
+
+func (f *fflags) SetFQDNEnabled(newValue bool) {
+	f.callbackMut.Lock()
+	defer f.callbackMut.Unlock()
+	oldValue := f.fqdnEnabled.Swap(newValue)
+
+	for _, cb := range f.fqdnCallbacks {
+		cb(newValue, oldValue)
+	}
+}
+
+// FQDN reports if FQDN should be used instead of hostname for host.name.
+// If it hasn't been set by UpdateFromConfig or UpdateFromProto, it returns false.
+func FQDN() bool {
+	return flags.fqdnEnabled.Load()
+}
+
+// AddFQDNOnChangeCallback takes a callback function that will be called with the new and old values
+// of `flags.fqdnEnabled` whenever it changes. It also takes a string ID - this is useful
+// in calling `RemoveFQDNOnChangeCallback` to de-register the callback.
+// if the ID already exists, this returns an error.
+func AddFQDNOnChangeCallback(cb boolValueOnChangeCallback, id string) error {
+	flags.callbackMut.Lock()
+	defer flags.callbackMut.Unlock()
+
+	// Initialize callbacks map if necessary.
+	if flags.fqdnCallbacks == nil {
+		flags.fqdnCallbacks = map[string]boolValueOnChangeCallback{}
+	}
+
+	if _, ok := flags.fqdnCallbacks[id]; ok {
+		return fmt.Errorf("callback with ID %s already registered", id)
+	}
+
+	flags.fqdnCallbacks[id] = cb
+	return nil
+}
+
+// RemoveFQDNOnChangeCallback removes the callback function associated with the given ID (originally
+// returned by `AddFQDNOnChangeCallback` so that function will be no longer be called when
+// `flags.fqdnEnabled` changes.
+func RemoveFQDNOnChangeCallback(id string) {
+	flags.callbackMut.Lock()
+	defer flags.callbackMut.Unlock()
+
+	delete(flags.fqdnCallbacks, id)
+}
+
+func LogInputRunFilestream() bool {
+	return flags.logRunAsFilestream.Load()
+}
+
+func (f *fflags) SetLogInputRunFilestream(v bool) {
+	f.logRunAsFilestream.Store(v)
+}
+
+// AwsS3V2 reports whether the aws-s3 input should use the V2
+// implementation. Defaults to false (legacy implementation).
+func AwsS3V2() bool {
+	return flags.awsS3V2.Load()
+}
+
+func (f *fflags) SetAwsS3V2(v bool) {
+	f.awsS3V2.Store(v)
+}

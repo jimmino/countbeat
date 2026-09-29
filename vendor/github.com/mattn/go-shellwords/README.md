@@ -2,7 +2,8 @@
 
 [![codecov](https://codecov.io/gh/mattn/go-shellwords/branch/master/graph/badge.svg)](https://codecov.io/gh/mattn/go-shellwords)
 [![Build Status](https://travis-ci.org/mattn/go-shellwords.svg?branch=master)](https://travis-ci.org/mattn/go-shellwords)
-[![GoDoc](https://godoc.org/github.com/mattn/go-shellwords?status.svg)](http://godoc.org/github.com/mattn/go-shellwords)
+[![PkgGoDev](https://pkg.go.dev/badge/github.com/mattn/go-shellwords)](https://pkg.go.dev/github.com/mattn/go-shellwords)
+[![ci](https://github.com/mattn/go-shellwords/ci/badge.svg)](https://github.com/mattn/go-shellwords/actions)
 
 Parse line as shell words.
 
@@ -10,6 +11,12 @@ Parse line as shell words.
 
 ```go
 args, err := shellwords.Parse("./foo --bar=baz")
+// args should be ["./foo", "--bar=baz"]
+```
+
+```go
+envs, args, err := shellwords.ParseWithEnvs("FOO=foo BAR=baz ./foo --bar=baz")
+// envs should be ["FOO=foo", "BAR=baz"]
 // args should be ["./foo", "--bar=baz"]
 ```
 
@@ -33,6 +40,18 @@ shellwords.ParseBacktick = true
 p := shellwords.NewParser()
 args, err := p.Parse("./foo `echo $SHELL`")
 // args should be ["./foo", "/bin/bash"]
+```
+
+```go
+p := shellwords.NewParser()
+p.ParseComment = true
+args, err := p.Parse("./foo # comment")
+// args should be ["./foo"]
+```
+
+```go
+p := shellwords.NewParser()
+p.SetExcludeSeparators('\t', ';')
 ```
 
 # Thanks

@@ -18,8 +18,10 @@
 package mage
 
 import (
+	"errors"
 	"fmt"
 	"log"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -41,7 +43,8 @@ import (
 // to point to somewhere on C:\.
 
 const (
-	libbeatRequirements = "{{ elastic_beats_dir}}/libbeat/tests/system/requirements.txt"
+	libbeatRequirements    = "{{ elastic_beats_dir}}/libbeat/tests/system/requirements.txt"
+	aixLibbeatRequirements = "{{ elastic_beats_dir}}/libbeat/tests/system/requirements_aix.txt"
 )
 
 var (
@@ -56,7 +59,7 @@ var (
 	pythonVirtualenvLock sync.Mutex
 
 	// More globs may be needed in the future if tests are added in more places.
-	nosetestsTestFiles = []string{
+	pythonTestFiles = []string{
 		"tests/system/test_*.py",
 		"module/*/test_*.py",
 		"module/*/*/test_*.py",
@@ -77,16 +80,18 @@ func init() {
 }
 
 // PythonTestArgs are the arguments used for the "python*Test" targets and they
-// define how "nosetests" is invoked.
+// define how python tests are invoked.
 type PythonTestArgs struct {
 	TestName            string            // Test name used in logging.
 	Env                 map[string]string // Env vars to add to the current env.
+	Files               []string          // Globs used to find tests.
 	XUnitReportFile     string            // File to write the XUnit XML test report to.
 	CoverageProfileFile string            // Test coverage profile file.
+	ForceCreateVenv     bool              // Set to true to always install required dependencies in the test virtual environment.
 }
 
 func makePythonTestArgs(name string) PythonTestArgs {
-	fileName := fmt.Sprintf("build/TEST-python-%s", strings.Replace(strings.ToLower(name), " ", "_", -1))
+	fileName := fmt.Sprintf("build/TEST-python-%s", strings.ReplaceAll(strings.ToLower(name), " ", "_"))
 
 	params := PythonTestArgs{
 		TestName:        name,
@@ -106,43 +111,63 @@ func DefaultPythonTestUnitArgs() PythonTestArgs { return makePythonTestArgs("Uni
 // DefaultPythonTestIntegrationArgs returns a default set of arguments for
 // running all integration tests. Integration tests are made conditional by
 // checking for INTEGRATION_TEST=1 in the test code.
-func DefaultPythonTestIntegrationArgs() PythonTestArgs { return makePythonTestArgs("Integration") }
+func DefaultPythonTestIntegrationArgs() PythonTestArgs {
+	return makePythonTestArgs("Integration")
+}
 
-// PythonNoseTest invokes "nosetests" via a Python virtualenv.
-func PythonNoseTest(params PythonTestArgs) error {
+// DefaultPythonTestIntegrationFromHostArgs returns a default set of arguments for running
+// all integration tests from the host system (outside the docker network).
+func DefaultPythonTestIntegrationFromHostArgs() PythonTestArgs {
+	args := makePythonTestArgs("Integration")
+	args.Env = WithPythonIntegTestHostEnv(args.Env)
+	return args
+}
+
+// PythonTest executes python tests via a Python virtualenv.
+func PythonTest(params PythonTestArgs) error {
 	fmt.Println(">> python test:", params.TestName, "Testing")
 
-	ve, err := PythonVirtualenv()
+	// Only activate the virtualenv if necessary.
+	ve, err := PythonVirtualenv(params.ForceCreateVenv)
 	if err != nil {
 		return err
 	}
 
-	nosetestsEnv := map[string]string{
+	pytestEnv := map[string]string{
 		// activate sets this. Not sure if it's ever needed.
 		"VIRTUAL_ENV": ve,
 	}
 	if IsInIntegTestEnv() {
-		nosetestsEnv["INTEGRATION_TESTS"] = "1"
+		pytestEnv["INTEGRATION_TESTS"] = "1"
 	}
-	for k, v := range params.Env {
-		nosetestsEnv[k] = v
-	}
+	maps.Copy(pytestEnv, params.Env)
 
-	nosetestsOptions := []string{
-		"--process-timeout=90",
-		"--with-timer",
+	pytestOptions := []string{
+		"--timeout=90",
+		"--durations=20",
+		// Enable -x to stop at the first failing test
+		// "-x",
+		// Enable --tb=long to produce long tracebacks
+		//"--tb=long",
+		// Enable -v to produce verbose output
+		//"-v",
+		// Don't capture test output
+		//"-s",
 	}
 	if mg.Verbose() {
-		nosetestsOptions = append(nosetestsOptions, "-v")
+		pytestOptions = append(pytestOptions, "-v")
 	}
 	if params.XUnitReportFile != "" {
-		nosetestsOptions = append(nosetestsOptions,
-			"--with-xunit",
-			"--xunit-file="+createDir(params.XUnitReportFile),
+		pytestOptions = append(pytestOptions,
+			"--junit-xml="+createDir(params.XUnitReportFile),
 		)
 	}
 
-	testFiles, err := FindFiles(nosetestsTestFiles...)
+	files := pythonTestFiles
+	if len(params.Files) > 0 {
+		files = params.Files
+	}
+	testFiles, err := FindFiles(files...)
 	if err != nil {
 		return err
 	}
@@ -154,25 +179,53 @@ func PythonNoseTest(params PythonTestArgs) error {
 	// We check both the VE and the normal PATH because on Windows if the
 	// requirements are met by the globally installed package they are not
 	// installed to the VE.
-	nosetestsPath, err := LookVirtualenvPath(ve, "nosetests")
+	pytestPath, err := LookVirtualenvPath(ve, "pytest")
 	if err != nil {
 		return err
 	}
 
 	defer fmt.Println(">> python test:", params.TestName, "Testing Complete")
-	_, err = sh.Exec(nosetestsEnv, os.Stdout, os.Stderr, nosetestsPath, append(nosetestsOptions, testFiles...)...)
+	_, err = sh.Exec(pytestEnv, os.Stdout, os.Stderr, pytestPath, append(pytestOptions, testFiles...)...)
 	return err
 
 	// TODO: Aggregate all the individual code coverage reports and generate
 	// and HTML report.
 }
 
+// PythonTestForModule executes python system tests for modules.
+//
+// Use `MODULE=module` to run only tests for `module`.
+func PythonTestForModule(params PythonTestArgs) error {
+	if module := EnvOr("MODULE", ""); module != "" {
+		fmt.Println(">> Single module selected for testing: ", module)
+		params.Files = []string{
+			fmt.Sprintf("module/%s/test_*.py", module),
+			fmt.Sprintf("module/%s/*/test_*.py", module),
+
+			// Run always the base tests, that include tests for module dashboards.
+			"tests/system/test*_base.py",
+		}
+		fmt.Println("Test files: ", params.Files)
+		params.TestName += "-" + module
+	} else {
+		fmt.Println(">> Running tests for all modules, you can use MODULE=foo to scope it down to a single module...")
+	}
+	return PythonTest(params)
+}
+
 // PythonVirtualenv constructs a virtualenv that contains the given modules as
 // defined in the requirements file pointed to by requirementsTxt. It returns
-// the path to the virutalenv.
-func PythonVirtualenv() (string, error) {
+// the path to the virtualenv.
+func PythonVirtualenv(forceCreate bool) (string, error) {
 	pythonVirtualenvLock.Lock()
 	defer pythonVirtualenvLock.Unlock()
+
+	// Certain docker requirements simply won't build on AIX
+	// Skipping them here will obviously break the components that require docker compose,
+	// But at least the components that don't require it will still run
+	if runtime.GOOS == "aix" {
+		VirtualenvReqs[0] = aixLibbeatRequirements
+	}
 
 	// Determine the location of the virtualenv.
 	ve, err := pythonVirtualenvPath()
@@ -185,7 +238,7 @@ func PythonVirtualenv() (string, error) {
 	// Only execute if requirements.txt is newer than the virtualenv activate
 	// script.
 	activate := virtualenvPath(ve, "activate")
-	if IsUpToDate(activate, reqs...) {
+	if !forceCreate && IsUpToDate(activate, reqs...) {
 		return pythonVirtualenvDir, nil
 	}
 
@@ -201,7 +254,24 @@ func PythonVirtualenv() (string, error) {
 		"VIRTUAL_ENV": ve,
 	}
 
+	vePython := virtualenvPath(ve, pythonExe)
+	// Ensure we are using the latest pip version.
+	// use method described at https://pip.pypa.io/en/stable/installation/#upgrading-pip
+	if err = sh.RunWith(env, vePython, "-m", "pip", "install", "--upgrade", "pip"); err != nil {
+		fmt.Printf("warn: failed to upgrade pip (ignoring): %v", err)
+	}
+
 	pip := virtualenvPath(ve, "pip")
+	pipUpgrade := func(pkg string) error {
+		return sh.RunWith(env, pip, "install", "-U", pkg)
+	}
+
+	// First ensure that wheel is installed so that bdists build cleanly.
+	if err = pipUpgrade("wheel"); err != nil {
+		return "", err
+	}
+
+	// Execute pip to install the dependencies.
 	args := []string{"install"}
 	if !mg.Verbose() {
 		args = append(args, "--quiet")
@@ -209,8 +279,6 @@ func PythonVirtualenv() (string, error) {
 	for _, req := range reqs {
 		args = append(args, "-Ur", req)
 	}
-
-	// Execute pip to install the dependencies.
 	if err := sh.RunWith(env, pip, args...); err != nil {
 		return "", err
 	}
@@ -230,6 +298,12 @@ func pythonVirtualenvPath() (string, error) {
 		return pythonVirtualenvDir, nil
 	}
 
+	// If VIRTUAL_ENV is set we are already in a virtual environment.
+	pythonVirtualenvDir = os.Getenv("VIRTUAL_ENV")
+	if pythonVirtualenvDir != "" {
+		return pythonVirtualenvDir, nil
+	}
+
 	// PYTHON_ENV can override the default location. This is used by CI to
 	// shorten the overall shebang interpreter path below the path length limits.
 	pythonVirtualenvDir = os.Getenv("PYTHON_ENV")
@@ -241,6 +315,7 @@ func pythonVirtualenvPath() (string, error) {
 
 		pythonVirtualenvDir = info.RootDir
 	}
+
 	pythonVirtualenvDir = filepath.Join(pythonVirtualenvDir, "build/ve")
 
 	// Use OS and docker specific virtualenv's because the interpreter in
@@ -273,7 +348,14 @@ func LookVirtualenvPath(ve, file string) (string, error) {
 	os.Setenv("PATH", virtualenvPath(ve)+string(filepath.ListSeparator)+path)
 	defer os.Setenv("PATH", path)
 
-	return exec.LookPath(file)
+	// See https://pkg.go.dev/os/exec#hdr-Executables_in_the_current_directory
+	// We explicitly want to find ./pytest in the virtualenv if it exists as of Go 1.19.
+	path, err := exec.LookPath(file)
+	if errors.Is(err, exec.ErrDot) {
+		return path, nil
+	}
+
+	return path, err
 }
 
 func expandVirtualenvReqs() []string {

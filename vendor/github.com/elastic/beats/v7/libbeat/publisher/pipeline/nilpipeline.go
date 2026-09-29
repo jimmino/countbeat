@@ -17,15 +17,17 @@
 
 package pipeline
 
-import "github.com/elastic/beats/v7/libbeat/beat"
+import (
+	"context"
+
+	"github.com/elastic/beats/v7/libbeat/beat"
+)
 
 type nilPipeline struct{}
 
 type nilClient struct {
-	eventer      beat.ClientEventer
-	ackCount     func(int)
-	ackEvents    func([]interface{})
-	ackLastEvent func(interface{})
+	clientListener beat.ClientListener
+	acker          beat.EventListener
 }
 
 var _nilPipeline = (*nilPipeline)(nil)
@@ -42,13 +44,14 @@ func (p *nilPipeline) Connect() (beat.Client, error) {
 
 func (p *nilPipeline) ConnectWith(cfg beat.ClientConfig) (beat.Client, error) {
 	return &nilClient{
-		eventer:      cfg.Events,
-		ackCount:     cfg.ACKCount,
-		ackEvents:    cfg.ACKEvents,
-		ackLastEvent: cfg.ACKLastEvent,
+		clientListener: cfg.ClientListener,
+		acker:          cfg.EventListener,
 	}, nil
 }
 
+func (p *nilPipeline) Disconnect(_ context.Context) error {
+	return nil
+}
 func (c *nilClient) Publish(event beat.Event) {
 	c.PublishAll([]beat.Event{event})
 }
@@ -59,25 +62,18 @@ func (c *nilClient) PublishAll(events []beat.Event) {
 		return
 	}
 
-	if c.ackLastEvent != nil {
-		c.ackLastEvent(events[L-1].Private)
-	}
-	if c.ackEvents != nil {
-		tmp := make([]interface{}, L)
-		for i := range events {
-			tmp[i] = events[i].Private
+	if c.acker != nil {
+		for _, event := range events {
+			c.acker.AddEvent(event, true)
 		}
-		c.ackEvents(tmp)
-	}
-	if c.ackCount != nil {
-		c.ackCount(L)
+		c.acker.ACKEvents(len(events))
 	}
 }
 
 func (c *nilClient) Close() error {
-	if c.eventer != nil {
-		c.eventer.Closing()
-		c.eventer.Closed()
+	if c.clientListener != nil {
+		c.clientListener.Closing()
+		c.clientListener.Closed()
 	}
 	return nil
 }

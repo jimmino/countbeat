@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// +build linux darwin windows
+//go:build linux || darwin || windows
 
 package add_kubernetes_metadata
 
@@ -23,27 +23,29 @@ import (
 	"sync"
 	"time"
 
-	"github.com/elastic/beats/v7/libbeat/common"
+	"github.com/elastic/elastic-agent-libs/mapstr"
 )
 
 type cache struct {
 	sync.Mutex
 	timeout  time.Duration
 	deleted  map[string]time.Time // key ->  when should this obj be deleted
-	metadata map[string]common.MapStr
+	metadata map[string]mapstr.M
+	done     chan struct{}
 }
 
 func newCache(cleanupTimeout time.Duration) *cache {
 	c := &cache{
 		timeout:  cleanupTimeout,
 		deleted:  make(map[string]time.Time),
-		metadata: make(map[string]common.MapStr),
+		metadata: make(map[string]mapstr.M),
+		done:     make(chan struct{}),
 	}
 	go c.cleanup()
 	return c
 }
 
-func (c *cache) get(key string) common.MapStr {
+func (c *cache) get(key string) mapstr.M {
 	c.Lock()
 	defer c.Unlock()
 	// add lifecycle if key was queried
@@ -59,7 +61,7 @@ func (c *cache) delete(key string) {
 	c.deleted[key] = time.Now().Add(c.timeout)
 }
 
-func (c *cache) set(key string, data common.MapStr) {
+func (c *cache) set(key string, data mapstr.M) {
 	c.Lock()
 	defer c.Unlock()
 	delete(c.deleted, key)
@@ -67,15 +69,29 @@ func (c *cache) set(key string, data common.MapStr) {
 }
 
 func (c *cache) cleanup() {
-	ticker := time.Tick(timeout)
-	for now := range ticker {
-		c.Lock()
-		for k, t := range c.deleted {
-			if now.After(t) {
-				delete(c.deleted, k)
-				delete(c.metadata, k)
-			}
-		}
-		c.Unlock()
+	if timeout <= 0 {
+		return
 	}
+
+	ticker := time.NewTicker(timeout)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-c.done:
+			return
+		case now := <-ticker.C:
+			c.Lock()
+			for k, t := range c.deleted {
+				if now.After(t) {
+					delete(c.deleted, k)
+					delete(c.metadata, k)
+				}
+			}
+			c.Unlock()
+		}
+	}
+}
+
+func (c *cache) stop() {
+	close(c.done)
 }

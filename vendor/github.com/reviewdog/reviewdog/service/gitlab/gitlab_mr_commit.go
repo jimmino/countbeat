@@ -4,25 +4,25 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"sync"
 
-	"github.com/xanzy/go-gitlab"
+	gitlab "gitlab.com/gitlab-org/api/client-go/v3"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/reviewdog/reviewdog"
-	"github.com/reviewdog/reviewdog/service/serviceutil"
+	"github.com/reviewdog/reviewdog/service/commentutil"
 )
 
-var _ reviewdog.CommentService = &GitLabMergeRequestCommitCommenter{}
+var _ reviewdog.CommentService = &MergeRequestCommitCommenter{}
 
-// GitLabMergeRequestCommitCommenter is a comment service for GitLab MergeRequest.
+// MergeRequestCommitCommenter is a comment service for GitLab MergeRequest.
 //
 // API:
-//  https://docs.gitlab.com/ce/api/commits.html#post-comment-to-commit
-//  POST /projects/:id/repository/commits/:sha/comments
-type GitLabMergeRequestCommitCommenter struct {
+//
+//	https://docs.gitlab.com/ce/api/commits.html#post-comment-to-commit
+//	POST /projects/:id/repository/commits/:sha/comments
+type MergeRequestCommitCommenter struct {
 	cli      *gitlab.Client
 	pr       int
 	sha      string
@@ -31,42 +31,36 @@ type GitLabMergeRequestCommitCommenter struct {
 	muComments   sync.Mutex
 	postComments []*reviewdog.Comment
 
-	postedcs serviceutil.PostedComments
-
-	// wd is working directory relative to root of repository.
-	wd string
+	postedcs commentutil.PostedComments
 }
 
-// NewGitLabMergeRequestCommitCommenter returns a new GitLabMergeRequestCommitCommenter service.
-// GitLabMergeRequestCommitCommenter service needs git command in $PATH.
-func NewGitLabMergeRequestCommitCommenter(cli *gitlab.Client, owner, repo string, pr int, sha string) (*GitLabMergeRequestCommitCommenter, error) {
-	workDir, err := serviceutil.GitRelWorkdir()
-	if err != nil {
-		return nil, fmt.Errorf("GitLabMergeRequestCommitCommenter needs 'git' command: %v", err)
-	}
-	return &GitLabMergeRequestCommitCommenter{
+// NewGitLabMergeRequestCommitCommenter returns a new MergeRequestCommitCommenter service.
+// MergeRequestCommitCommenter service needs git command in $PATH.
+func NewGitLabMergeRequestCommitCommenter(cli *gitlab.Client, owner, repo string, pr int, sha string) *MergeRequestCommitCommenter {
+	return &MergeRequestCommitCommenter{
 		cli:      cli,
 		pr:       pr,
 		sha:      sha,
 		projects: owner + "/" + repo,
-		wd:       workDir,
-	}, nil
+	}
 }
 
 // Post accepts a comment and holds it. Flush method actually posts comments to
 // GitLab in parallel.
-func (g *GitLabMergeRequestCommitCommenter) Post(_ context.Context, c *reviewdog.Comment) error {
-	c.Path = filepath.ToSlash(filepath.Join(g.wd, c.Path))
+func (g *MergeRequestCommitCommenter) Post(_ context.Context, c *reviewdog.Comment) error {
 	g.muComments.Lock()
 	defer g.muComments.Unlock()
 	g.postComments = append(g.postComments, c)
 	return nil
 }
 
+func (*MergeRequestCommitCommenter) ShouldPrependGitRelDir() bool { return true }
+
 // Flush posts comments which has not been posted yet.
-func (g *GitLabMergeRequestCommitCommenter) Flush(ctx context.Context) error {
+func (g *MergeRequestCommitCommenter) Flush(ctx context.Context) error {
 	g.muComments.Lock()
 	defer g.muComments.Unlock()
+	defer func() { g.postComments = nil }()
 
 	if err := g.setPostedComment(ctx); err != nil {
 		return err
@@ -75,25 +69,26 @@ func (g *GitLabMergeRequestCommitCommenter) Flush(ctx context.Context) error {
 	return g.postCommentsForEach(ctx)
 }
 
-func (g *GitLabMergeRequestCommitCommenter) postCommentsForEach(ctx context.Context) error {
+func (g *MergeRequestCommitCommenter) postCommentsForEach(ctx context.Context) error {
 	var eg errgroup.Group
 	for _, c := range g.postComments {
-		comment := c
-		if g.postedcs.IsPosted(comment, comment.Lnum) {
+		c := c
+		loc := c.Result.Diagnostic.GetLocation()
+		lnum := int(loc.GetRange().GetStart().GetLine())
+		body := commentutil.MarkdownComment(c)
+		if !c.Result.InDiffFile || lnum == 0 || g.postedcs.IsPosted(c, lnum, body) {
 			continue
 		}
 		eg.Go(func() error {
-			commitID, err := g.getLastCommitsID(comment.Path, comment.Lnum)
+			commitID, err := g.getLastCommitsID(loc.GetPath(), lnum)
 			if err != nil {
 				commitID = g.sha
 			}
-			body := serviceutil.CommentBody(comment)
-			ltype := "new"
 			prcomment := &gitlab.PostCommitCommentOptions{
-				Note:     &body,
-				Path:     &comment.Path,
-				Line:     &comment.Lnum,
-				LineType: &ltype,
+				Note:     new(body),
+				Path:     new(loc.GetPath()),
+				Line:     new(int64(lnum)),
+				LineType: new("new"),
 			}
 			_, _, err = g.cli.Commits.PostCommitComment(g.projects, commitID, prcomment, gitlab.WithContext(ctx))
 			return err
@@ -102,18 +97,18 @@ func (g *GitLabMergeRequestCommitCommenter) postCommentsForEach(ctx context.Cont
 	return eg.Wait()
 }
 
-func (g *GitLabMergeRequestCommitCommenter) getLastCommitsID(path string, line int) (string, error) {
+func (g *MergeRequestCommitCommenter) getLastCommitsID(path string, line int) (string, error) {
 	lineFormat := fmt.Sprintf("%d,%d", line, line)
 	s, err := exec.Command("git", "blame", "-l", "-L", lineFormat, path).Output()
 	if err != nil {
-		return "", fmt.Errorf("failed to get commitID: %v", err)
+		return "", fmt.Errorf("failed to get commitID: %w", err)
 	}
 	commitID := strings.Split(string(s), " ")[0]
 	return commitID, nil
 }
 
-func (g *GitLabMergeRequestCommitCommenter) setPostedComment(ctx context.Context) error {
-	g.postedcs = make(serviceutil.PostedComments)
+func (g *MergeRequestCommitCommenter) setPostedComment(ctx context.Context) error {
+	g.postedcs = make(commentutil.PostedComments)
 	cs, err := g.comment(ctx)
 	if err != nil {
 		return err
@@ -124,14 +119,14 @@ func (g *GitLabMergeRequestCommitCommenter) setPostedComment(ctx context.Context
 			// "body".
 			continue
 		}
-		g.postedcs.AddPostedComment(c.Path, c.Line, c.Note)
+		g.postedcs.AddPostedComment(c.Path, int(c.Line), c.Note)
 	}
 	return nil
 }
 
-func (g *GitLabMergeRequestCommitCommenter) comment(ctx context.Context) ([]*gitlab.CommitComment, error) {
+func (g *MergeRequestCommitCommenter) comment(ctx context.Context) ([]*gitlab.CommitComment, error) {
 	commits, _, err := g.cli.MergeRequests.GetMergeRequestCommits(
-		g.projects, g.pr, nil, gitlab.WithContext(ctx))
+		g.projects, int64(g.pr), nil, gitlab.WithContext(ctx))
 	if err != nil {
 		return nil, err
 	}

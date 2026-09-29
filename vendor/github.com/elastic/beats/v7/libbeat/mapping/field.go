@@ -18,19 +18,19 @@
 package mapping
 
 import (
+	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
-	"github.com/joeshaw/multierror"
-	"github.com/pkg/errors"
-
+	"github.com/elastic/elastic-agent-libs/mapstr"
 	"github.com/elastic/go-ucfg/yaml"
 )
 
-//This reflects allowed attributes for field definitions in the fields.yml.
-//No logic is put into this data structure.
-//The purpose is to enable using different kinds of transformation, on top of the same data structure.
-//Current transformation:
+// This reflects allowed attributes for field definitions in the fields.yml.
+// No logic is put into this data structure.
+// The purpose is to enable using different kinds of transformation, on top of the same data structure.
+// Current transformation:
 //  -ElasticSearch Template
 //  -Kibana Index Pattern
 
@@ -44,8 +44,8 @@ type Field struct {
 	Fields         Fields      `config:"fields"`
 	MultiFields    Fields      `config:"multi_fields"`
 	Enabled        *bool       `config:"enabled"`
-	Analyzer       string      `config:"analyzer"`
-	SearchAnalyzer string      `config:"search_analyzer"`
+	Analyzer       Analyzer    `config:"analyzer"`
+	SearchAnalyzer Analyzer    `config:"search_analyzer"`
 	Norms          bool        `config:"norms"`
 	Dynamic        DynamicType `config:"dynamic"`
 	Index          *bool       `config:"index"`
@@ -55,6 +55,22 @@ type Field struct {
 	AliasPath      string      `config:"path"`
 	MigrationAlias bool        `config:"migration"`
 	Dimension      *bool       `config:"dimension"`
+
+	// DynamicTemplate controls whether this field represents an explicitly
+	// named dynamic template.
+	//
+	// Such dynamic templates are only suitable for use in dynamic_template
+	// parameter in bulk requests or in ingest pipelines, as they will have
+	// no path or type match criteria.
+	DynamicTemplate bool `config:"dynamic_template"`
+
+	// Unit holds a standard unit for numeric fields: "percent", "byte", or a time unit.
+	// See https://www.elastic.co/guide/en/elasticsearch/reference/current/mapping-field-meta.html.
+	Unit string `config:"unit"`
+
+	// MetricType holds a standard metric type for numeric fields: "gauge" or "counter".
+	// See https://www.elastic.co/guide/en/elasticsearch/reference/current/mapping-field-meta.html.
+	MetricType string `config:"metric_type"`
 
 	ObjectType            string          `config:"object_type"`
 	ObjectTypeMappingType string          `config:"object_type_mapping_type"`
@@ -93,7 +109,7 @@ type VersionizedString struct {
 	Value      string `config:"value"`
 }
 
-type DynamicType struct{ Value interface{} }
+type DynamicType struct{ Value any }
 
 func (d *DynamicType) Unpack(s string) error {
 	switch s {
@@ -109,10 +125,39 @@ func (d *DynamicType) Unpack(s string) error {
 	return nil
 }
 
+type Analyzer struct {
+	Name       string
+	Definition any
+}
+
+func (a *Analyzer) Unpack(v any) error {
+	var m mapstr.M
+	switch v := v.(type) {
+	case string:
+		a.Name = v
+		return nil
+	case mapstr.M:
+		m = v
+	case map[string]any:
+		m = mapstr.M(v)
+	default:
+		return fmt.Errorf("'%v' is invalid analyzer setting", v)
+	}
+
+	if len(m) != 1 {
+		return fmt.Errorf("'%v' is invalid analyzer setting", v)
+	}
+	for a.Name, a.Definition = range m {
+		break
+	}
+
+	return nil
+}
+
 // Validate ensures objectTypeParams are not mixed with top level objectType configuration
 func (f *Field) Validate() error {
 	if err := f.validateType(); err != nil {
-		return errors.Wrapf(err, "incorrect type configuration for field '%s'", f.Name)
+		return fmt.Errorf("incorrect type configuration for field '%s': %w", f.Name, err)
 	}
 	if len(f.ObjectTypeParams) > 0 {
 		if f.ScalingFactor != 0 || f.ObjectTypeMappingType != "" || f.ObjectType != "" {
@@ -123,60 +168,67 @@ func (f *Field) Validate() error {
 }
 
 func (f *Field) validateType() error {
+	var allowedFormatters, allowedMetricTypes, allowedUnits []string
 	switch strings.ToLower(f.Type) {
-	case "text", "keyword":
-		return stringType.validate(f.Format)
-	case "long", "integer", "short", "byte", "double", "float", "half_float", "scaled_float":
-		return numberType.validate(f.Format)
+	case "text", "keyword", "wildcard", "constant_keyword", "match_only_text":
+		allowedFormatters = []string{"string", "url"}
+	case "long", "integer", "short", "byte", "double", "float", "half_float", "scaled_float", "histogram":
+		allowedFormatters = []string{"string", "url", "bytes", "duration", "number", "percent", "color"}
+		allowedMetricTypes = []string{"gauge", "counter"}
+		allowedUnits = []string{"percent", "byte", "nanos", "micros", "ms", "s", "m", "h", "d"}
 	case "date", "date_nanos":
-		return dateType.validate(f.Format)
+		allowedFormatters = []string{"string", "url", "date"}
 	case "geo_point":
-		return geoPointType.validate(f.Format)
+		allowedFormatters = []string{"geo_point"}
 	case "date_range":
-		return dateRangeType.validate(f.Format)
-	case "boolean", "binary", "ip", "alias", "array", "histogram":
-		if f.Format != "" {
-			return fmt.Errorf("no format expected for field %s, found: %s", f.Name, f.Format)
+		allowedFormatters = []string{"date_range"}
+	case "boolean", "binary", "ip", "alias", "array", "ip_range":
+		// No formatters, metric types, or units allowed.
+	case "object":
+		if f.DynamicTemplate && (len(f.ObjectTypeParams) > 0 || f.ObjectType != "") {
+			// When either ObjectTypeParams or ObjectType are set for an object-type field,
+			// libbeat/template will create dynamic templates. It does not make sense to
+			// use these with explicit dynamic templates.
+			return errors.New("dynamic_template not supported with object_type_params")
 		}
-	case "object", "group", "nested":
+		// No further checks for object yet.
+		return nil
+	case "group", "nested", "flattened":
 		// No check for them yet
+		return nil
 	case "":
 		// Module keys, not used as fields
+		return nil
 	default:
 		// There are more types, not being used by beats, to be added if needed
 		return fmt.Errorf("unexpected type '%s' for field '%s'", f.Type, f.Name)
 	}
+	if err := validateAllowedValue(f.Name, "format", f.Format, allowedFormatters); err != nil {
+		return err
+	}
+	if err := validateAllowedValue(f.Name, "metric type", f.MetricType, allowedMetricTypes); err != nil {
+		return err
+	}
+	if err := validateAllowedValue(f.Name, "unit", f.Unit, allowedUnits); err != nil {
+		return err
+	}
 	return nil
 }
 
-type fieldTypeGroup struct {
-	name string
-
-	// formatters used in Kibana, taken from https://www.elastic.co/guide/en/kibana/7.3/managing-fields.html
-	// Value shown in Kibana docs and UI is not always the same as the
-	// internal value, e.g. `percent` appears as `Percentage` in docs
-	// and UI. We have to use here the internal value.
-	formatters []string
-}
-
-var (
-	stringType    = fieldTypeGroup{"string", []string{"string", "url"}}
-	numberType    = fieldTypeGroup{"number", []string{"string", "url", "bytes", "duration", "number", "percent", "color"}}
-	dateType      = fieldTypeGroup{"date", []string{"string", "url", "date"}}
-	geoPointType  = fieldTypeGroup{"geo_point", []string{"geo_point"}}
-	dateRangeType = fieldTypeGroup{"date_range", []string{"date_range"}}
-)
-
-func (g *fieldTypeGroup) validate(formatter string) error {
-	if formatter == "" {
+func validateAllowedValue(fieldName string, propertyName string, propertyValue string, allowedPropertyValues []string) error {
+	if propertyValue == "" {
 		return nil
 	}
-	for _, expected := range g.formatters {
-		if expected == formatter {
-			return nil
-		}
+	if len(allowedPropertyValues) == 0 {
+		return fmt.Errorf("no %s expected for field '%s', found: %s", propertyName, fieldName, propertyValue)
 	}
-	return fmt.Errorf("unexpected formatter for %s type, expected one of: %s", g.name, strings.Join(g.formatters, ", "))
+	if !slices.Contains(allowedPropertyValues, propertyValue) {
+		return fmt.Errorf(
+			"unexpected %s '%s' for field '%s', expected one of: %s",
+			propertyName, propertyValue, fieldName, strings.Join(allowedPropertyValues, ", "),
+		)
+	}
+	return nil
 }
 
 func LoadFieldsYaml(path string) (Fields, error) {
@@ -232,7 +284,6 @@ func (f Fields) HasKey(key string) bool {
 func (f Fields) GetField(key string) *Field {
 	keys := strings.Split(key, ".")
 	return f.getField(keys)
-
 }
 
 // HasNode checks if inside fields the given node exists
@@ -244,7 +295,6 @@ func (f Fields) HasNode(key string) bool {
 }
 
 func (f Fields) hasNode(keys []string) bool {
-
 	// Nothing to compare, so does not contain it
 	if len(keys) == 0 {
 		return false
@@ -254,7 +304,6 @@ func (f Fields) hasNode(keys []string) bool {
 	keys = keys[1:]
 
 	for _, field := range f {
-
 		if field.Name == key {
 
 			//// It's the last key to compare
@@ -341,7 +390,6 @@ func (f Fields) GetKeys() []string {
 }
 
 func (f Fields) getKeys(namespace string) []string {
-
 	var keys []string
 
 	for _, field := range f {
@@ -384,14 +432,14 @@ func ConcatFields(a, b Fields) (Fields, error) {
 }
 
 func (f Fields) conflicts(fields Fields) error {
-	var errs multierror.Errors
+	var errs []error
 	for _, key := range fields.GetKeys() {
 		keys := strings.Split(key, ".")
 		if err := f.canConcat(key, keys); err != nil {
 			errs = append(errs, err)
 		}
 	}
-	return errs.Err()
+	return errors.Join(errs...)
 }
 
 // canConcat checks if the given string can be concatenated to the existing fields f
@@ -410,12 +458,12 @@ func (f Fields) canConcat(k string, keys []string) error {
 		}
 		// last key to compare
 		if len(keys) == 0 {
-			return errors.Errorf("fields contain key <%s>", k)
+			return fmt.Errorf("fields contain key <%s>", k)
 		}
 		// last field to compare, only valid if it is of type object
 		if len(field.Fields) == 0 {
 			if field.Type != "object" {
-				return errors.Errorf("fields contain non object node conflicting with key <%s>", k)
+				return fmt.Errorf("fields contain non object node conflicting with key <%s>", k)
 			}
 		}
 		return field.Fields.canConcat(k, keys)

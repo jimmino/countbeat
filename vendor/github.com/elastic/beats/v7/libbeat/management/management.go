@@ -18,86 +18,169 @@
 package management
 
 import (
-	"github.com/gofrs/uuid"
+	"sync"
 
-	"github.com/elastic/beats/v7/libbeat/common"
 	"github.com/elastic/beats/v7/libbeat/common/reload"
-	"github.com/elastic/beats/v7/libbeat/feature"
+	"github.com/elastic/beats/v7/libbeat/management/status"
+	"github.com/elastic/elastic-agent-libs/config"
+	"github.com/elastic/elastic-agent-libs/logp"
 )
-
-// Namespace is the feature namespace for queue definition.
-var Namespace = "libbeat.management"
 
 // DebugK used as key for all things central management
 var DebugK = "centralmgmt"
 
-var centralMgmtKey = "x-pack-cm"
+// Manager interacts with the beat to provide status updates and to receive
+// configurations.
+type Manager interface {
+	status.StatusReporter
 
-// ConfigManager interacts with the beat to update configurations
-// from an external source
-type ConfigManager interface {
-	// Enabled returns true if config manager is enabled
+	// Enabled returns true if manager is enabled.
 	Enabled() bool
 
-	// Start the config manager
-	Start()
+	// Starts the unitListen loop, so the manager can already
+	// check-in with Elastic Agent, but no input/output will be
+	// started yet. Call [PostInit] to enable starting/stopping
+	// inputs/output.
+	PreInit() error
 
-	// Stop the config manager
+	// PostInit needs to be invoked when the system is ready to receive an external configuration and
+	// also ready to start ingesting new events. The manager expects that all the reloadable and
+	// reloadable list are fixed for the whole lifetime of the manager.
+	//
+	// Notes: Adding dynamically new reloadable hooks at runtime can lead to inconsistency in the
+	// execution.
+	PostInit()
+
+	// Start starts the manager.
+	//
+	// Deprecated: Use [PreInit] and [PostInit] instead
+	//
+	// For backwards compatibility, [Start] calls [PreInit] then [PostInit].
+	Start() error
+
+	// Stop when this method is called, the manager will stop receiving new actions, no more action
+	// will be propagated to the handlers and will not try to configure any reloadable parts.
+	// When the manager is stopped the callback will be called to signal that the system can terminate.
+	// This method waits for manager goroutines to finish before returning.
+	//
+	// Calls to 'CheckRawConfig()' or 'SetPayload()' will be ignored after calling stop.
+	//
+	// Note: Stop will not call 'UnregisterAction()' automatically.
 	Stop()
 
-	// CheckRawConfig check settings are correct before launching the beat
-	CheckRawConfig(cfg *common.Config) error
+	// AgentInfo returns the information of the agent to which the manager is connected.
+	AgentInfo() AgentInfo
+
+	// SetStopCallback accepts a function that need to be called when the manager want to shutdown the
+	// beats. This is needed when you want your beats to be gracefully shutdown remotely by the Elastic Agent
+	// when a policy doesn't need to run this beat.
+	SetStopCallback(f func())
+
+	// CheckRawConfig check settings are correct before launching the beat.
+	CheckRawConfig(cfg *config.C) error
+
+	// RegisterAction registers action handler with the client
+	RegisterAction(action Action)
+
+	// UnregisterAction unregisters action handler with the client
+	UnregisterAction(action Action)
+
+	// SetPayload Allows to add additional metadata to future requests made by the manager.
+	SetPayload(map[string]any)
+
+	// RegisterDiagnosticHook registers a callback for elastic-agent diagnostics
+	RegisterDiagnosticHook(name string, description string, filename string, contentType string, hook DiagnosticHook)
 }
 
-// PluginFunc for creating FactoryFunc if it matches a config
-type PluginFunc func(*common.Config) FactoryFunc
+// ManagerFactory is the factory type for creating a config manager
+type ManagerFactory func(*config.C, *reload.Registry, *logp.Logger) (Manager, error)
 
-// FactoryFunc for creating a config manager
-type FactoryFunc func(*common.Config, *reload.Registry, uuid.UUID) (ConfigManager, error)
+// If managerFactory is non-nil, NewManager will use it to create the
+// beats manager. managerFactoryLock must be held to access managerFactory.
+var managerFactory ManagerFactory
+var managerFactoryLock sync.Mutex
 
-// Register a config manager
-func Register(name string, fn PluginFunc, stability feature.Stability) {
-	f := feature.New(Namespace, name, fn, feature.MakeDetails(name, "", stability))
-	feature.MustRegister(f)
-}
-
-// Factory retrieves config manager constructor. If no one is registered
-// it will create a nil manager
-func Factory(cfg *common.Config) FactoryFunc {
-	factories, err := feature.GlobalRegistry().LookupAll(Namespace)
-	if err != nil {
-		return nilFactory
-	}
-
-	for _, f := range factories {
-		if plugin, ok := f.Factory().(PluginFunc); ok {
-			if factory := plugin(cfg); factory != nil {
-				return factory
-			}
+// NewManager creates the beats manager based on the given configuration
+// and registry. If management and x-pack are enabled this calls
+// NewV2AgentManager (see x-pack/libbeat/management/managerV2.go), otherwise
+// it returns a placeholder.
+// Tests can call SetManagerFactory to instead use a mocked manager,
+// see x-pack/libbeat/management/tests/init.go.
+func NewManager(cfg *config.C, registry *reload.Registry, logger *logp.Logger) (Manager, error) {
+	if cfg.Enabled() {
+		managerFactoryLock.Lock()
+		defer managerFactoryLock.Unlock()
+		if managerFactory != nil {
+			return managerFactory(cfg, registry, logger)
 		}
 	}
-
-	return nilFactory
+	return &FallbackManager{
+		logger: logger.Named("mgmt"),
+		status: status.Unknown,
+		msg:    "",
+	}, nil
 }
 
-type modeConfig struct {
-	Mode string `config:"mode" yaml:"mode"`
+// SetManagerFactory tells NewManager to use the given factory when management
+// is enabled. It is only called by Agent V2 initialization
+// (x-pack/libbeat/management/managerV2.go) and by tests that need a mocked
+// manager.
+func SetManagerFactory(factory ManagerFactory) {
+	managerFactoryLock.Lock()
+	defer managerFactoryLock.Unlock()
+	managerFactory = factory
 }
 
-func defaultModeConfig() *modeConfig {
-	return &modeConfig{
-		Mode: centralMgmtKey,
+// FallbackManager, fallback when no manager is present
+type FallbackManager struct {
+	logger   *logp.Logger
+	lock     sync.Mutex
+	status   status.Status
+	msg      string
+	stopFunc func()
+	stopOnce sync.Once
+}
+
+func (n *FallbackManager) UpdateStatus(status status.Status, msg string) {
+	n.lock.Lock()
+	defer n.lock.Unlock()
+	if n.status != status || n.msg != msg {
+		n.status = status
+		n.msg = msg
+		n.logger.Infof("Status change to %s: %s", status, msg)
 	}
 }
 
-// nilManager, fallback when no manager is present
-type nilManager struct{}
-
-func nilFactory(*common.Config, *reload.Registry, uuid.UUID) (ConfigManager, error) {
-	return nilManager{}, nil
+func (n *FallbackManager) SetStopCallback(f func()) {
+	n.lock.Lock()
+	n.stopFunc = f
+	n.lock.Unlock()
 }
 
-func (nilManager) Enabled() bool                           { return false }
-func (nilManager) Start()                                  {}
-func (nilManager) Stop()                                   {}
-func (nilManager) CheckRawConfig(cfg *common.Config) error { return nil }
+func (n *FallbackManager) Stop() {
+	n.lock.Lock()
+	defer n.lock.Unlock()
+	if n.stopFunc != nil {
+		// I'm not sure we really need the sync.Once here, but
+		// because different Beats can have different requirements
+		// for their stop function, it's better to make sure it will
+		// only be called once.
+		n.stopOnce.Do(n.stopFunc)
+	}
+}
+
+// Enabled returns false because management is disabled.
+// the nilManager is still used for shutdown on some cases,
+// but that does not mean the Beat is being managed externally,
+// hence it will always return false.
+func (n *FallbackManager) Enabled() bool                      { return false }
+func (n *FallbackManager) AgentInfo() AgentInfo               { return AgentInfo{} }
+func (n *FallbackManager) PreInit() error                     { return nil }
+func (n *FallbackManager) PostInit()                          {}
+func (n *FallbackManager) Start() error                       { return nil }
+func (n *FallbackManager) CheckRawConfig(cfg *config.C) error { return nil }
+func (n *FallbackManager) RegisterAction(action Action)       {}
+func (n *FallbackManager) UnregisterAction(action Action)     {}
+func (n *FallbackManager) SetPayload(map[string]any)          {}
+func (n *FallbackManager) RegisterDiagnosticHook(_ string, _ string, _ string, _ string, _ DiagnosticHook) {
+}

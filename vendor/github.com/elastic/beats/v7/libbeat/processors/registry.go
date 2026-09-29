@@ -20,9 +20,10 @@ package processors
 import (
 	"errors"
 
-	"github.com/elastic/beats/v7/libbeat/common"
-	"github.com/elastic/beats/v7/libbeat/logp"
+	"github.com/elastic/beats/v7/libbeat/beat"
 	p "github.com/elastic/beats/v7/libbeat/plugin"
+	"github.com/elastic/elastic-agent-libs/config"
+	"github.com/elastic/elastic-agent-libs/logp"
 )
 
 type processorPlugin struct {
@@ -32,12 +33,12 @@ type processorPlugin struct {
 
 var pluginKey = "libbeat.processor"
 
-func Plugin(name string, c Constructor) map[string][]interface{} {
+func Plugin(name string, c Constructor) map[string][]any {
 	return p.MakePlugin(pluginKey, processorPlugin{name, c})
 }
 
 func init() {
-	p.MustRegisterLoader(pluginKey, func(ifc interface{}) error {
+	p.MustRegisterLoader(pluginKey, func(ifc any) error {
 		p, ok := ifc.(processorPlugin)
 		if !ok {
 			return errors.New("plugin does not match processor plugin type")
@@ -47,15 +48,17 @@ func init() {
 	})
 }
 
-type Constructor func(config *common.Config) (Processor, error)
+type Constructor func(config *config.C, logger *logp.Logger) (beat.Processor, error)
 
 var registry = NewNamespace()
 
 func RegisterPlugin(name string, constructor Constructor) {
-	logp.L().Named(logName).Debugf("Register plugin %s", name)
-
-	err := registry.Register(name, constructor)
+	err := registry.Register(name, SafeWrap(constructor))
 	if err != nil {
 		panic(err)
 	}
+}
+
+func GetConstructor(name string) (Constructor, error) {
+	return registry.GetConstructor(name)
 }

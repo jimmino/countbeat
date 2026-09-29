@@ -1,16 +1,20 @@
-// +build !windows,go1.6
+//go:build !windows
+// +build !windows
 
 package shellwords
 
 import (
-	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"strings"
 )
 
 func shellRun(line, dir string) (string, error) {
-	shell := os.Getenv("SHELL")
+	var shell string
+	if shell = os.Getenv("SHELL"); shell == "" {
+		shell = "/bin/sh"
+	}
 	cmd := exec.Command(shell, "-c", line)
 	if dir != "" {
 		cmd.Dir = dir
@@ -20,7 +24,7 @@ func shellRun(line, dir string) (string, error) {
 		if eerr, ok := err.(*exec.ExitError); ok {
 			b = eerr.Stderr
 		}
-		return "", errors.New(err.Error() + ":" + string(b))
+		return "", fmt.Errorf("%s: %w", string(b), err)
 	}
 	return strings.TrimSpace(string(b)), nil
 }

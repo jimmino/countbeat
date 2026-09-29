@@ -3,11 +3,12 @@ package githubutils
 import (
 	"context"
 	"fmt"
-	"strings"
 	"sync"
 
 	"github.com/haya14busa/go-actions-toolkit/core"
+
 	"github.com/reviewdog/reviewdog"
+	"github.com/reviewdog/reviewdog/proto/rdf"
 )
 
 const MaxLoggingAnnotationsPerStep = 10
@@ -32,9 +33,11 @@ func (lw *GitHubActionLogWriter) Post(_ context.Context, c *reviewdog.Comment) e
 	if lw.reportNum == MaxLoggingAnnotationsPerStep {
 		WarnTooManyAnnotationOnce()
 	}
-	ReportAsGitHubActionsLog(c.ToolName, lw.level, c.CheckResult)
+	ReportAsGitHubActionsLog(c.ToolName, lw.level, c.Result.Diagnostic)
 	return nil
 }
+
+func (*GitHubActionLogWriter) ShouldPrependGitRelDir() bool { return true }
 
 // Flush checks overall error at last.
 func (lw *GitHubActionLogWriter) Flush(_ context.Context) error {
@@ -47,13 +50,23 @@ func (lw *GitHubActionLogWriter) Flush(_ context.Context) error {
 // ReportAsGitHubActionsLog reports results via logging command to create
 // annotations.
 // https://help.github.com/en/actions/automating-your-workflow-with-github-actions/development-tools-for-github-actions#example-5
-func ReportAsGitHubActionsLog(toolName, level string, c *reviewdog.CheckResult) {
+func ReportAsGitHubActionsLog(toolName, defaultLevel string, d *rdf.Diagnostic) {
 	mes := fmt.Sprintf("[%s] reported by reviewdog 🐶\n%s\n\nRaw Output:\n%s",
-		toolName, c.Message, strings.Join(c.Lines, "\n"))
+		toolName, d.GetMessage(), d.GetOriginalOutput())
+	loc := d.GetLocation()
+	start := loc.GetRange().GetStart()
 	opt := &core.LogOption{
-		File: c.Path,
-		Line: c.Lnum,
-		Col:  c.Col,
+		File: d.GetLocation().GetPath(),
+		Line: int(start.GetLine()),
+		Col:  int(start.GetColumn()),
+	}
+
+	level := defaultLevel
+	switch d.Severity {
+	case rdf.Severity_ERROR:
+		level = "error"
+	case rdf.Severity_INFO, rdf.Severity_WARNING:
+		level = "warning"
 	}
 
 	switch level {
@@ -84,5 +97,5 @@ Limitation:
 - 50 annotations per job (sum of annotations from all the steps)
 - 50 annotations per run (separate from the job annotations, these annotations aren't created by users)
 
-Source: https://github.community/t5/GitHub-Actions/Maximum-number-of-annotations-that-can-be-created-using-GitHub/m-p/39085`, nil)
+Source: https://github.com/orgs/community/discussions/26680#discussioncomment-3252835`, nil)
 }

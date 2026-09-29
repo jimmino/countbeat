@@ -18,52 +18,72 @@
 package template
 
 import (
-	"github.com/elastic/beats/v7/libbeat/common"
-	"github.com/elastic/beats/v7/libbeat/common/bus"
-	"github.com/elastic/beats/v7/libbeat/conditions"
-	"github.com/elastic/beats/v7/libbeat/logp"
+	"fmt"
+
+	conf "github.com/elastic/elastic-agent-libs/config"
+	"github.com/elastic/elastic-agent-libs/mapstr"
 	"github.com/elastic/go-ucfg"
+	"github.com/elastic/go-ucfg/parse"
+
+	"github.com/elastic/beats/v7/libbeat/conditions"
+	"github.com/elastic/beats/v7/pkg/autodiscover/bus"
+	"github.com/elastic/elastic-agent-libs/keystore"
+	"github.com/elastic/elastic-agent-libs/logp"
 )
 
-// Mapper maps config templates with conditions, if a match happens on a discover event
-// the given template will be used as config
-type Mapper []*ConditionMap
+// Mapper maps config templates with conditions in ConditionMaps, if a match happens on a discover event
+// the given template will be used as config.
+// Mapper also includes the global Keystore object at `keystore` and `keystoreProvider`, which
+// has access to a keystores registry
+type Mapper struct {
+	ConditionMaps    []*ConditionMap
+	keystore         keystore.Keystore
+	keystoreProvider bus.KeystoreProvider
+	logger           *logp.Logger
+}
 
 // ConditionMap maps a condition to the configs to use when it's triggered
 type ConditionMap struct {
 	Condition conditions.Condition
-	Configs   []*common.Config
+	Configs   []*conf.C
 }
 
 // MapperSettings holds user settings to build Mapper
 type MapperSettings []*struct {
 	ConditionConfig *conditions.Config `config:"condition"`
-	Configs         []*common.Config   `config:"config"`
+	Configs         []*conf.C          `config:"config"`
 }
 
 // NewConfigMapper builds a template Mapper from given settings
-func NewConfigMapper(configs MapperSettings) (mapper Mapper, err error) {
+func NewConfigMapper(
+	configs MapperSettings,
+	keystore keystore.Keystore,
+	keystoreProvider bus.KeystoreProvider,
+	logger *logp.Logger,
+) (mapper Mapper, err error) {
 	for _, c := range configs {
 		condMap := &ConditionMap{Configs: c.Configs}
 		if c.ConditionConfig != nil {
-			condMap.Condition, err = conditions.NewCondition(c.ConditionConfig)
+			condMap.Condition, err = conditions.NewCondition(c.ConditionConfig, logger)
 			if err != nil {
-				return nil, err
+				return Mapper{}, err
 			}
 		}
-
-		mapper = append(mapper, condMap)
+		mapper.ConditionMaps = append(mapper.ConditionMaps, condMap)
 	}
 
+	mapper.keystore = keystore
+	mapper.keystoreProvider = keystoreProvider
+	mapper.logger = logger
 	return mapper, nil
 }
 
 // Event adapts MapStr to processors.ValuesMap interface
-type Event common.MapStr
+type Event mapstr.M
 
 // GetValue extracts given key from an Event
-func (e Event) GetValue(key string) (interface{}, error) {
-	val, err := common.MapStr(e).GetValue(key)
+func (e Event) GetValue(key string) (any, error) {
+	val, err := mapstr.M(e).GetValue(key)
 	if err != nil {
 		return nil, err
 	}
@@ -71,17 +91,28 @@ func (e Event) GetValue(key string) (interface{}, error) {
 }
 
 // GetConfig returns a matching Config if any, nil otherwise
-func (c Mapper) GetConfig(event bus.Event) []*common.Config {
-	var result []*common.Config
-
-	for _, mapping := range c {
+func (c Mapper) GetConfig(event bus.Event) []*conf.C {
+	var result []*conf.C
+	opts := []ucfg.Option{}
+	// add k8s keystore in options list with higher priority
+	if c.keystoreProvider != nil {
+		k8sKeystore := c.keystoreProvider.GetKeystore(event)
+		if k8sKeystore != nil {
+			opts = append(opts, ucfg.Resolve(keystore.ResolverWrap(k8sKeystore)))
+		}
+	}
+	// add local keystore in options list with lower priority
+	if c.keystore != nil {
+		opts = append(opts, ucfg.Resolve(keystore.ResolverWrap(c.keystore)))
+	}
+	for _, mapping := range c.ConditionMaps {
 		// An empty condition matches everything
 		conditionOk := mapping.Condition == nil || mapping.Condition.Check(Event(event))
 		if mapping.Configs != nil && !conditionOk {
 			continue
 		}
 
-		configs := ApplyConfigTemplate(event, mapping.Configs)
+		configs := ApplyConfigTemplate(event, mapping.Configs, c.logger, opts...)
 		if configs != nil {
 			result = append(result, configs...)
 		}
@@ -90,38 +121,49 @@ func (c Mapper) GetConfig(event bus.Event) []*common.Config {
 }
 
 // ApplyConfigTemplate takes a set of templated configs and applys information in an event map
-func ApplyConfigTemplate(event bus.Event, configs []*common.Config) []*common.Config {
-	var result []*common.Config
+func ApplyConfigTemplate(event bus.Event, configs []*conf.C, logger *logp.Logger, options ...ucfg.Option) []*conf.C {
+	var result []*conf.C
 	// unpack input
-	vars, err := ucfg.NewFrom(map[string]interface{}{
+	vars, err := ucfg.NewFrom(map[string]any{
 		"data": event,
 	})
 	if err != nil {
-		logp.Err("Error building config: %v", err)
+		logger.Errorf("Error building config: %v", err)
 	}
+
 	opts := []ucfg.Option{
+		// Catch-all resolve function to log fields not resolved in any other way,
+		// it needs to be the first resolver added, so it is executed the last one.
+		// Being the last one, its returned error will be the one returned by `Unpack`,
+		// this is important to give better feedback in case of failure.
+		ucfg.Resolve(func(name string) (string, parse.Config, error) {
+			return "", parse.Config{}, fmt.Errorf("field '%s' not available in event or environment", name)
+		}),
+
 		ucfg.PathSep("."),
 		ucfg.Env(vars),
 		ucfg.ResolveEnv,
 		ucfg.VarExp,
 	}
-	for _, config := range configs {
-		c, err := ucfg.NewFrom(config, opts...)
+	opts = append(opts, options...)
+
+	for _, cfg := range configs {
+		c, err := ucfg.NewFrom(cfg, opts...)
 		if err != nil {
-			logp.Err("Error parsing config: %v", err)
+			logger.Errorf("Error parsing config: %v", err)
 			continue
 		}
 		// Unpack config to process any vars in the template:
-		var unpacked map[string]interface{}
-		c.Unpack(&unpacked, opts...)
+		var unpacked map[string]any
+		err = c.Unpack(&unpacked, opts...)
 		if err != nil {
-			logp.Err("Error unpacking config: %v", err)
+			logger.Debugf("Configuration template cannot be resolved: %v", err)
 			continue
 		}
 		// Repack again:
-		res, err := common.NewConfigFrom(unpacked)
+		res, err := conf.NewConfigFrom(unpacked)
 		if err != nil {
-			logp.Err("Error creating config from unpack: %v", err)
+			logger.Errorf("Error creating config from unpack: %v", err)
 			continue
 		}
 		result = append(result, res)

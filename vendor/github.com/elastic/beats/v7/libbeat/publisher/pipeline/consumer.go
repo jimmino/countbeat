@@ -18,187 +18,223 @@
 package pipeline
 
 import (
-	"github.com/elastic/beats/v7/libbeat/common/atomic"
-	"github.com/elastic/beats/v7/libbeat/logp"
+	"sync"
+
+	"github.com/elastic/beats/v7/libbeat/publisher"
 	"github.com/elastic/beats/v7/libbeat/publisher/queue"
+	"github.com/elastic/elastic-agent-libs/logp"
 )
 
 // eventConsumer collects and forwards events from the queue to the outputs work queue.
-// The eventConsumer is managed by the controller and receives additional pause signals
-// from the retryer in case of too many events failing to be send or if retryer
-// is receiving cancelled batches from outputs to be closed on output reloading.
+// It accepts retry requests from batches it vends, which will resend them
+// to the next available output.
 type eventConsumer struct {
 	logger *logp.Logger
-	done   chan struct{}
 
-	ctx *batchContext
+	// eventConsumer calls the retryObserver methods eventsRetry and eventsDropped.
+	retryObserver retryObserver
 
-	pause atomic.Bool
-	wait  atomic.Bool
-	sig   chan consumerSignal
+	// When the output changes, the new target is sent to the worker routine
+	// on this channel. Clients should call eventConsumer.setTarget().
+	targetChan chan consumerTarget
 
-	queue    queue.Queue
-	consumer queue.Consumer
+	// Failed batches are sent to this channel to retry. Clients should call
+	// eventConsumer.retry().
+	retryChan chan retryRequest
 
-	out *outputGroup
+	// Closing this channel signals consumer shutdown. Clients should call
+	// eventConsumer.close().
+	done chan struct{}
+
+	// queueReader is a helper routine that fetches queue batches in a
+	// separate goroutine so we don't block on the control path.
+	queueReader queueReader
+
+	// This waitgroup is released when this eventConsumer's worker
+	// goroutines return.
+	wg sync.WaitGroup
 }
 
-type consumerSignal struct {
-	tag      consumerEventTag
-	consumer queue.Consumer
-	out      *outputGroup
+// consumerTarget specifies the queue to read from, the parameters needed
+// to generate a batch, and the output channel to send batches to.
+type consumerTarget struct {
+	queue      queue.Queue[publisher.Event]
+	ch         chan publisher.Batch
+	timeToLive int
+	batchSize  int
 }
 
-type consumerEventTag uint8
-
-const (
-	sigConsumerCheck consumerEventTag = iota
-	sigConsumerUpdateOutput
-	sigConsumerUpdateInput
-)
+// retryRequest is used by ttlBatch to add itself back to the eventConsumer
+// queue for distribution to an output.
+type retryRequest struct {
+	batch       *ttlBatch
+	decreaseTTL bool
+}
 
 func newEventConsumer(
 	log *logp.Logger,
-	queue queue.Queue,
-	ctx *batchContext,
+	observer retryObserver,
 ) *eventConsumer {
 	c := &eventConsumer{
-		logger: log,
-		done:   make(chan struct{}),
-		sig:    make(chan consumerSignal, 3),
-		out:    nil,
+		logger:        log,
+		retryObserver: observer,
+		queueReader:   makeQueueReader(),
 
-		queue:    queue,
-		consumer: queue.Consumer(),
-		ctx:      ctx,
+		targetChan: make(chan consumerTarget),
+		retryChan:  make(chan retryRequest),
+		done:       make(chan struct{}),
 	}
 
-	c.pause.Store(true)
-	go c.loop(c.consumer)
+	c.wg.Go(func() {
+		c.run()
+	})
+
+	// Even though we start a goroutine here, we don't include it in the
+	// waitGroup used for shutdown: if the queue itself is not closed yet,
+	// then the queueReader may be blocked in a read call to the queue,
+	// and waiting on it would deadlock. (This scenario is common; the
+	// queue is rarely closed properly on shutdown.) The queueReader itself
+	// has no independent state to clean up, and can safely shut down
+	// after the eventConsumer is already gone, so nothing is lost by
+	// letting it happen asynchronously.
+	go c.queueReader.run(c.logger)
+
 	return c
 }
 
-func (c *eventConsumer) close() {
-	c.consumer.Close()
-	close(c.done)
-}
-
-func (c *eventConsumer) sigWait() {
-	c.wait.Store(true)
-	c.sigHint()
-}
-
-func (c *eventConsumer) sigUnWait() {
-	c.wait.Store(false)
-	c.sigHint()
-}
-
-func (c *eventConsumer) sigPause() {
-	c.pause.Store(true)
-	c.sigHint()
-}
-
-func (c *eventConsumer) sigContinue() {
-	c.pause.Store(false)
-	c.sigHint()
-}
-
-func (c *eventConsumer) sigHint() {
-	// send signal to unblock a consumer trying to publish events.
-	// With flags being set atomically, multiple signals can be compressed into one
-	// signal -> drop if queue is not empty
-	select {
-	case c.sig <- consumerSignal{tag: sigConsumerCheck}:
-	default:
-	}
-}
-
-func (c *eventConsumer) updOutput(grp *outputGroup) {
-	// close consumer to break consumer worker from pipeline
-	c.consumer.Close()
-
-	// update output
-	c.sig <- consumerSignal{
-		tag: sigConsumerUpdateOutput,
-		out: grp,
-	}
-
-	// update eventConsumer with new queue connection
-	c.consumer = c.queue.Consumer()
-	c.sig <- consumerSignal{
-		tag:      sigConsumerUpdateInput,
-		consumer: c.consumer,
-	}
-}
-
-func (c *eventConsumer) loop(consumer queue.Consumer) {
+func (c *eventConsumer) run() {
 	log := c.logger
 
 	log.Debug("start pipeline event consumer")
 
 	var (
-		out    workQueue
-		batch  *Batch
-		paused = true
+		// Whether there's an outstanding request to queueReader
+		pendingRead bool
+
+		// The batches waiting to be retried.
+		retryBatches []*ttlBatch
+
+		// The batch read from the queue and waiting to be sent, if any.
+		queueBatch *ttlBatch
+
+		// The output channel (and associated parameters) that will receive
+		// the batches we're loading.
+		target consumerTarget
 	)
 
-	handleSignal := func(sig consumerSignal) {
-		switch sig.tag {
-		case sigConsumerCheck:
-
-		case sigConsumerUpdateOutput:
-			c.out = sig.out
-
-		case sigConsumerUpdateInput:
-			consumer = sig.consumer
+outerLoop:
+	for {
+		// If possible, start reading the next batch in the background.
+		// We require a non-nil target channel so we don't queue up a large
+		// batch before we know the real requested size for our output.
+		if queueBatch == nil && !pendingRead && target.queue != nil && target.ch != nil {
+			pendingRead = true
+			c.queueReader.req <- queueReaderRequest{
+				queue:      target.queue,
+				retryer:    c,
+				batchSize:  target.batchSize,
+				timeToLive: target.timeToLive,
+			}
 		}
 
-		paused = c.paused()
-		if !paused && c.out != nil && batch != nil {
-			out = c.out.workQueue
-		} else {
-			out = nil
+		var active *ttlBatch
+		// Choose the active batch: if we have batches to retry, use the first
+		// one. Otherwise, use a new batch if we have one.
+		if len(retryBatches) > 0 {
+			active = retryBatches[0]
+		} else if queueBatch != nil {
+			active = queueBatch
+		}
+
+		// If we have a batch, we'll point the output channel at the target
+		// and try to send to it. Otherwise, it will remain nil, and sends
+		// to it will always block, so the output case of the select below
+		// will be ignored.
+		var outputChan chan publisher.Batch
+		if active != nil {
+			outputChan = target.ch
+		}
+
+		// Now we can block until the next state change.
+		select {
+		case outputChan <- active:
+			// Successfully sent a batch to the output workers
+			if len(retryBatches) > 0 {
+				// This was a retry, advance the retry batch list
+				retryBatches = retryBatches[1:]
+			} else {
+				// This was directly from the queue, clear the value so we can
+				// fetch a new one
+				queueBatch = nil
+			}
+
+		case target = <-c.targetChan:
+
+		case queueBatch = <-c.queueReader.resp:
+			pendingRead = false
+
+		case req := <-c.retryChan:
+			if req.decreaseTTL {
+				countFailed := len(req.batch.Events())
+
+				alive := req.batch.reduceTTL()
+
+				// Report retried vs dropped event count to the observer
+				countDropped := countFailed - len(req.batch.Events())
+				c.retryObserver.eventsDropped(countDropped)
+				c.retryObserver.eventsRetry(len(req.batch.Events()))
+
+				if !alive {
+					log.Info("Drop batch")
+					req.batch.Drop()
+					continue
+				}
+			}
+			retryBatches = append(retryBatches, req.batch)
+
+		case <-c.done:
+			// Release any batches we're still holding so the underlying
+			// queue can reclaim its backing storage without firing
+			// producer ACK callbacks. Release is the abandonment
+			// path: slabqueue returns its slot indices to the pool's
+			// free list; memqueue advances ackLoop past the batch
+			// without invoking input ACK handlers; diskqueue is a
+			// no-op (events stay on disk for next-process recovery).
+			// We must NOT call Drop here — Drop signals successful
+			// delivery and would falsely advance input registries for
+			// events the consumer is abandoning.
+			if queueBatch != nil {
+				queueBatch.Release()
+			}
+			for _, rb := range retryBatches {
+				rb.Release()
+			}
+			break outerLoop
 		}
 	}
 
-	for {
-		if !paused && c.out != nil && consumer != nil && batch == nil {
-			out = c.out.workQueue
-			queueBatch, err := consumer.Get(c.out.batchSize)
-			if err != nil {
-				out = nil
-				consumer = nil
-				continue
-			}
-			if queueBatch != nil {
-				batch = newBatch(c.ctx, queueBatch, c.out.timeToLive)
-			}
+	// Close the queueReader request channel so it knows to shutdown.
+	close(c.queueReader.req)
+}
 
-			paused = c.paused()
-			if paused || batch == nil {
-				out = nil
-			}
-		}
-
-		select {
-		case sig := <-c.sig:
-			handleSignal(sig)
-			continue
-		default:
-		}
-
-		select {
-		case <-c.done:
-			log.Debug("stop pipeline event consumer")
-			return
-		case sig := <-c.sig:
-			handleSignal(sig)
-		case out <- batch:
-			batch = nil
-		}
+func (c *eventConsumer) setTarget(target consumerTarget) {
+	select {
+	case c.targetChan <- target:
+	case <-c.done:
 	}
 }
 
-func (c *eventConsumer) paused() bool {
-	return c.pause.Load() || c.wait.Load()
+func (c *eventConsumer) retry(batch *ttlBatch, decreaseTTL bool) {
+	select {
+	case c.retryChan <- retryRequest{batch: batch, decreaseTTL: decreaseTTL}:
+		// The batch is back in eventConsumer's retry queue
+	case <-c.done:
+		// The consumer has already shut down, drop the batch
+		batch.Drop()
+	}
+}
+
+func (c *eventConsumer) close() {
+	close(c.done)
+	c.wg.Wait()
 }

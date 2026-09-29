@@ -1,3 +1,20 @@
+// Licensed to Elasticsearch B.V. under one or more contributor
+// license agreements. See the NOTICE file distributed with
+// this work for additional information regarding copyright
+// ownership. Elasticsearch B.V. licenses this file to you under
+// the Apache License, Version 2.0 (the "License"); you may
+// not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
 package v2
 
 import (
@@ -31,11 +48,9 @@ var (
 	empty4 = []byte{0, 0, 0, 0}
 )
 
-var (
-	// ErrProtocolError is returned if an protocol error was detected in the
-	// conversation with lumberjack server.
-	ErrProtocolError = errors.New("lumberjack protocol error")
-)
+// ErrProtocolError is returned if a protocol error was detected in the
+// conversation with lumberjack server.
+var ErrProtocolError = errors.New("lumberjack protocol error")
 
 // NewWithConn create a new lumberjack client with an existing and active
 // connection.
@@ -163,13 +178,13 @@ func (c *Client) ReceiveACK() (uint32, error) {
 	}
 
 	var msg [6]byte
-	ackbytes := 0
-	for ackbytes < 6 {
-		n, err := c.conn.Read(msg[ackbytes:])
+	ackBytes := 0
+	for ackBytes < 6 {
+		n, err := c.conn.Read(msg[ackBytes:])
 		if err != nil {
 			return 0, err
 		}
-		ackbytes += n
+		ackBytes += n
 	}
 
 	// validate response
@@ -187,7 +202,7 @@ func (c *Client) AwaitACK(count uint32) (uint32, error) {
 	var ackSeq uint32
 	var err error
 
-	// read until all acks
+	// read until all ACKs
 	for ackSeq < count {
 		ackSeq, err = c.ReceiveACK()
 		if err != nil {

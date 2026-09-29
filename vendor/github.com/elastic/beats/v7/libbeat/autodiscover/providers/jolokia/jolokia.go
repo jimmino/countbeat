@@ -20,16 +20,19 @@ package jolokia
 import (
 	"fmt"
 
-	"github.com/gofrs/uuid"
-	"github.com/pkg/errors"
+	"github.com/gofrs/uuid/v5"
 
 	"github.com/elastic/beats/v7/libbeat/autodiscover"
 	"github.com/elastic/beats/v7/libbeat/autodiscover/template"
-	"github.com/elastic/beats/v7/libbeat/common"
-	"github.com/elastic/beats/v7/libbeat/common/bus"
+	"github.com/elastic/beats/v7/pkg/autodiscover/bus"
+	"github.com/elastic/elastic-agent-libs/config"
+	"github.com/elastic/elastic-agent-libs/keystore"
+	"github.com/elastic/elastic-agent-libs/logp"
+	"github.com/elastic/elastic-agent-libs/paths"
 )
 
 func init() {
+	//nolint:errcheck // init function
 	autodiscover.Registry.AddProvider("jolokia", AutodiscoverBuilder)
 }
 
@@ -42,19 +45,27 @@ type DiscoveryProber interface {
 
 // Provider is the Jolokia Discovery autodiscover provider
 type Provider struct {
-	config    *Config
 	bus       bus.Bus
 	builders  autodiscover.Builders
 	appenders autodiscover.Appenders
 	templates template.Mapper
 	discovery DiscoveryProber
+	logger    *logp.Logger
 }
 
 // AutodiscoverBuilder builds a Jolokia Discovery autodiscover provider, it fails if
 // there is some problem with the configuration
-func AutodiscoverBuilder(bus bus.Bus, uuid uuid.UUID, c *common.Config) (autodiscover.Provider, error) {
+func AutodiscoverBuilder(
+	beatName string,
+	bus bus.Bus,
+	uuid uuid.UUID,
+	c *config.C,
+	keystore keystore.Keystore,
+	logger *logp.Logger,
+	path *paths.Path,
+) (autodiscover.Provider, error) {
 	errWrap := func(err error) error {
-		return errors.Wrap(err, "error setting up jolokia autodiscover provider")
+		return fmt.Errorf("error setting up jolokia autodiscover provider: %w", err)
 	}
 
 	config := defaultConfig()
@@ -66,17 +77,18 @@ func AutodiscoverBuilder(bus bus.Bus, uuid uuid.UUID, c *common.Config) (autodis
 	discovery := &Discovery{
 		ProviderUUID: uuid,
 		Interfaces:   config.Interfaces,
+		log:          logger,
 	}
 
-	mapper, err := template.NewConfigMapper(config.Templates)
+	mapper, err := template.NewConfigMapper(config.Templates, keystore, nil, logger)
 	if err != nil {
 		return nil, errWrap(err)
 	}
-	if len(mapper) == 0 {
+	if len(mapper.ConditionMaps) == 0 {
 		return nil, errWrap(fmt.Errorf("no configs defined for autodiscover provider"))
 	}
 
-	builders, err := autodiscover.NewBuilders(config.Builders, nil)
+	builders, err := autodiscover.NewBuilders(logger.Named("jolokia"), config.Builders, nil, nil, path)
 	if err != nil {
 		return nil, errWrap(err)
 	}
@@ -92,6 +104,7 @@ func AutodiscoverBuilder(bus bus.Bus, uuid uuid.UUID, c *common.Config) (autodis
 		builders:  builders,
 		appenders: appenders,
 		discovery: discovery,
+		logger:    logger.Named("jolokia"),
 	}, nil
 }
 

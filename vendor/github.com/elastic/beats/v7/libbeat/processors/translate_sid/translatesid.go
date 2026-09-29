@@ -15,24 +15,24 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// +build windows
+//go:build windows
 
 package translate_sid
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
-	"github.com/pkg/errors"
-	"go.uber.org/multierr"
 	"golang.org/x/sys/windows"
 
 	"github.com/elastic/beats/v7/libbeat/beat"
-	"github.com/elastic/beats/v7/libbeat/common"
-	"github.com/elastic/beats/v7/libbeat/logp"
 	"github.com/elastic/beats/v7/libbeat/processors"
-	jsprocessor "github.com/elastic/beats/v7/libbeat/processors/script/javascript/module/processor"
-	"github.com/elastic/beats/v7/winlogbeat/sys"
+	jsprocessor "github.com/elastic/beats/v7/libbeat/processors/script/javascript/module/processor/registry"
+	"github.com/elastic/beats/v7/winlogbeat/sys/winevent"
+	conf "github.com/elastic/elastic-agent-libs/config"
+	"github.com/elastic/elastic-agent-libs/logp"
+	"github.com/elastic/elastic-agent-libs/mapstr"
 )
 
 const logName = "processor.translate_sid"
@@ -51,19 +51,19 @@ type processor struct {
 
 // New returns a new translate_sid processor for converting windows SID values
 // to names.
-func New(cfg *common.Config) (processors.Processor, error) {
+func New(cfg *conf.C, log *logp.Logger) (beat.Processor, error) {
 	c := defaultConfig()
 	if err := cfg.Unpack(&c); err != nil {
-		return nil, errors.Wrap(err, "fail to unpack the translate_sid configuration")
+		return nil, fmt.Errorf("fail to unpack the translate_sid configuration: %w", err)
 	}
 
-	return newFromConfig(c)
+	return newFromConfig(c, log)
 }
 
-func newFromConfig(c config) (*processor, error) {
+func newFromConfig(c config, log *logp.Logger) (*processor, error) {
 	return &processor{
 		config: c,
-		log:    logp.NewLogger(logName),
+		log:    log.Named(logName),
 	}, nil
 }
 
@@ -74,7 +74,7 @@ func (p *processor) String() string {
 
 func (p *processor) Run(event *beat.Event) (*beat.Event, error) {
 	err := p.translateSID(event)
-	if err == nil || p.IgnoreFailure || (p.IgnoreMissing && common.ErrKeyNotFound == errors.Cause(err)) {
+	if err == nil || p.IgnoreFailure || (p.IgnoreMissing && errors.Is(err, mapstr.ErrKeyNotFound)) {
 		return event, nil
 	}
 	return event, err
@@ -111,14 +111,20 @@ func (p *processor) translateSID(event *beat.Event) error {
 
 	// Do all operations even if one fails.
 	var errs []error
-	if _, err = event.PutValue(p.AccountNameTarget, account); err != nil {
-		errs = append(errs, err)
+	if p.AccountNameTarget != "" {
+		if _, err = event.PutValue(p.AccountNameTarget, account); err != nil {
+			errs = append(errs, err)
+		}
 	}
-	if _, err = event.PutValue(p.AccountTypeTarget, sys.SIDType(accountType).String()); err != nil {
-		errs = append(errs, err)
+	if p.AccountTypeTarget != "" {
+		if _, err = event.PutValue(p.AccountTypeTarget, winevent.SIDType(accountType).String()); err != nil {
+			errs = append(errs, err)
+		}
 	}
-	if _, err = event.PutValue(p.DomainTarget, domain); err != nil {
-		errs = append(errs, err)
+	if p.DomainTarget != "" {
+		if _, err = event.PutValue(p.DomainTarget, domain); err != nil {
+			errs = append(errs, err)
+		}
 	}
-	return multierr.Combine(errs...)
+	return errors.Join(errs...)
 }

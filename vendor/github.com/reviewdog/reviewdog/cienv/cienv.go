@@ -20,6 +20,10 @@ type BuildInfo struct {
 
 	// Optional.
 	Branch string
+
+	// Gerrit related params
+	GerritChangeID   string
+	GerritRevisionID string
 }
 
 // GetBuildInfo returns BuildInfo from environment variables.
@@ -37,6 +41,7 @@ func GetBuildInfo() (prInfo *BuildInfo, isPR bool, err error) {
 	owner, repo := getOwnerAndRepoFromSlug([]string{
 		"TRAVIS_REPO_SLUG",
 		"DRONE_REPO", // drone<=0.4
+		"BITBUCKET_REPO_FULL_NAME",
 	})
 	if owner == "" {
 		owner = getOneEnvValue([]string{
@@ -70,6 +75,7 @@ func GetBuildInfo() (prInfo *BuildInfo, isPR bool, err error) {
 		"CIRCLE_SHA1",
 		"DRONE_COMMIT",
 		"CI_COMMIT_SHA", // GitLab CI
+		"BITBUCKET_COMMIT",
 	})
 	if sha == "" {
 		return nil, false, errors.New("cannot get commit SHA from environment variable. Set CI_COMMIT?")
@@ -80,6 +86,10 @@ func GetBuildInfo() (prInfo *BuildInfo, isPR bool, err error) {
 		"TRAVIS_PULL_REQUEST_BRANCH",
 		"CIRCLE_BRANCH",
 		"DRONE_COMMIT_BRANCH",
+		"CI_COMMIT_BRANCH", // Woodpecker CI
+		// present only if PR pipeline
+		"BITBUCKET_PR_DESTINATION_BRANCH",
+		"BITBUCKET_BRANCH",
 	})
 
 	pr := getPullRequestNum()
@@ -93,6 +103,30 @@ func GetBuildInfo() (prInfo *BuildInfo, isPR bool, err error) {
 	}, pr != 0, nil
 }
 
+// GetGerritBuildInfo returns Gerrit specific build info
+func GetGerritBuildInfo() (*BuildInfo, error) {
+	changeID := os.Getenv("GERRIT_CHANGE_ID")
+	if changeID == "" {
+		return nil, errors.New("cannot get change id from environment variable. Set GERRIT_CHANGE_ID ?")
+	}
+
+	revisionID := os.Getenv("GERRIT_REVISION_ID")
+	if revisionID == "" {
+		return nil, errors.New("cannot get revision id from environment variable. Set GERRIT_REVISION_ID ?")
+	}
+
+	branch := os.Getenv("GERRIT_BRANCH")
+	if branch == "" {
+		return nil, errors.New("cannot get branch from environment variable. Set GERRIT_BRANCH ?")
+	}
+
+	return &BuildInfo{
+		GerritChangeID:   changeID,
+		GerritRevisionID: revisionID,
+		Branch:           branch,
+	}, nil
+}
+
 func getPullRequestNum() int {
 	envs := []string{
 		// Common.
@@ -104,6 +138,11 @@ func getPullRequestNum() int {
 		"CIRCLE_PR_NUMBER",    // For Pull Request by a fork repository
 		// drone.io.
 		"DRONE_PULL_REQUEST",
+		// GitLab CI MergeTrains
+		"CI_MERGE_REQUEST_IID",
+		"BITBUCKET_PR_ID",
+		// Woodpecker CI
+		"CI_COMMIT_PULL_REQUEST",
 	}
 	// regexp.MustCompile() in func intentionally because this func is called
 	// once for one run.

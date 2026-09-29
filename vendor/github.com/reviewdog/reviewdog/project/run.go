@@ -3,6 +3,7 @@ package project
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -14,6 +15,8 @@ import (
 
 	"github.com/reviewdog/reviewdog"
 	"github.com/reviewdog/reviewdog/diff"
+	"github.com/reviewdog/reviewdog/filter"
+	"github.com/reviewdog/reviewdog/parser"
 )
 
 // RunAndParse runs commands and parse results. Returns map of tool name to check results.
@@ -29,20 +32,21 @@ func RunAndParse(ctx context.Context, conf *Config, runners map[string]bool, def
 		semaphoreNum = 1
 	}
 	semaphore := make(chan int, semaphoreNum)
-	for _, runner := range conf.Runner {
+	for key, runner := range conf.Runner {
 		runner := runner
-		if len(runners) != 0 && !runners[runner.Name] {
+		runnerName := getRunnerName(key, runner)
+		if len(runners) != 0 && !runners[runnerName] {
 			continue // Skip this runner.
 		}
-		usedRunners = append(usedRunners, runner.Name)
+		usedRunners = append(usedRunners, runnerName)
 		semaphore <- 1
-		log.Printf("reviewdog: [start]\trunner=%s", runner.Name)
+		log.Printf("reviewdog: [start] runner=%s", runnerName)
 		fname := runner.Format
 		if fname == "" && len(runner.Errorformat) == 0 {
-			fname = runner.Name
+			fname = runnerName
 		}
-		opt := &reviewdog.ParserOpt{FormatName: fname, Errorformat: runner.Errorformat}
-		p, err := reviewdog.NewParser(opt)
+		opt := &parser.Option{FormatName: fname, Errorformat: runner.Errorformat}
+		p, err := parser.New(opt)
 		if err != nil {
 			return nil, err
 		}
@@ -51,25 +55,35 @@ func RunAndParse(ctx context.Context, conf *Config, runners map[string]bool, def
 			return nil, err
 		}
 		if err := cmd.Start(); err != nil {
-			return nil, fmt.Errorf("fail to start command: %v", err)
+			return nil, fmt.Errorf("fail to start command: %w", err)
 		}
 		g.Go(func() error {
 			defer func() { <-semaphore }()
-			rs, err := p.Parse(io.MultiReader(stdout, stderr))
+			diagnostics, err := p.Parse(concurrentMultiReader(stdout, stderr))
 			if err != nil {
 				return err
 			}
-			log.Printf("reviewdog: [finish]\trunner=%s", runner.Name)
 			level := runner.Level
 			if level == "" {
 				level = defaultLevel
 			}
-			results.Store(runner.Name, &reviewdog.Result{Level: level, CheckResults: rs})
+			cmdErr := cmd.Wait()
+			results.Store(runnerName, &reviewdog.Result{
+				Name:        runnerName,
+				Level:       level,
+				Diagnostics: diagnostics,
+				CmdErr:      cmdErr,
+			})
+			msg := fmt.Sprintf("reviewdog: [finish] runner=%s", runnerName)
+			if cmdErr != nil {
+				msg += fmt.Sprintf("\terror=%v", cmdErr)
+			}
+			log.Println(msg)
 			return nil
 		})
 	}
 	if err := g.Wait(); err != nil {
-		return nil, fmt.Errorf("fail to run reviewdog: %v", err)
+		return nil, fmt.Errorf("fail to run reviewdog: %w", err)
 	}
 	if err := checkUnknownRunner(runners, usedRunners); err != nil {
 		return nil, err
@@ -78,7 +92,8 @@ func RunAndParse(ctx context.Context, conf *Config, runners map[string]bool, def
 }
 
 // Run runs reviewdog tasks based on Config.
-func Run(ctx context.Context, conf *Config, runners map[string]bool, c reviewdog.CommentService, d reviewdog.DiffService, teeMode bool) error {
+func Run(ctx context.Context, conf *Config, runners map[string]bool, c reviewdog.CommentService, d reviewdog.DiffService,
+	teeMode bool, filterMode filter.Mode, failLevel reviewdog.FailLevel) error {
 	results, err := RunAndParse(ctx, conf, runners, "", teeMode) // Level is not used.
 	if err != nil {
 		return err
@@ -86,6 +101,7 @@ func Run(ctx context.Context, conf *Config, runners map[string]bool, c reviewdog
 	if results.Len() == 0 {
 		return nil
 	}
+
 	b, err := d.Diff(ctx)
 	if err != nil {
 		return err
@@ -94,14 +110,20 @@ func Run(ctx context.Context, conf *Config, runners map[string]bool, c reviewdog
 	if err != nil {
 		return err
 	}
-	var g errgroup.Group
+	var errs []error
 	results.Range(func(toolname string, result *reviewdog.Result) {
-		rs := result.CheckResults
-		g.Go(func() error {
-			return reviewdog.RunFromResult(ctx, c, rs, filediffs, d.Strip(), toolname)
-		})
+		if err := result.CheckUnexpectedFailure(); err != nil {
+			errs = append(errs, err)
+		}
+		if ncs, ok := c.(reviewdog.NamedCommentService); ok {
+			ncs.SetTool(toolname, result.Level)
+		}
+		// Note: CommentService shouldn't be run concurrently with different tool.
+		if err := reviewdog.RunFromResult(ctx, c, result.Diagnostics, filediffs, d.Strip(), toolname, filterMode, failLevel); err != nil {
+			errs = append(errs, err)
+		}
 	})
-	return g.Wait()
+	return errors.Join(errs...)
 }
 
 var secretEnvs = [...]string{
@@ -137,4 +159,51 @@ func checkUnknownRunner(specifiedRunners map[string]bool, usedRunners []string) 
 		return fmt.Errorf("runner not found: [%s]", strings.Join(rs, ","))
 	}
 	return nil
+}
+
+func getRunnerName(key string, runner *Runner) string {
+	if runner.Name != "" {
+		return runner.Name
+	}
+	return key
+}
+
+// We need concurrent Reader to prevent deadlock.
+// If we read stdout and stderr sequentially,
+// 1. huge stderr can block the process
+// 2. stdout doesn't close until the process finishes
+// 3. we can't read stderr until stdout is closed <- deadlock
+func concurrentMultiReader(readers ...io.Reader) io.Reader {
+	pr, pw := io.Pipe()
+	var bufs []*bytes.Buffer
+
+	var g errgroup.Group
+	for _, r := range readers {
+		b := &bytes.Buffer{}
+		bufs = append(bufs, b)
+		g.Go(func() error {
+			_, err := io.Copy(b, r)
+			if err != nil {
+				return err
+			}
+			return nil
+		})
+	}
+
+	go func() {
+		err := g.Wait()
+		if err != nil {
+			_ = pw.CloseWithError(err)
+			return
+		}
+		for _, b := range bufs {
+			if _, err := io.Copy(pw, b); err != nil {
+				_ = pw.CloseWithError(err)
+				return
+			}
+		}
+		_ = pw.Close()
+	}()
+
+	return pr
 }

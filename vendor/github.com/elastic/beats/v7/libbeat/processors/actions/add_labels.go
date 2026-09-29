@@ -20,9 +20,13 @@ package actions
 import (
 	"fmt"
 
-	"github.com/elastic/beats/v7/libbeat/common"
+	"github.com/elastic/beats/v7/libbeat/beat"
 	"github.com/elastic/beats/v7/libbeat/processors"
+	"github.com/elastic/beats/v7/libbeat/processors/actions/addfields"
 	"github.com/elastic/beats/v7/libbeat/processors/checks"
+	conf "github.com/elastic/elastic-agent-libs/config"
+	"github.com/elastic/elastic-agent-libs/logp"
+	"github.com/elastic/elastic-agent-libs/mapstr"
 )
 
 // LabelsKey is the default target key for the add_labels processor.
@@ -35,16 +39,21 @@ func init() {
 			checks.AllowedFields(LabelsKey, "when")))
 }
 
-func createAddLabels(c *common.Config) (processors.Processor, error) {
+func createAddLabels(c *conf.C, log *logp.Logger) (beat.Processor, error) {
 	config := struct {
-		Labels common.MapStr `config:"labels" validate:"required"`
+		Labels mapstr.M `config:"labels" validate:"required"`
 	}{}
 	err := c.Unpack(&config)
 	if err != nil {
-		return nil, fmt.Errorf("fail to unpack the add_fields configuration: %s", err)
+		return nil, fmt.Errorf("fail to unpack the add_fields configuration: %w", err)
 	}
 
-	return makeFieldsProcessor(LabelsKey, config.Labels.Flatten(), true), nil
+	flatLabels, err := flattenLabels(config.Labels)
+	if err != nil {
+		return nil, fmt.Errorf("failed to flatten labels: %w", err)
+	}
+
+	return addfields.MakeFieldsProcessor(LabelsKey, flatLabels, true), nil
 }
 
 // NewAddLabels creates a new processor adding the given object to events. Set
@@ -53,8 +62,32 @@ func createAddLabels(c *common.Config) (processors.Processor, error) {
 // If labels contains nested objects, NewAddLabels will flatten keys into labels by
 // by joining names with a dot ('.') .
 // The labels will be inserted into the 'labels' field.
-func NewAddLabels(labels common.MapStr, shared bool) processors.Processor {
-	return NewAddFields(common.MapStr{
-		LabelsKey: labels.Flatten(),
-	}, shared, true)
+func NewAddLabels(labels mapstr.M, shared bool) (beat.Processor, error) {
+	flatLabels, err := flattenLabels(labels)
+	if err != nil {
+		return nil, fmt.Errorf("failed to flatten labels: %w", err)
+	}
+
+	return addfields.NewAddFields(mapstr.M{
+		LabelsKey: flatLabels,
+	}, shared, true), nil
+}
+
+func flattenLabels(labels mapstr.M) (mapstr.M, error) {
+	labelConfig, err := conf.NewConfigFrom(labels)
+	if err != nil {
+		return nil, err
+	}
+
+	flatKeys := labelConfig.FlattenedKeys()
+	flatMap := make(mapstr.M, len(flatKeys))
+	for _, k := range flatKeys {
+		v, err := labelConfig.String(k, -1)
+		if err != nil {
+			return nil, err
+		}
+		flatMap[k] = v
+	}
+
+	return flatMap, nil
 }

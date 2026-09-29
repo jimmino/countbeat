@@ -18,9 +18,11 @@
 package redis
 
 import (
+	"context"
+	"errors"
 	"time"
 
-	"github.com/garyburd/redigo/redis"
+	"github.com/gomodule/redigo/redis"
 
 	b "github.com/elastic/beats/v7/libbeat/common/backoff"
 	"github.com/elastic/beats/v7/libbeat/publisher"
@@ -31,7 +33,6 @@ type backoffClient struct {
 
 	reason failReason
 
-	done    chan struct{}
 	backoff b.Backoff
 }
 
@@ -50,21 +51,18 @@ const (
 )
 
 func newBackoffClient(client *client, init, max time.Duration) *backoffClient {
-	done := make(chan struct{})
-	backoff := b.NewEqualJitterBackoff(done, init, max)
 	return &backoffClient{
 		client:  client,
-		done:    done,
-		backoff: backoff,
+		backoff: b.NewEqualJitterBackoff(init, max),
 	}
 }
 
-func (b *backoffClient) Connect() error {
-	err := b.client.Connect()
+func (b *backoffClient) Connect(ctx context.Context) error {
+	err := b.client.Connect(ctx)
 	if err != nil {
 		// give the client a chance to promote an internal error to a network error.
 		b.updateFailReason(err)
-		b.backoff.Wait()
+		b.backoff.Wait(ctx)
 	} else if b.reason != failRedis { // Only reset backoff duration if failure was due to IO errors.
 		b.resetFail()
 	}
@@ -73,17 +71,15 @@ func (b *backoffClient) Connect() error {
 }
 
 func (b *backoffClient) Close() error {
-	err := b.client.Close()
-	close(b.done)
-	return err
+	return b.client.Close()
 }
 
-func (b *backoffClient) Publish(batch publisher.Batch) error {
-	err := b.client.Publish(batch)
+func (b *backoffClient) Publish(ctx context.Context, batch publisher.Batch) error {
+	err := b.client.Publish(ctx, batch)
 	if err != nil {
 		b.client.Close()
 		b.updateFailReason(err)
-		b.backoff.Wait()
+		b.backoff.Wait(ctx)
 	} else {
 		b.resetFail()
 	}
@@ -101,7 +97,8 @@ func (b *backoffClient) updateFailReason(err error) {
 		return
 	}
 
-	if _, ok := err.(redis.Error); ok {
+	var redisErr *redis.Error
+	if errors.As(err, &redisErr) {
 		b.reason = failRedis
 	} else {
 		b.reason = failOther

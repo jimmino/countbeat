@@ -18,21 +18,8 @@
 package queue
 
 import (
-	"io"
-
-	"github.com/elastic/beats/v7/libbeat/beat"
-	"github.com/elastic/beats/v7/libbeat/common"
-	"github.com/elastic/beats/v7/libbeat/logp"
-	"github.com/elastic/beats/v7/libbeat/publisher"
+	"github.com/elastic/elastic-agent-libs/logp"
 )
-
-// Factory for creating a queue used by a pipeline instance.
-type Factory func(ACKListener, *logp.Logger, *common.Config) (Queue, error)
-
-// ACKListener listens to special events to be send by queue implementations.
-type ACKListener interface {
-	OnACK(eventCount int) // number of consecutively published events acked by producers
-}
 
 // Queue is responsible for accepting, forwarding and ACKing events.
 // A queue will receive and buffer single events from its producers.
@@ -43,14 +30,36 @@ type ACKListener interface {
 // When the queue decides it is safe to progress (events have been ACKed by
 // consumer or flush to some other intermediate storage), it will send an ACK signal
 // with the number of ACKed events to the Producer (ACK happens in batches).
-type Queue interface {
-	io.Closer
+type Queue[T any] interface {
+	// Close signals the queue to shut down, but it may keep handling requests
+	// and acknowledgments for events that are already in progress.
+	// Passing force=true causes the queue to drop in-flight events and acks
+	// and free all resources immediately. This may block.
+	// Close is idempotent and can be called multiple times safely.
+	Close(force bool) error
 
+	// Done returns a channel that unblocks when the queue is closed and all
+	// its events are persisted or acknowledged.
+	Done() <-chan struct{}
+
+	QueueType() string
 	BufferConfig() BufferConfig
 
-	Producer(cfg ProducerConfig) Producer
-	Consumer() Consumer
+	Producer(cfg ProducerConfig) Producer[T]
+
+	// Get retrieves a batch of up to eventCount events. If eventCount <= 0,
+	// there is no bound on the number of returned events.
+	Get(eventCount int) (Batch[T], error)
 }
+
+// If encoderFactory is provided, then the resulting queue must use it to
+// encode queued events before returning them.
+type QueueFactory[T any] func(
+	logger *logp.Logger,
+	observer Observer,
+	inputQueueSize int,
+	encoderFactory EncoderFactory[T],
+) (Queue[T], error)
 
 // BufferConfig returns the pipelines buffering settings,
 // for the pipeline to use.
@@ -69,56 +78,94 @@ type ProducerConfig struct {
 	// if ACK is set, the callback will be called with number of events produced
 	// by the producer instance and being ACKed by the queue.
 	ACK func(count int)
-
-	// OnDrop provided to the queue, to report events being silently dropped by
-	// the queue. For example an async producer close and publish event,
-	// with close happening early might result in the event being dropped. The callback
-	// gives a queue user a chance to keep track of total number of events
-	// being buffered by the queue.
-	OnDrop func(beat.Event)
-
-	// DropOnCancel is a hint to the queue to drop events if the producer disconnects
-	// via Cancel.
-	DropOnCancel bool
 }
+
+type EntryID uint64
 
 // Producer is an interface to be used by the pipelines client to forward
 // events to a queue.
-type Producer interface {
-	// Publish adds an event to the queue, blocking if necessary, and returns
-	// true on success.
-	Publish(event publisher.Event) bool
+type Producer[T any] interface {
+	// Publish adds an entry to the queue, blocking if necessary, and returns
+	// the new entry's id and true on success.
+	Publish(entry T) (EntryID, bool)
 
-	// TryPublish adds an event to the queue if doing so will not block the
+	// TryPublish adds an entry to the queue if doing so will not block the
 	// caller, otherwise it immediately returns. The reasons a publish attempt
 	// might block are defined by the specific queue implementation and its
-	// configuration. Returns true if the event was successfully added, false
-	// otherwise.
-	TryPublish(event publisher.Event) bool
+	// configuration. If the event was successfully added, returns true with
+	// the event's assigned ID, and false otherwise.
+	TryPublish(entry T) (EntryID, bool)
 
-	// Cancel closes this Producer endpoint. If the producer is configured to
-	// drop its events on Cancel, the number of dropped events is returned.
-	// Note: A queue may still send ACK signals even after Cancel is called on
-	//       the originating Producer. The pipeline client must accept and
-	//       discard these ACKs.
-	Cancel() int
+	// Close closes this Producer endpoint.
+	// Note: A queue may still send ACK signals even after Close is called on
+	// the originating Producer. The pipeline client must accept these ACKs.
+	Close()
+
+	// ACKWaitChan returns a channel that is closed once this producer has been
+	// Closed AND every event it published has been acknowledged. Producers that
+	// do not track in-memory acknowledgments (the disk queue, where events are
+	// durably persisted, or producers created without an ACK callback) close it
+	// as soon as Close is called.
+	//
+	// The channel is also closed if the underlying queue is force-closed, so a
+	// caller waiting on it can never hang past queue teardown. It is never
+	// closed while the producer is still open, even if every event published so
+	// far has been acknowledged.
+	//
+	// The same channel instance is returned across calls. ACKWaitChan is safe to
+	// call concurrently with Publish, TryPublish and Close.
+	ACKWaitChan() <-chan struct{}
 }
 
-// Consumer is an interface to be used by the pipeline output workers,
-// used to read events from the head of the queue.
-type Consumer interface {
-	// Get retrieves a batch of up to eventCount events. If eventCount <= 0,
-	// there is no bound on the number of returned events.
-	Get(eventCount int) (Batch, error)
-
-	// Close closes this Consumer. Returns an error if the Consumer is
-	// already closed.
-	Close() error
+// Batch of entries (usually publisher.Event) to be returned to Consumers.
+// The `Done` method will tell the queue that the batch has been consumed and
+// its entries can be acknowledged and discarded.
+type Batch[T any] interface {
+	Count() int
+	Entry(i int) T
+	// Done signals that the consumer has successfully finished with this
+	// batch: producer ACK callbacks fire and any backing storage is
+	// released. This is the normal completion path.
+	Done()
+	// Release returns the batch's backing storage to the queue WITHOUT
+	// firing producer ACK callbacks. Used by the pipeline on shutdown to
+	// reclaim queue-side resources for batches the consumer is abandoning.
+	// Implementations differ:
+	//   - memqueue: marks the batch cancelled and advances ackLoop past
+	//     it so subsequent batches' ACKs aren't stalled, but does not
+	//     fire the producer ACK callback.
+	//   - slabqueue: returns slot indices to the pool's free list and
+	//     removes the batch from the queue's pending list. No ACK.
+	//   - diskqueue: no-op; events stay on disk for next-process recovery.
+	//
+	// Caller contract — IMPORTANT: Release must only be invoked when no
+	// further Done()s are expected from the same producer. In practice
+	// that means it is only safe to call from a pipeline-wide shutdown
+	// path (currently eventConsumer.run's shutdown handler and
+	// queueReader.run's shutdown handler). Calling Release on a batch
+	// while other batches from the same producer are still in flight
+	// would leave a hole in the producer's ACK accounting: subsequent
+	// Done callbacks would compute a count that includes the abandoned
+	// events, causing the input registry to advance over undelivered
+	// data. This invariant is honored by every caller in this repo.
+	Release()
+	// FreeEntries releases internal references to the contained events if
+	// supported (the disk queue does not currently implement this).
+	// Entry() should not be used after this call.
+	FreeEntries()
 }
 
-// Batch of events to be returned to Consumers. The `ACK` method will send the
-// ACK signal to the queue.
-type Batch interface {
-	Events() []publisher.Event
-	ACK()
+// Outputs can provide an EncoderFactory to enable early encoding, in which
+// case the queue will run the given encoder on events before they reach
+// consumers.
+// Encoders are provided as factories so each worker goroutine can have its own
+type EncoderFactory[T any] func() Encoder[T]
+
+type Encoder[T any] interface {
+	// Return the encoded form of the entry that the output workers can use,
+	// and the in-memory size of the encoded buffer.
+	// EncodeEntry should return a valid entry when given one, even if the
+	// encoding fails. In that case, the returned entry should contain the
+	// metadata needed to report the error when the entry is consumed.
+	EncodeEntry(T) (T, int)
 }

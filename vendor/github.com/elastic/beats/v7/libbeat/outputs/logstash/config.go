@@ -21,12 +21,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/elastic/beats/v7/libbeat/beat"
+	"github.com/elastic/elastic-agent-libs/config"
 
-	"github.com/elastic/beats/v7/libbeat/common"
 	"github.com/elastic/beats/v7/libbeat/common/cfgwarn"
-	"github.com/elastic/beats/v7/libbeat/common/transport"
-	"github.com/elastic/beats/v7/libbeat/common/transport/tlscommon"
+	"github.com/elastic/elastic-agent-libs/transport"
+	"github.com/elastic/elastic-agent-libs/transport/tlscommon"
 )
 
 type Config struct {
@@ -43,6 +42,7 @@ type Config struct {
 	Proxy            transport.ProxyConfig `config:",inline"`
 	Backoff          Backoff               `config:"backoff"`
 	EscapeHTML       bool                  `config:"escape_html"`
+	Queue            config.Namespace      `config:"queue"`
 }
 
 type Backoff struct {
@@ -50,7 +50,7 @@ type Backoff struct {
 	Max  time.Duration
 }
 
-func defaultConfig() Config {
+func DefaultConfig() Config {
 	return Config{
 		LoadBalance:      false,
 		Pipelining:       2,
@@ -68,8 +68,8 @@ func defaultConfig() Config {
 	}
 }
 
-func readConfig(cfg *common.Config, info beat.Info) (*Config, error) {
-	c := defaultConfig()
+func readConfig(cfg *config.C, indexPrefix string) (*Config, error) {
+	c := DefaultConfig()
 
 	err := cfgwarn.CheckRemoved6xSettings(cfg, "port")
 	if err != nil {
@@ -81,7 +81,7 @@ func readConfig(cfg *common.Config, info beat.Info) (*Config, error) {
 	}
 
 	if c.Index == "" {
-		c.Index = strings.ToLower(info.IndexPrefix)
+		c.Index = strings.ToLower(indexPrefix)
 	}
 
 	return &c, nil

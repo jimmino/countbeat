@@ -20,31 +20,43 @@ package kafka
 import (
 	"errors"
 	"fmt"
+	"math"
+	"math/rand/v2"
 	"strings"
 	"time"
 
-	"github.com/Shopify/sarama"
-
-	"github.com/elastic/beats/v7/libbeat/common"
 	"github.com/elastic/beats/v7/libbeat/common/cfgwarn"
 	"github.com/elastic/beats/v7/libbeat/common/fmtstr"
 	"github.com/elastic/beats/v7/libbeat/common/kafka"
 	"github.com/elastic/beats/v7/libbeat/common/transport/kerberos"
-	"github.com/elastic/beats/v7/libbeat/common/transport/tlscommon"
-	"github.com/elastic/beats/v7/libbeat/logp"
-	"github.com/elastic/beats/v7/libbeat/monitoring"
-	"github.com/elastic/beats/v7/libbeat/monitoring/adapter"
+	"github.com/elastic/beats/v7/libbeat/management"
 	"github.com/elastic/beats/v7/libbeat/outputs/codec"
+	"github.com/elastic/elastic-agent-libs/config"
+	"github.com/elastic/elastic-agent-libs/logp"
+	"github.com/elastic/elastic-agent-libs/monitoring"
+	"github.com/elastic/elastic-agent-libs/monitoring/adapter"
+	"github.com/elastic/elastic-agent-libs/transport/tlscommon"
+	"github.com/elastic/sarama"
 )
 
-type kafkaConfig struct {
+type backoffConfig struct {
+	Init time.Duration `config:"init"`
+	Max  time.Duration `config:"max"`
+}
+
+type header struct {
+	Key   string `config:"key"`
+	Value string `config:"value"`
+}
+
+type KafkaConfig struct {
 	Hosts              []string                  `config:"hosts"               validate:"required"`
 	TLS                *tlscommon.Config         `config:"ssl"`
 	Kerberos           *kerberos.Config          `config:"kerberos"`
 	Timeout            time.Duration             `config:"timeout"             validate:"min=1"`
 	Metadata           metaConfig                `config:"metadata"`
 	Key                *fmtstr.EventFormatString `config:"key"`
-	Partition          map[string]*common.Config `config:"partition"`
+	Partition          map[string]*config.C      `config:"partition"`
 	KeepAlive          time.Duration             `config:"keep_alive"          validate:"min=0"`
 	MaxMessageBytes    *int                      `config:"max_message_bytes"   validate:"min=1"`
 	RequiredACKs       *int                      `config:"required_acks"       validate:"min=-1"`
@@ -55,18 +67,21 @@ type kafkaConfig struct {
 	BulkMaxSize        int                       `config:"bulk_max_size"`
 	BulkFlushFrequency time.Duration             `config:"bulk_flush_frequency"`
 	MaxRetries         int                       `config:"max_retries"         validate:"min=-1,nonzero"`
+	Headers            []header                  `config:"headers"`
+	Backoff            backoffConfig             `config:"backoff"`
 	ClientID           string                    `config:"client_id"`
 	ChanBufferSize     int                       `config:"channel_buffer_size" validate:"min=1"`
 	Username           string                    `config:"username"`
 	Password           string                    `config:"password"`
 	Codec              codec.Config              `config:"codec"`
-	Sasl               saslConfig                `config:"sasl"`
-}
+	Sasl               kafka.SaslConfig          `config:"sasl"`
+	EnableFAST         bool                      `config:"enable_krb5_fast"`
+	Queue              config.Namespace          `config:"queue"`
 
-type saslConfig struct {
-	SaslMechanism string `config:"mechanism"`
-	//SaslUsername  string `config:"username"` //maybe use ssl.username ssl.password instead in future?
-	//SaslPassword  string `config:"password"`
+	// Currently only used for validation. Those values are later
+	// unpacked into temporary structs whenever they're necessary.
+	Topic  string `config:"topic"`
+	Topics []any  `config:"topics"`
 }
 
 type metaConfig struct {
@@ -84,22 +99,22 @@ var compressionModes = map[string]sarama.CompressionCodec{
 	// As of sarama 1.24.1, zstd support is broken
 	// (https://github.com/Shopify/sarama/issues/1252), which needs to be
 	// addressed before we add support here.
+
+	// (https://github.com/IBM/sarama/pull/1574) sarama version 1.26.0 has
+	// fixed this issue and elastic version of sarama has merged this commit.
+	// (https://github.com/elastic/sarama/commit/37faed7ffc7d59e681d99cfebd1f3d453d6d607c)
+
 	"none":   sarama.CompressionNone,
 	"no":     sarama.CompressionNone,
 	"off":    sarama.CompressionNone,
 	"gzip":   sarama.CompressionGZIP,
 	"lz4":    sarama.CompressionLZ4,
 	"snappy": sarama.CompressionSnappy,
+	"zstd":   sarama.CompressionZSTD,
 }
 
-const (
-	saslTypePlaintext   = sarama.SASLTypePlaintext
-	saslTypeSCRAMSHA256 = sarama.SASLTypeSCRAMSHA256
-	saslTypeSCRAMSHA512 = sarama.SASLTypeSCRAMSHA512
-)
-
-func defaultConfig() kafkaConfig {
-	return kafkaConfig{
+func defaultConfig() KafkaConfig {
+	return KafkaConfig{
 		Hosts:              nil,
 		TLS:                nil,
 		Kerberos:           nil,
@@ -120,42 +135,21 @@ func defaultConfig() kafkaConfig {
 		BrokerTimeout:    10 * time.Second,
 		Compression:      "gzip",
 		CompressionLevel: 4,
-		Version:          kafka.Version("1.0.0"),
+		Version:          kafka.Version("2.1.0"),
 		MaxRetries:       3,
-		ClientID:         "beats",
-		ChanBufferSize:   256,
-		Username:         "",
-		Password:         "",
+		Headers:          nil,
+		Backoff: backoffConfig{
+			Init: 1 * time.Second,
+			Max:  60 * time.Second,
+		},
+		ClientID:       "beats",
+		ChanBufferSize: 256,
+		Username:       "",
+		Password:       "",
 	}
 }
 
-func (c *saslConfig) configureSarama(config *sarama.Config) error {
-	switch strings.ToUpper(c.SaslMechanism) { // try not to force users to use all upper case
-	case "":
-		// SASL is not enabled
-		return nil
-	case saslTypePlaintext:
-		config.Net.SASL.Mechanism = sarama.SASLMechanism(sarama.SASLTypePlaintext)
-	case saslTypeSCRAMSHA256:
-		config.Net.SASL.Handshake = true
-		config.Net.SASL.Mechanism = sarama.SASLMechanism(sarama.SASLTypeSCRAMSHA256)
-		config.Net.SASL.SCRAMClientGeneratorFunc = func() sarama.SCRAMClient {
-			return &XDGSCRAMClient{HashGeneratorFcn: SHA256}
-		}
-	case saslTypeSCRAMSHA512:
-		config.Net.SASL.Handshake = true
-		config.Net.SASL.Mechanism = sarama.SASLMechanism(sarama.SASLTypeSCRAMSHA512)
-		config.Net.SASL.SCRAMClientGeneratorFunc = func() sarama.SCRAMClient {
-			return &XDGSCRAMClient{HashGeneratorFcn: SHA512}
-		}
-	default:
-		return fmt.Errorf("not valid mechanism '%v', only supported with PLAIN|SCRAM-SHA-512|SCRAM-SHA-256", c.SaslMechanism)
-	}
-
-	return nil
-}
-
-func readConfig(cfg *common.Config) (*kafkaConfig, error) {
+func ReadConfig(cfg *config.C) (*KafkaConfig, error) {
 	c := defaultConfig()
 	if err := cfg.Unpack(&c); err != nil {
 		return nil, err
@@ -163,7 +157,7 @@ func readConfig(cfg *common.Config) (*kafkaConfig, error) {
 	return &c, nil
 }
 
-func (c *kafkaConfig) Validate() error {
+func (c *KafkaConfig) Validate() error {
 	if len(c.Hosts) == 0 {
 		return errors.New("no hosts configured")
 	}
@@ -186,16 +180,38 @@ func (c *kafkaConfig) Validate() error {
 			return fmt.Errorf("compression_level must be between 0 and 9")
 		}
 	}
+
+	if c.Topic == "" && len(c.Topics) == 0 {
+		return errors.New("either 'topic' or 'topics' must be defined")
+	}
+
+	if len(c.Headers) != 0 && c.Version < kafka.Version("0.11") {
+		return errors.New("including headers is not supported for kafka versions < 0.11")
+	}
+
+	// When running under Elastic-Agent we do not support dynamic topic
+	// selection, so `topics` is not supported and `topic` is treated as an
+	// plain string
+	if management.UnderAgent() {
+		if len(c.Topics) != 0 {
+			return errors.New("'topics' is not supported when running under Elastic-Agent")
+		}
+	}
+
 	return nil
 }
 
-func newSaramaConfig(log *logp.Logger, config *kafkaConfig) (*sarama.Config, error) {
+func newSaramaConfig(log *logp.Logger, config *KafkaConfig) (*sarama.Config, error) {
 	partitioner, err := makePartitioner(log, config.Partition)
 	if err != nil {
 		return nil, err
 	}
 
 	k := sarama.NewConfig()
+	// If ApiVersionsRequest is set, then the client can negotiate down the
+	// version, making Version be a ceiling rather than a strict pinning.
+	// See https://github.com/IBM/sarama/releases/tag/v1.46.0 for details.
+	k.ApiVersionsRequest = false
 
 	// configure network level properties
 	timeout := config.Timeout
@@ -206,18 +222,26 @@ func newSaramaConfig(log *logp.Logger, config *kafkaConfig) (*sarama.Config, err
 	k.Producer.Timeout = config.BrokerTimeout
 	k.Producer.CompressionLevel = config.CompressionLevel
 
-	tls, err := tlscommon.LoadTLSConfig(config.TLS)
+	tls, err := tlscommon.LoadTLSConfig(config.TLS, log)
 	if err != nil {
 		return nil, err
 	}
 
 	if tls != nil {
 		k.Net.TLS.Enable = true
-		k.Net.TLS.Config = tls.BuildModuleConfig("")
+		k.Net.TLS.Config = tls.BuildModuleClientConfig("")
 	}
 
-	if config.Kerberos != nil {
-		cfgwarn.Beta("Kerberos authentication for Kafka is beta.")
+	switch {
+	case config.Kerberos.IsEnabled():
+		log.Warn(cfgwarn.Beta("Kerberos authentication for Kafka is beta."))
+
+		// Due to a regrettable past decision, the flag controlling Kerberos
+		// FAST authentication was initially added to the output configuration
+		// rather than the shared Kerberos configuration. To avoid a breaking
+		// change, we still check for the old flag, but it is deprecated and
+		// should be removed in a future version.
+		enableFAST := config.Kerberos.EnableFAST || config.EnableFAST
 
 		k.Net.SASL.Enable = true
 		k.Net.SASL.Mechanism = sarama.SASLTypeGSSAPI
@@ -229,18 +253,14 @@ func newSaramaConfig(log *logp.Logger, config *kafkaConfig) (*sarama.Config, err
 			Username:           config.Kerberos.Username,
 			Password:           config.Kerberos.Password,
 			Realm:              config.Kerberos.Realm,
+			DisablePAFXFAST:    !enableFAST,
 		}
-	}
 
-	if config.Username != "" {
+	case config.Username != "":
 		k.Net.SASL.Enable = true
 		k.Net.SASL.User = config.Username
 		k.Net.SASL.Password = config.Password
-		err = config.Sasl.configureSarama(k)
-
-		if err != nil {
-			return nil, err
-		}
+		config.Sasl.ConfigureSarama(k)
 	}
 
 	// configure metadata update properties
@@ -272,7 +292,7 @@ func newSaramaConfig(log *logp.Logger, config *kafkaConfig) (*sarama.Config, err
 		retryMax = 1000
 	}
 	k.Producer.Retry.Max = retryMax
-	// TODO: k.Producer.Retry.Backoff = ?
+	k.Producer.Retry.BackoffFunc = makeBackoffFunc(config.Backoff)
 
 	// configure per broker go channel buffering
 	k.ChannelBufferSize = config.ChanBufferSize
@@ -293,11 +313,15 @@ func newSaramaConfig(log *logp.Logger, config *kafkaConfig) (*sarama.Config, err
 	k.Version = version
 
 	k.Producer.Partitioner = partitioner
+
 	k.MetricRegistry = adapter.GetGoMetrics(
 		monitoring.Default,
-		"libbeat.outputs.kafka",
-		adapter.Rename("incoming-byte-rate", "bytes_read"),
-		adapter.Rename("outgoing-byte-rate", "bytes_write"),
+		"libbeat.outputs",
+		log,
+		adapter.Rename("incoming-byte-rate", "read.bytes"),
+		adapter.Rename("outgoing-byte-rate", "write.bytes"),
+		adapter.Rename("request-latency-in-ms", "write.latency"),
+		adapter.Rename("requests-in-flight", "kafka.requests-in-flight"),
 		adapter.GoMetricsNilify,
 	)
 
@@ -306,4 +330,24 @@ func newSaramaConfig(log *logp.Logger, config *kafkaConfig) (*sarama.Config, err
 		return nil, err
 	}
 	return k, nil
+}
+
+// makeBackoffFunc returns a stateless implementation of exponential-backoff-with-jitter. It is conceptually
+// equivalent to the stateful implementation used by other outputs, EqualJitterBackoff.
+func makeBackoffFunc(cfg backoffConfig) func(retries, maxRetries int) time.Duration {
+	maxBackoffRetries := int(math.Ceil(math.Log2(float64(cfg.Max) / float64(cfg.Init))))
+
+	return func(retries, _ int) time.Duration {
+		// compute 'base' duration for exponential backoff
+		dur := cfg.Max
+		if retries < maxBackoffRetries {
+			dur = time.Duration(uint64(cfg.Init) * uint64(1<<retries))
+		}
+
+		// apply about equaly distributed jitter in second half of the interval, such that the wait
+		// time falls into the interval [dur/2, dur]
+		limit := int64(dur / 2)
+		jitter := rand.Int64N(limit + 1)
+		return time.Duration(limit + jitter)
+	}
 }

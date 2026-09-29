@@ -2,10 +2,19 @@ package reviewdog
 
 import "context"
 
-var _ BulkCommentService = &multiCommentService{}
+var _ BulkCommentService = (*multiCommentService)(nil)
 
 type multiCommentService struct {
 	services []CommentService
+}
+
+func (m *multiCommentService) ShouldPrependGitRelDir() bool {
+	for _, cs := range m.services {
+		if cs.ShouldPrependGitRelDir() {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *multiCommentService) Post(ctx context.Context, c *Comment) error {
@@ -26,6 +35,14 @@ func (m *multiCommentService) Flush(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+func (m *multiCommentService) SetTool(toolName string, level string) {
+	for _, cs := range m.services {
+		if ncs, ok := cs.(NamedCommentService); ok {
+			ncs.SetTool(toolName, level)
+		}
+	}
 }
 
 // MultiCommentService creates a comment service that duplicates its post to

@@ -1,3 +1,4 @@
+//go:build mage
 // +build mage
 
 package main
@@ -14,7 +15,6 @@ import (
 	"github.com/elastic/beats/v7/dev-tools/mage/target/common"
 	"github.com/elastic/beats/v7/dev-tools/mage/target/pkg"
 	"github.com/elastic/beats/v7/dev-tools/mage/target/unittest"
-	"github.com/elastic/beats/v7/generator/common/beatgen"
 )
 
 func init() {
@@ -27,7 +27,7 @@ func init() {
 
 // VendorUpdate updates the vendor dir
 func VendorUpdate() error {
-	return beatgen.VendorUpdate()
+	return sh.Run("go", "mod", "vendor")
 }
 
 // Package packages the Beat for distribution.
@@ -37,10 +37,10 @@ func Package() {
 	start := time.Now()
 	defer func() { fmt.Println("package ran for", time.Since(start)) }()
 
-	devtools.UseCommunityBeatPackaging()
+	devtools.MustUsePackaging("community_beat", "dev-tools/packaging/packages.yml")
 
 	mg.Deps(Update)
-	mg.Deps(build.CrossBuild, build.CrossBuildGoDaemon)
+	mg.Deps(build.CrossBuild)
 	mg.SerialDeps(devtools.Package, pkg.PackageTest)
 }
 
@@ -88,11 +88,6 @@ func Build() error {
 // CrossBuild cross-builds the beat for all target platforms.
 func CrossBuild() error {
 	return build.CrossBuild()
-}
-
-// BuildGoDaemon builds the go-daemon binary (use crossBuildGoDaemon).
-func BuildGoDaemon() error {
-	return build.BuildGoDaemon()
 }
 
 // GolangCrossBuild build the Beat binary inside of the golang-builder.

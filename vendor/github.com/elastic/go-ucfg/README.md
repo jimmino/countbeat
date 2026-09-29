@@ -1,8 +1,7 @@
-[![Build
-Status](https://travis-ci.org/elastic/go-ucfg.svg?branch=master)](https://travis-ci.org/elastic/go-ucfg)
+[![ci](https://github.com/elastic/go-ucfg/actions/workflows/ci.yml/badge.svg)](https://github.com/elastic/go-ucfg/actions/workflows/ci.yml)
 [![Go Report
 Card](https://goreportcard.com/badge/github.com/elastic/go-ucfg)](https://goreportcard.com/report/github.com/elastic/go-ucfg)
-[![codecov](https://codecov.io/gh/elastic/go-ucfg/branch/master/graph/badge.svg)](https://codecov.io/gh/elastic/go-ucfg)
+[![codecov](https://codecov.io/gh/elastic/go-ucfg/branch/main/graph/badge.svg)](https://codecov.io/gh/elastic/go-ucfg)
 
 
 # ucfg - Universal Configuration

@@ -2,6 +2,7 @@ package windows
 
 import (
 	"fmt"
+	"strings"
 	"syscall"
 	"time"
 	"unsafe"
@@ -21,6 +22,12 @@ var (
 const (
 	PROCESS_QUERY_LIMITED_INFORMATION uint32 = 0x1000
 	PROCESS_VM_READ                   uint32 = 0x0010
+)
+
+// error codes for GetVolumeInformation function
+const (
+	ERROR_INVALID_FUNCTION syscall.Errno = 1
+	ERROR_NOT_READY        syscall.Errno = 21
 )
 
 // SizeOfRtlUserProcessParameters gives the size
@@ -188,10 +195,11 @@ func GetAccessPaths() ([]string, error) {
 	var paths []string
 	for _, volumeName := range volumes {
 		volumePaths, err := GetVolumePathsForVolume(volumeName)
-		if err != nil {
+		if err != nil && errors.Cause(err) != syscall.ERROR_FILE_NOT_FOUND {
 			return nil, errors.Wrapf(err, "failed to get list of access paths for volume '%s'", volumeName)
 		}
-		if len(volumePaths) == 0 {
+		if errors.Cause(err) == syscall.ERROR_FILE_NOT_FOUND || len(volumePaths) == 0 {
+			// FILE_NOT_FOUND because GetVolumes can return volume names that don't exist
 			continue
 		}
 
@@ -333,6 +341,23 @@ func GetDriveType(rootPathName string) (DriveType, error) {
 	}
 
 	return dt, nil
+}
+
+// GetFilesystemType returns file system type information at the given root path.
+// https://docs.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getvolumeinformationw
+func GetFilesystemType(rootPathName string) (string, error) {
+	rootPathNamePtr, err := syscall.UTF16PtrFromString(rootPathName)
+	var systemType = "unavailable"
+	if err != nil {
+		return "", errors.Wrapf(err, "UTF16PtrFromString failed for rootPathName=%v", rootPathName)
+	}
+	buffer := make([]uint16, MAX_PATH+1)
+	// _GetVolumeInformation will fail for external drives like CD-ROM or other type with error codes as ERROR_NOT_READY. ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, etc., these types of errors will be ignored
+	success, err := _GetVolumeInformation(rootPathNamePtr, nil, 0, nil, nil, nil, &buffer[0], MAX_PATH)
+	if success {
+		systemType = strings.ToLower(syscall.UTF16ToString(buffer))
+	}
+	return systemType, nil
 }
 
 // EnumProcesses retrieves the process identifier for each process object in the
@@ -587,6 +612,7 @@ func GetTickCount64() (uptime uint64, err error) {
 //sys   _GetProcessImageFileName(handle syscall.Handle, outImageFileName *uint16, size uint32) (length uint32, err error) = psapi.GetProcessImageFileNameW
 //sys   _GetSystemTimes(idleTime *syscall.Filetime, kernelTime *syscall.Filetime, userTime *syscall.Filetime) (err error) = kernel32.GetSystemTimes
 //sys   _GetDriveType(rootPathName *uint16) (dt DriveType, err error) = kernel32.GetDriveTypeW
+//sys   _GetVolumeInformation(rootPathName *uint16, volumeName *uint16, volumeNameSize uint32, volumeSerialNumber *uint32, maximumComponentLength *uint32, fileSystemFlags *uint32, fileSystemName *uint16, fileSystemNameSize uint32) (success bool, err error) [true] = kernel32.GetVolumeInformationW
 //sys   _EnumProcesses(processIds *uint32, sizeBytes uint32, bytesReturned *uint32) (err error) = psapi.EnumProcesses
 //sys   _GetDiskFreeSpaceEx(directoryName *uint16, freeBytesAvailable *uint64, totalNumberOfBytes *uint64, totalNumberOfFreeBytes *uint64) (err error) = kernel32.GetDiskFreeSpaceExW
 //sys   _Process32First(handle syscall.Handle, processEntry32 *ProcessEntry32) (err error) = kernel32.Process32FirstW

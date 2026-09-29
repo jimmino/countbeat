@@ -21,16 +21,16 @@ import (
 	"strings"
 
 	"github.com/elastic/beats/v7/libbeat/beat"
-	"github.com/elastic/beats/v7/libbeat/common"
 	"github.com/elastic/beats/v7/libbeat/common/cfgwarn"
 	"github.com/elastic/beats/v7/libbeat/mapping"
-	"github.com/elastic/beats/v7/libbeat/processors"
+	"github.com/elastic/elastic-agent-libs/logp"
+	"github.com/elastic/elastic-agent-libs/mapstr"
 
-	"github.com/mitchellh/hashstructure"
+	"github.com/gohugoio/hashstructure"
 )
 
 type timeseriesProcessor struct {
-	dimensions map[string]interface{}
+	dimensions map[string]any
 	prefixes   []string
 }
 
@@ -38,8 +38,8 @@ type timeseriesProcessor struct {
 // Events are processed to extract all their dimensions (keyword fields that
 // hold a dimension of the metrics) and compute a hash of all their values into
 // `timeseries.instance` field.
-func NewTimeSeriesProcessor(fields mapping.Fields) processors.Processor {
-	cfgwarn.Experimental("timeseries.instance field is experimental")
+func NewTimeSeriesProcessor(fields mapping.Fields, logger *logp.Logger) beat.Processor {
+	logger.Warn(cfgwarn.Experimental("timeseries.instance field is experimental"))
 
 	dimensions := map[string]bool{}
 	prefixes := map[string]bool{}
@@ -47,7 +47,7 @@ func NewTimeSeriesProcessor(fields mapping.Fields) processors.Processor {
 
 	// remove false values and convert to map where a nil value means
 	// it's a dimension
-	dimensionsNilDict := map[string]interface{}{}
+	dimensionsNilDict := map[string]any{}
 	for k, isDimension := range dimensions {
 		if isDimension {
 			dimensionsNilDict[k] = nil
@@ -67,7 +67,7 @@ func NewTimeSeriesProcessor(fields mapping.Fields) processors.Processor {
 
 func (t *timeseriesProcessor) Run(event *beat.Event) (*beat.Event, error) {
 	if event.TimeSeries {
-		instanceFields := common.MapStr{}
+		instanceFields := mapstr.M{}
 
 		// map all dimensions & values
 		for k, v := range event.Fields.Flatten() {
@@ -81,7 +81,7 @@ func (t *timeseriesProcessor) Run(event *beat.Event) (*beat.Event, error) {
 			// this should not happen, keep the event in any case
 			return event, err
 		}
-		event.Fields["timeseries"] = common.MapStr{
+		event.Fields["timeseries"] = mapstr.M{
 			"instance": h,
 		}
 	}

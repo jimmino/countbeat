@@ -18,17 +18,21 @@
 package dashboards
 
 import (
-	"io/ioutil"
+	"bufio"
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
 	"os"
 	"path"
 	"path/filepath"
 	"strconv"
 
-	"github.com/pkg/errors"
 	"gopkg.in/yaml.v2"
 
-	"github.com/elastic/beats/v7/libbeat/common"
-	"github.com/elastic/beats/v7/libbeat/kibana"
+	"github.com/elastic/elastic-agent-libs/kibana"
+	"github.com/elastic/elastic-agent-libs/mapstr"
+	"github.com/elastic/elastic-agent-libs/version"
 )
 
 const (
@@ -50,23 +54,23 @@ type YMLElement struct {
 }
 
 // Export wraps GetDashboard call to provide a more descriptive API
-func Export(client *kibana.Client, id string) (common.MapStr, error) {
-	return client.GetDashboard(id)
+func Export(client *kibana.Client, id string) ([]byte, error) {
+	return Get(client, id)
 }
 
 // ExportAllFromYml exports all dashboards found in the YML file
-func ExportAllFromYml(client *kibana.Client, ymlPath string) ([]common.MapStr, ListYML, error) {
-	b, err := ioutil.ReadFile(ymlPath)
+func ExportAllFromYml(client *kibana.Client, ymlPath string) ([][]byte, ListYML, error) {
+	b, err := os.ReadFile(ymlPath)
 	if err != nil {
-		return nil, ListYML{}, errors.Wrap(err, "error opening the list of dashboards")
+		return nil, ListYML{}, fmt.Errorf("error opening the list of dashboards: %w", err)
 	}
 	var list ListYML
 	err = yaml.Unmarshal(b, &list)
 	if err != nil {
-		return nil, ListYML{}, errors.Wrap(err, "error reading the list of dashboards")
+		return nil, ListYML{}, fmt.Errorf("error reading the list of dashboards: %w", err)
 	}
 	if len(list.Dashboards) == 0 {
-		return nil, ListYML{}, errors.Errorf("dashboards list is empty in file %v", ymlPath)
+		return nil, ListYML{}, fmt.Errorf("dashboards list is empty in file %v", ymlPath)
 	}
 
 	results, err := ExportAll(client, list)
@@ -75,12 +79,12 @@ func ExportAllFromYml(client *kibana.Client, ymlPath string) ([]common.MapStr, L
 }
 
 // ExportAll exports all dashboards from an opened and parsed dashboards YML.
-func ExportAll(client *kibana.Client, list ListYML) ([]common.MapStr, error) {
-	var results []common.MapStr
+func ExportAll(client *kibana.Client, list ListYML) ([][]byte, error) {
+	var results [][]byte
 	for _, e := range list.Dashboards {
 		result, err := Export(client, e.ID)
 		if err != nil {
-			return nil, errors.Wrapf(err, "failed exporting id=%v", e.ID)
+			return nil, fmt.Errorf("failed exporting id=%v: %w", e.ID, err)
 		}
 		results = append(results, result)
 	}
@@ -88,7 +92,7 @@ func ExportAll(client *kibana.Client, list ListYML) ([]common.MapStr, error) {
 }
 
 // SaveToFile creates the required directories if needed and saves dashboard.
-func SaveToFile(dashboard common.MapStr, filename, root string, version common.Version) error {
+func SaveToFile(dashboard []byte, filename, root string, version version.V) error {
 	dashboardsPath := path.Join("_meta", "kibana", strconv.Itoa(version.Major), "dashboard")
 	err := os.MkdirAll(path.Join(root, dashboardsPath), 0750)
 	if err != nil {
@@ -97,5 +101,67 @@ func SaveToFile(dashboard common.MapStr, filename, root string, version common.V
 
 	out := filepath.Join(root, dashboardsPath, filename)
 
-	return ioutil.WriteFile(out, []byte(dashboard.StringToPrint()), OutputPermission)
+	return os.WriteFile(out, dashboard, OutputPermission)
+}
+
+// SaveToFile creates the required directories if needed and saves dashboard.
+func SaveToFolder(dashboard []byte, root string, version version.V) error {
+	p := path.Join(root, "_meta", "kibana", strconv.Itoa(version.Major))
+	err := os.MkdirAll(p, 0750)
+	if err != nil {
+		return fmt.Errorf("failed to create folder ('%s') for new dashboard: %+v", p, err)
+	}
+
+	r := bufio.NewReader(bytes.NewReader(dashboard))
+	for {
+		line, err := r.ReadBytes('\n')
+		if err != nil {
+			if err == io.EOF {
+				return saveAsset(line, p)
+			}
+			return fmt.Errorf("error while reading dashboard lines: %+v", err)
+		}
+		err = saveAsset(line, p)
+		if err != nil {
+			return fmt.Errorf("error while saving dashboard asset: %+v", err)
+		}
+	}
+}
+
+func saveAsset(line []byte, assetRoot string) error {
+	var a mapstr.M
+	err := json.Unmarshal(line, &a)
+	if err != nil {
+		return fmt.Errorf("failed to decode dashboard asset: %+v", err)
+	}
+
+	t, err := a.GetValue("type")
+	if err != nil {
+		return fmt.Errorf("failed to retrieve asset type: %+v", err)
+	}
+	assetType, ok := t.(string)
+	if !ok {
+		return fmt.Errorf("asset type must be string: %+v", t)
+	}
+	id, err := a.GetValue("id")
+	if err != nil {
+		return fmt.Errorf("failed to retrieve asset id: %+v", err)
+	}
+	assetID, ok := id.(string)
+	if !ok {
+		return fmt.Errorf("asset id must be string: %+v", id)
+	}
+	assetFolder := filepath.Join(assetRoot, assetType)
+	err = os.MkdirAll(assetFolder, 0750)
+	if err != nil {
+		return fmt.Errorf("failed to create folder ('%s') for asset: %+v", assetFolder, err)
+	}
+
+	out := filepath.Join(assetFolder, assetID+".json")
+	assetIndented, err := json.MarshalIndent(a, "", "    ")
+	if err != nil {
+		return fmt.Errorf("failed to get indented bytes: %+v", err)
+	}
+	return os.WriteFile(out, assetIndented, OutputPermission)
+
 }

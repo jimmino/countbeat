@@ -29,9 +29,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	errw "github.com/pkg/errors"
-
-	"github.com/elastic/beats/v7/libbeat/common"
+	"github.com/elastic/elastic-agent-libs/mapstr"
+	"github.com/elastic/elastic-agent-libs/version"
 )
 
 // ErrNotFound returned when we cannot find any dashboard to import.
@@ -42,24 +41,25 @@ type ErrNotFound struct {
 // Error returns the human readable error.
 func (e *ErrNotFound) Error() string { return e.ErrorString }
 
-func newErrNotFound(s string, a ...interface{}) *ErrNotFound {
+func newErrNotFound(s string, a ...any) *ErrNotFound {
 	return &ErrNotFound{fmt.Sprintf(s, a...)}
 }
 
 // MessageOutputter is a function type for injecting status logging
 // into this module.
-type MessageOutputter func(msg string, a ...interface{})
+type MessageOutputter func(msg string, a ...any)
 
+// Importer is a type to import dashboards
 type Importer struct {
 	cfg     *Config
-	version common.Version
+	version version.V
 
 	loader KibanaLoader
-	fields common.MapStr
+	fields mapstr.M
 }
 
 // NewImporter creates a new dashboard importer
-func NewImporter(version common.Version, cfg *Config, loader KibanaLoader, fields common.MapStr) (*Importer, error) {
+func NewImporter(version version.V, cfg *Config, loader KibanaLoader, fields mapstr.M) (*Importer, error) {
 
 	// Current max version is 7
 	if version.Major > 6 {
@@ -79,23 +79,25 @@ func (imp Importer) Import() error {
 	if imp.cfg.URL != "" || imp.cfg.File != "" {
 		err := imp.ImportArchive()
 		if err != nil {
-			return errw.Wrap(err, "Error importing URL/file")
+			return fmt.Errorf("Error importing URL/file: %w", err)
 		}
 	} else {
 		err := imp.ImportKibanaDir(imp.cfg.Dir)
 		if err != nil {
-			return errw.Wrapf(err, "Error importing directory %s", imp.cfg.Dir)
+			return fmt.Errorf("Error importing directory %s: %w", imp.cfg.Dir, err)
 		}
 	}
 	return nil
 }
 
+// ImportDashboard imports a dashboard
 func (imp Importer) ImportDashboard(file string) error {
 	imp.loader.statusMsg("Import dashboard %s", file)
 
 	return imp.loader.ImportDashboard(file)
 }
 
+// ImportFile imports a file
 func (imp Importer) ImportFile(fileType string, file string) error {
 	imp.loader.statusMsg("Import %s from %s", fileType, file)
 
@@ -107,13 +109,13 @@ func (imp Importer) ImportFile(fileType string, file string) error {
 	return fmt.Errorf("Unexpected file type %s", fileType)
 }
 
+// ImportDir imports a directory
 func (imp Importer) ImportDir(dirType string, dir string) error {
 	imp.loader.statusMsg("Import directory %s", dir)
 
-	dir = path.Join(dir, dirType)
 	var errors []string
 
-	files, err := filepath.Glob(path.Join(dir, "*.json"))
+	files, err := filepath.Glob(path.Join(dir, dirType, "*.json"))
 	if err != nil {
 		return fmt.Errorf("Failed to read directory %s. Error: %s", dir, err)
 	}
@@ -191,10 +193,11 @@ func (imp Importer) unzip(archive, target string) error {
 	return nil
 }
 
+// ImportArchive imports a zip archive
 func (imp Importer) ImportArchive() error {
 	var archive string
 
-	target, err := ioutil.TempDir("", "tmp")
+	target, err := os.MkdirTemp("", "tmp")
 	if err != nil {
 		return fmt.Errorf("Failed to generate a temporary directory name: %v", err)
 	}
@@ -241,6 +244,8 @@ func (imp Importer) ImportArchive() error {
 			if err != nil {
 				return err
 			}
+		} else {
+			imp.loader.statusMsg("Skipping import of %s directory. Beat name: %s, base dir name: %s.", dir, imp.cfg.Beat, filepath.Base(dir))
 		}
 	}
 	return nil
@@ -292,7 +297,7 @@ func (imp Importer) downloadFile(url string, target string) (string, error) {
 	return targetPath, nil
 }
 
-// import Kibana dashboards and index-pattern or only one of these
+// ImportKibanaDir imports dashboards and index-pattern or only one of these
 func (imp Importer) ImportKibanaDir(dir string) error {
 	var err error
 
@@ -300,7 +305,9 @@ func (imp Importer) ImportKibanaDir(dir string) error {
 
 	// Loads the internal index pattern
 	if imp.fields != nil {
-		imp.loader.ImportIndex(imp.fields)
+		if err = imp.loader.ImportIndex(imp.fields); err != nil {
+			return fmt.Errorf("failed to import Kibana index pattern: %w", err)
+		}
 	}
 
 	dir = path.Join(dir, versionPath)

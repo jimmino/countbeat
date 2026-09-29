@@ -18,13 +18,13 @@
 package logstash
 
 import (
+	"context"
 	"time"
 
-	"github.com/elastic/beats/v7/libbeat/beat"
-	"github.com/elastic/beats/v7/libbeat/common/transport"
-	"github.com/elastic/beats/v7/libbeat/logp"
 	"github.com/elastic/beats/v7/libbeat/outputs"
 	"github.com/elastic/beats/v7/libbeat/publisher"
+	"github.com/elastic/elastic-agent-libs/logp"
+	"github.com/elastic/elastic-agent-libs/transport"
 	v2 "github.com/elastic/go-lumber/client/v2"
 )
 
@@ -39,12 +39,12 @@ type syncClient struct {
 }
 
 func newSyncClient(
-	beat beat.Info,
+	log *logp.Logger,
+	beatVersion string,
 	conn *transport.Client,
 	observer outputs.Observer,
 	config *Config,
 ) (*syncClient, error) {
-	log := logp.NewLogger("logstash")
 	c := &syncClient{
 		log:      log,
 		Client:   conn,
@@ -60,7 +60,7 @@ func newSyncClient(
 	}
 
 	var err error
-	enc := makeLogstashEventEncoder(log, beat, config.EscapeHTML, config.Index)
+	enc := makeLogstashEventEncoder(log, beatVersion, config.EscapeHTML, config.Index)
 	c.client, err = v2.NewSyncClientWithConn(conn,
 		v2.JSONEncoder(enc),
 		v2.Timeout(config.Timeout),
@@ -73,9 +73,9 @@ func newSyncClient(
 	return c, nil
 }
 
-func (c *syncClient) Connect() error {
+func (c *syncClient) Connect(ctx context.Context) error {
 	c.log.Debug("connect")
-	err := c.Client.Connect()
+	err := c.ConnectContext(ctx)
 	if err != nil {
 		return err
 	}
@@ -101,7 +101,7 @@ func (c *syncClient) reconnect() error {
 	return c.Client.Connect()
 }
 
-func (c *syncClient) Publish(batch publisher.Batch) error {
+func (c *syncClient) Publish(_ context.Context, batch publisher.Batch) error {
 	events := batch.Events()
 	st := c.observer
 
@@ -112,7 +112,10 @@ func (c *syncClient) Publish(batch publisher.Batch) error {
 		return nil
 	}
 
+	deadlockListener := newDeadlockListener(c.log, logstashDeadlockTimeout)
+	defer deadlockListener.close()
 	for len(events) > 0 {
+
 		// check if we need to reconnect
 		if c.ticker != nil {
 			select {
@@ -135,33 +138,34 @@ func (c *syncClient) Publish(batch publisher.Batch) error {
 			err error
 		)
 
+		begin := time.Now()
 		if c.win == nil {
 			n, err = c.sendEvents(events)
 		} else {
 			n, err = c.publishWindowed(events)
 		}
-
+		took := time.Since(begin)
+		st.ReportLatency(took)
 		c.log.Debugf("%v events out of %v events sent to logstash host %s. Continue sending",
 			n, len(events), c.Host())
 
 		events = events[n:]
-		st.Acked(n)
+		st.AckedEvents(n)
+		deadlockListener.ack(n)
 		if err != nil {
 			// return batch to pipeline before reporting/counting error
 			batch.RetryEvents(events)
 
-			if c.win != nil {
-				c.win.shrinkWindow()
-			}
 			_ = c.Close()
 
 			c.log.Errorf("Failed to publish events caused by: %+v", err)
 
 			rest := len(events)
-			st.Failed(rest)
+			st.RetryableErrors(rest)
 
 			return err
 		}
+
 	}
 
 	batch.ACK()
@@ -181,6 +185,7 @@ func (c *syncClient) publishWindowed(events []publisher.Event) (int, error) {
 
 	n, err := c.sendEvents(events)
 	if err != nil {
+		c.win.shrinkWindow()
 		return n, err
 	}
 
@@ -189,7 +194,7 @@ func (c *syncClient) publishWindowed(events []publisher.Event) (int, error) {
 }
 
 func (c *syncClient) sendEvents(events []publisher.Event) (int, error) {
-	window := make([]interface{}, len(events))
+	window := make([]any, len(events))
 	for i := range events {
 		window[i] = &events[i].Content
 	}

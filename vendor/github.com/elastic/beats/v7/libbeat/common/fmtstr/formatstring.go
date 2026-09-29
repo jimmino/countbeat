@@ -28,7 +28,7 @@ import (
 type FormatEvaler interface {
 	// Eval will execute the format and writes the results into
 	// the provided output buffer. Returns error on failure.
-	Eval(ctx interface{}, out *bytes.Buffer) error
+	Eval(ctx any, out *bytes.Buffer) error
 }
 
 // StringFormatter interface extends FormatEvaler adding support for querying
@@ -37,7 +37,7 @@ type StringFormatter interface {
 	FormatEvaler
 
 	// Run execute the formatter returning the generated string.
-	Run(ctx interface{}) (string, error)
+	Run(ctx any) (string, error)
 
 	// IsConst returns true, if execution of formatter will always return the
 	// same constant string.
@@ -132,7 +132,7 @@ func Compile(in string, vc VariableCompiler) (StringFormatter, error) {
 }
 
 func compile(ctx *compileCtx, in string) (StringFormatter, error) {
-	lexer := makeLexer(in)
+	lexer := MakeLexer(in)
 	defer lexer.Finish()
 
 	// parse format string
@@ -199,12 +199,12 @@ func optimize(in []FormatEvaler) []FormatEvaler {
 	return out
 }
 
-func (f constStringFormatter) Eval(_ interface{}, out *bytes.Buffer) error {
+func (f constStringFormatter) Eval(_ any, out *bytes.Buffer) error {
 	_, err := out.WriteString(f.s)
 	return err
 }
 
-func (f constStringFormatter) Run(_ interface{}) (string, error) {
+func (f constStringFormatter) Run(_ any) (string, error) {
 	return f.s, nil
 }
 
@@ -212,7 +212,7 @@ func (f constStringFormatter) IsConst() bool {
 	return true
 }
 
-func (f execStringFormatter) Eval(ctx interface{}, out *bytes.Buffer) error {
+func (f execStringFormatter) Eval(ctx any, out *bytes.Buffer) error {
 	for _, evaler := range f.evalers {
 		if err := evaler.Eval(ctx, out); err != nil {
 			return err
@@ -221,7 +221,7 @@ func (f execStringFormatter) Eval(ctx interface{}, out *bytes.Buffer) error {
 	return nil
 }
 
-func (f execStringFormatter) Run(ctx interface{}) (string, error) {
+func (f execStringFormatter) Run(ctx any) (string, error) {
 	buf := bytes.NewBuffer(nil)
 	if err := f.Eval(ctx, buf); err != nil {
 		return "", err
@@ -239,7 +239,7 @@ func (e StringElement) compile(ctx *compileCtx) (FormatEvaler, error) {
 
 // Eval write the string elements constant string value into
 // output buffer.
-func (e StringElement) Eval(_ interface{}, out *bytes.Buffer) error {
+func (e StringElement) Eval(_ any, out *bytes.Buffer) error {
 	_, err := out.WriteString(e.s)
 	return err
 }
@@ -265,8 +265,13 @@ func (e variableElement) compile(ctx *compileCtx) (FormatEvaler, error) {
 	return ctx.compileVariable(e.field, e.ops)
 }
 
-func parse(lex lexer) ([]formatElement, error) {
-	var elems []formatElement
+// parseFormatTokens runs the shared lexer-driven loop
+func parseFormatTokens[T any](
+	lex lexer,
+	appendLiteral func(*[]T, string),
+	parseVar func(lexer) (T, error),
+) ([]T, error) {
+	var elems []T
 
 	for token := range lex.Tokens() {
 		switch token.typ {
@@ -274,10 +279,10 @@ func parse(lex lexer) ([]formatElement, error) {
 			return nil, errors.New(token.val)
 
 		case tokString:
-			elems = append(elems, StringElement{token.val})
+			appendLiteral(&elems, token.val)
 
 		case tokOpen:
-			elem, err := parseVariable(lex)
+			elem, err := parseVar(lex)
 			if err != nil {
 				return nil, err
 			}
@@ -285,11 +290,17 @@ func parse(lex lexer) ([]formatElement, error) {
 
 		case tokClose, tokOperator:
 			// should not happen, but let's return error just in case
-			return nil, fmt.Errorf("Token '%v'(%v) not allowed", token.val, token.typ)
+			return nil, fmt.Errorf("token '%v'(%v) not allowed", token.val, token.typ)
 		}
 	}
 
 	return elems, nil
+}
+
+func parse(lex lexer) ([]formatElement, error) {
+	return parseFormatTokens(lex, func(elems *[]formatElement, s string) {
+		*elems = append(*elems, StringElement{s})
+	}, parseVariable)
 }
 
 func parseVariable(lex lexer) (formatElement, error) {
@@ -312,7 +323,7 @@ func parseVariable(lex lexer) (formatElement, error) {
 
 		case tokString:
 			if len(strings) != len(ops) {
-				return nil, fmt.Errorf("Unexpected string token %v, expected operator", token.val)
+				return nil, fmt.Errorf("unexpected string token %v, expected operator", token.val)
 			}
 			strings = append(strings, token.val)
 
@@ -322,18 +333,82 @@ func parseVariable(lex lexer) (formatElement, error) {
 			}
 			ops = append(ops, token.val)
 			if len(ops) > len(strings) {
-				return nil, fmt.Errorf("Consecutive operator tokens '%v'", token.val)
+				return nil, fmt.Errorf("consecutive operator tokens '%v'", token.val)
 			}
 
 		default:
-			return nil, fmt.Errorf("Unexpected token '%v' (%v)", token.val, token.typ)
+			return nil, fmt.Errorf("unexpected token '%v' (%v)", token.val, token.typ)
 		}
 	}
 
 	return nil, errMissingClose
 }
 
-func makeLexer(in string) lexer {
+type VariableToken string
+
+// ParseRawTokens returns a slice of tokens as they occur.
+// variable tokens are stored as typed value
+func ParseRawTokens(lex lexer) ([]any, error) {
+	return parseFormatTokens(lex, func(elems *[]any, s string) {
+		*elems = append(*elems, s)
+	}, func(lex lexer) (any, error) {
+		s, err := parseVariableToken(lex)
+		if err != nil {
+			return nil, err
+		}
+		return VariableToken(s), nil
+	})
+}
+
+// parseVariableToken consumes lexer tokens inside %{...} and returns the full inner
+// expression as one string  e.g. "unknown:default".
+// Callers must parse operators if needed
+func parseVariableToken(lex lexer) (string, error) {
+	// finalValue appends each string chunk and operator as they appear.
+	var finalValue string
+	var strings []string
+	var ops []string
+
+	for token := range lex.Tokens() {
+		switch token.typ {
+		case tokErr:
+			return "", errors.New(token.val)
+
+		case tokOpen:
+			return "", errNestedVar
+
+		case tokClose:
+			if len(strings) == 0 {
+				return "", errEmptyFormat
+			}
+			return finalValue, nil
+
+		case tokString:
+			if len(strings) != len(ops) {
+				return "", fmt.Errorf("unexpected string token %v, expected operator", token.val)
+			}
+			strings = append(strings, token.val)
+			finalValue += token.val
+
+		case tokOperator:
+			if len(strings) == 0 {
+				return "", errUnexpectedOperator
+			}
+			ops = append(ops, token.val)
+			if len(ops) > len(strings) {
+				return "", fmt.Errorf("consecutive operator tokens '%v'", token.val)
+			}
+			finalValue += token.val
+
+		default:
+			return "", fmt.Errorf("unexpected token '%v' (%v)", token.val, token.typ)
+		}
+	}
+
+	return "", errMissingClose
+}
+
+func MakeLexer(in string) lexer {
 	lex := make(chan token, 1)
 
 	go func() {
@@ -359,7 +434,10 @@ func makeLexer(in string) lexer {
 
 		varcount := 0
 		for len(content) > 0 {
-			idx := -1
+			if off > len(content) {
+				return
+			}
+			var idx int
 			if varcount == 0 {
 				idx = strings.IndexAny(content[off:], `%\`)
 			} else {
@@ -387,7 +465,8 @@ func makeLexer(in string) lexer {
 				op := ":"
 				if strings.ContainsRune("!@#&*=+<>?", rune(content[off])) {
 					off++
-					op = content[idx : off+1]
+					// Two-byte op e.g. ":!"
+					op = content[idx:off]
 				}
 				lex <- opToken(op)
 

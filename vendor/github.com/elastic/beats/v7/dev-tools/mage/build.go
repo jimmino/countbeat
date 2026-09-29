@@ -18,16 +18,21 @@
 package mage
 
 import (
+	"errors"
 	"fmt"
 	"go/build"
 	"log"
+	"maps"
 	"os"
 	"path/filepath"
+	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/josephspurrier/goversioninfo"
 	"github.com/magefile/mage/sh"
-	"github.com/pkg/errors"
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
 )
 
 // BuildArgs are the arguments used for the "build" target and they define how
@@ -37,6 +42,7 @@ type BuildArgs struct {
 	InputFiles  []string
 	OutputDir   string
 	CGO         bool
+	BuildMode   string // Controls `go build -buildmode`
 	Static      bool
 	Env         map[string]string
 	LDFlags     []string
@@ -45,14 +51,45 @@ type BuildArgs struct {
 	WinMetadata bool // Add resource metadata to Windows binaries (like add the version number to the .exe properties).
 }
 
+// buildTagRE is a regexp to match strings like "-tags=abcd"
+// but does not match "-tags= "
+var buildTagRE = regexp.MustCompile(`-tags=([\S]+)?`)
+
+// ParseBuildTags returns the ExtraFlags param where all flags that are go build tags are joined by a comma.
+//
+// For example if given -someflag=val1 -tags=buildtag1 -tags=buildtag2
+// It will return -someflag=val1 -tags=buildtag1,buildtag2
+func (b BuildArgs) ParseBuildTags() []string {
+	flags := make([]string, 0)
+	if len(b.ExtraFlags) == 0 {
+		return flags
+	}
+
+	buildTags := make([]string, 0)
+	for _, flag := range b.ExtraFlags {
+		if buildTagRE.MatchString(flag) {
+			arr := buildTagRE.FindStringSubmatch(flag)
+			if len(arr) != 2 || arr[1] == "" {
+				log.Printf("Parsing buildargs.ExtraFlags found strange flag %q ignoring value", flag)
+				continue
+			}
+			buildTags = append(buildTags, arr[1])
+		} else {
+			flags = append(flags, flag)
+		}
+	}
+	if len(buildTags) > 0 {
+		flags = append(flags, "-tags="+strings.Join(buildTags, ","))
+	}
+	return flags
+}
+
 // DefaultBuildArgs returns the default BuildArgs for use in builds.
 func DefaultBuildArgs() BuildArgs {
 	args := BuildArgs{
 		Name: BeatName,
 		CGO:  build.Default.CgoEnabled,
-		LDFlags: []string{
-			"-s", // Strip all debug symbols from binary (does not affect Go stack traces).
-		},
+		Env:  map[string]string{},
 		Vars: map[string]string{
 			elasticBeatsModulePath + "/libbeat/version.buildTime": "{{ date }}",
 			elasticBeatsModulePath + "/libbeat/version.commit":    "{{ commit }}",
@@ -62,7 +99,43 @@ func DefaultBuildArgs() BuildArgs {
 	if versionQualified {
 		args.Vars[elasticBeatsModulePath+"/libbeat/version.qualifier"] = "{{ .Qualifier }}"
 	}
+
+	if positionIndependentCodeSupported() {
+		args.BuildMode = "pie"
+	}
+
+	if DevBuild {
+		// Disable optimizations (-N) and inlining (-l) for debugging.
+		args.ExtraFlags = append(args.ExtraFlags, `-gcflags=all=-N -l`)
+	} else {
+		// Strip all debug symbols from binary (does not affect Go stack traces).
+		args.LDFlags = append(args.LDFlags, "-s")
+		// Remove all file system paths from the compiled executable, to improve build reproducibility
+		args.ExtraFlags = append(args.ExtraFlags, "-trimpath")
+	}
+	if FIPSBuild {
+		for _, tag := range FIPSConfig.Compile.Tags {
+			args.ExtraFlags = append(args.ExtraFlags, "-tags="+tag)
+		}
+		maps.Copy(args.Env, FIPSConfig.Compile.Env)
+	}
+
 	return args
+}
+
+// positionIndependentCodeSupported checks if the target platform support position independent code (or ASLR).
+//
+// The list of supported platforms is compiled based on the Go release notes: https://golang.org/doc/devel/release.html
+// The list has been updated according to the Go version: 1.16
+func positionIndependentCodeSupported() bool {
+	return slices.Contains([]string{"darwin"}, Platform.GOOS) ||
+		(Platform.GOOS == "linux" && slices.Contains([]string{"riscv64", "amd64", "arm", "arm64", "ppc64le", "386"}, Platform.GOARCH)) ||
+		(Platform.GOOS == "aix" && Platform.GOARCH == "ppc64") ||
+
+		// Windows 32bit supports ASLR, but Windows Server 2003 and earlier do not.
+		// According to the support matrix (https://www.elastic.co/support/matrix), these old versions
+		// are not supported.
+		(Platform.GOOS == "windows")
 }
 
 // DefaultGolangCrossBuildArgs returns the default BuildArgs for use in
@@ -87,11 +160,38 @@ func DefaultGolangCrossBuildArgs() BuildArgs {
 // environment.
 func GolangCrossBuild(params BuildArgs) error {
 	if os.Getenv("GOLANG_CROSSBUILD") != "1" {
-		return errors.New("Use the crossBuild target. golangCrossBuild can " +
-			"only be executed within the golang-crossbuild docker environment.")
+		return errors.New("use the crossBuild target; golangCrossBuild can " +
+			"only be executed within the golang-crossbuild docker environment")
 	}
 
-	defer DockerChown(filepath.Join(params.OutputDir, params.Name+binaryExtension(GOOS)))
+	mountPoint, err := ElasticBeatsDir()
+	if err != nil {
+		return err
+	}
+	if err := sh.Run("git", "config", "--global", "--add", "safe.directory", mountPoint); err != nil {
+		return err
+	}
+
+	// Support projects outside of the beats directory.
+	repoInfo, err := GetProjectRepoInfo()
+	if err != nil {
+		return err
+	}
+
+	// TODO: Support custom build dir/subdir
+	projectMountPoint := filepath.ToSlash(filepath.Join("/go", "src", repoInfo.CanonicalRootImportPath))
+	if err := sh.Run("git", "config", "--global", "--add", "safe.directory", projectMountPoint); err != nil {
+		return err
+	}
+
+	defer DockerChown(filepath.Join(params.OutputDir))
+	// Build() calls os.MkdirAll for OutputDir, which may create parent
+	// directories as root inside the container. Chown the topmost newly
+	// created directory so the entire tree is owned by the invoking user.
+	if newTop := topmostNonexistentDir(params.OutputDir); newTop != "" {
+		defer DockerChown(newTop)
+	}
+
 	return Build(params)
 }
 
@@ -118,23 +218,16 @@ func Build(params BuildArgs) error {
 	}
 	env["CGO_ENABLED"] = cgoEnabled
 
-	if UseVendor {
-		var goFlags string
-		goFlags, ok := env["GOFLAGS"]
-		if !ok {
-			env["GOFLAGS"] = "-mod=vendor"
-		} else {
-			env["GOFLAGS"] = strings.Join([]string{goFlags, "-mod=vendor"}, " ")
-		}
-	}
-
 	// Spec
 	args := []string{
 		"build",
 		"-o",
 		filepath.Join(params.OutputDir, binaryName),
 	}
-	args = append(args, params.ExtraFlags...)
+	if params.BuildMode != "" {
+		args = append(args, "-buildmode", params.BuildMode)
+	}
+	args = append(args, params.ParseBuildTags()...)
 
 	// ldflags
 	ldflags := params.LDFlags
@@ -157,13 +250,29 @@ func Build(params BuildArgs) error {
 		log.Println("Generating a .syso containing Windows file metadata.")
 		syso, err := MakeWindowsSysoFile()
 		if err != nil {
-			return errors.Wrap(err, "failed generating Windows .syso metadata file")
+			return fmt.Errorf("failed generating Windows .syso metadata file: %w", err)
 		}
 		defer os.Remove(syso)
 	}
 
 	log.Println("Adding build environment vars:", env)
 	return sh.RunWith(env, "go", args...)
+}
+
+// topmostNonexistentDir returns the topmost path component that does not yet exist
+// and would be created by os.MkdirAll. DockerChown walks recursively, so
+// chowning this single root is enough to cover every newly created directory.
+// Returns "" if every component already exists.
+func topmostNonexistentDir(path string) string {
+	var top string
+	for p := filepath.Clean(path); p != "." && p != string(filepath.Separator); p = filepath.Dir(p) {
+		if _, err := os.Stat(p); os.IsNotExist(err) {
+			top = p
+		} else {
+			break
+		}
+	}
+	return top
 }
 
 // MakeWindowsSysoFile generates a .syso file containing metadata about the
@@ -196,7 +305,7 @@ func MakeWindowsSysoFile() (string, error) {
 		},
 		StringFileInfo: goversioninfo.StringFileInfo{
 			CompanyName:      BeatVendor,
-			ProductName:      strings.Title(BeatName),
+			ProductName:      cases.Title(language.English).String(BeatName),
 			ProductVersion:   version,
 			FileVersion:      version,
 			FileDescription:  BeatDescription,
@@ -210,7 +319,7 @@ func MakeWindowsSysoFile() (string, error) {
 	vi.Walk()
 	sysoFile := BeatName + "_windows_" + GOARCH + ".syso"
 	if err = vi.WriteSyso(sysoFile, GOARCH); err != nil {
-		return "", errors.Wrap(err, "failed to generate syso file with Windows metadata")
+		return "", fmt.Errorf("failed to generate syso file with Windows metadata: %w", err)
 	}
 	return sysoFile, nil
 }

@@ -1,9 +1,8 @@
 # go-sysinfo
 
-[![Build Status](http://img.shields.io/travis/elastic/go-sysinfo.svg?style=flat-square)][travis]
+[![go](https://github.com/elastic/go-sysinfo/actions/workflows/go.yml/badge.svg)](https://github.com/elastic/go-sysinfo/actions/workflows/go.yml)
 [![Go Documentation](http://img.shields.io/badge/go-documentation-blue.svg?style=flat-square)][godocs]
 
-[travis]: http://travis-ci.org/elastic/go-sysinfo
 [godocs]: http://godoc.org/github.com/elastic/go-sysinfo
 
 go-sysinfo is a library for collecting system information. This includes
@@ -31,25 +30,58 @@ if handleCounter, ok := process.(types.OpenHandleCounter); ok {
 These tables show what methods are implemented as well as the extra interfaces
 that are implemented.
 
-| `Host` Features  | Darwin | Linux | Windows |
-|------------------|--------|-------|---------|
-| `Info()`         | x      | x     | x       |
-| `Memory()`       | x      | x     | x       |
-| `CPUTimer`       | x      | x     | x       |
-| `VMStat`         |        | x     |         |
-| `NetworkCounters`|        | x     |         |
+| `Host` Features  | Darwin | Linux | Windows | AIX |
+|------------------|--------|-------|---------|-----|
+| `Info()`         | x      | x     | x       | x   |
+| `Memory()`       | x      | x     | x       | x   |
+| `CPUTimer`       | x      | x     | x       | x   |
+| `LoadAverage`    | x      | x     |         |     |
+| `VMStat`         |        | x     |         |     |
+| `NetworkCounters`|        | x     |         |     |
 
-| `Process` Features     | Darwin | Linux | Windows |
-|------------------------|--------|-------|---------|
-| `Info()`               | x      | x     | x       |
-| `Memory()`             | x      | x     | x       |
-| `User()`               | x      | x     | x       |
-| `Parent()`             | x      | x     | x       |
-| `CPUTimer`             | x      | x     | x       |
-| `Environment`          | x      | x     |         |
-| `OpenHandleEnumerator` |        | x     |         |
-| `OpenHandleCounter`    |        | x     |         |
-| `Seccomp`              |        | x     |         |
-| `Capabilities`         |        | x     |         |
+| `Process` Features     | Darwin | Linux | Windows | AIX |
+|------------------------|--------|-------|---------|-----|
+| `Info()`               | x      | x     | x       | x   |
+| `Memory()`             | x      | x     | x       | x   |
+| `User()`               | x      | x     | x       | x   |
+| `Parent()`             | x      | x     | x       | x   |
+| `CPUTimer`             | x      | x     | x       | x   |
+| `Environment`          | x      | x     |         | x   |
+| `OpenHandleEnumerator` |        | x     |         |     |
+| `OpenHandleCounter`    |        | x     |         |     |
+| `Seccomp`              |        | x     |         |     |
+| `Capabilities`         |        | x     |         |     |
+| `NetworkCounters`      |        | x     |         |     |
 
+### GOOS / GOARCH Pairs
 
+This table lists the OS and architectures for which a "provider" is implemented.
+
+| GOOS / GOARCH  | Requires CGO | Tested |
+|----------------|--------------|--------|
+| aix/ppc64      | x            |        |
+| darwin/amd64   | optional *   | x      |
+| darwin/arm64   | optional *   | x      |
+| linux/386      |              |        |
+| linux/amd64    |              | x      |
+| linux/arm      |              |        |
+| linux/arm64    |              |        |
+| linux/mips     |              |        |
+| linux/mips64   |              |        |
+| linux/mips64le |              |        |
+| linux/mipsle   |              |        |
+| linux/ppc64    |              |        |
+| linux/ppc64le  |              |        |
+| linux/riscv64  |              |        |
+| linux/s390x    |              |        |
+| windows/amd64  |              | x      |
+| windows/arm64  |              |        |
+| windows/arm    |              |        |
+
+* On darwin (macOS) host information like machineid and process information like memory, cpu, user and starttime require cgo.
+
+### Supported Go versions
+
+go-sysinfo supports the [two most recent Go releases][ci_go_versions].
+
+[ci_go_versions]: https://github.com/elastic/go-sysinfo/blob/main/.github/workflows/go.yml#L40-L41

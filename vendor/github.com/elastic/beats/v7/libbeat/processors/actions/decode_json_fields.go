@@ -19,24 +19,26 @@ package actions
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
 
-	"github.com/pkg/errors"
-
 	"github.com/elastic/beats/v7/libbeat/beat"
-	"github.com/elastic/beats/v7/libbeat/common"
+	"github.com/elastic/beats/v7/libbeat/beat/events"
 	"github.com/elastic/beats/v7/libbeat/common/jsontransform"
-	"github.com/elastic/beats/v7/libbeat/logp"
 	"github.com/elastic/beats/v7/libbeat/processors"
 	"github.com/elastic/beats/v7/libbeat/processors/checks"
-	jsprocessor "github.com/elastic/beats/v7/libbeat/processors/script/javascript/module/processor"
+	jsprocessor "github.com/elastic/beats/v7/libbeat/processors/script/javascript/module/processor/registry"
+	cfg "github.com/elastic/elastic-agent-libs/config"
+	"github.com/elastic/elastic-agent-libs/logp"
+	"github.com/elastic/elastic-agent-libs/mapstr"
 )
 
 type decodeJSONFields struct {
 	fields        []string
 	maxDepth      int
+	expandKeys    bool
 	overwriteKeys bool
 	addErrorKey   bool
 	processArray  bool
@@ -48,6 +50,7 @@ type decodeJSONFields struct {
 type config struct {
 	Fields        []string `config:"fields"`
 	MaxDepth      int      `config:"max_depth" validate:"min=1"`
+	ExpandKeys    bool     `config:"expand_keys"`
 	OverwriteKeys bool     `config:"overwrite_keys"`
 	AddErrorKey   bool     `config:"add_error_key"`
 	ProcessArray  bool     `config:"process_array"`
@@ -67,25 +70,26 @@ func init() {
 	processors.RegisterPlugin("decode_json_fields",
 		checks.ConfigChecked(NewDecodeJSONFields,
 			checks.RequireFields("fields"),
-			checks.AllowedFields("fields", "max_depth", "overwrite_keys", "add_error_key", "process_array", "target", "when", "document_id")))
+			checks.AllowedFields("fields", "max_depth", "overwrite_keys", "add_error_key", "process_array", "target", "when", "document_id", "expand_keys")))
 
 	jsprocessor.RegisterPlugin("DecodeJSONFields", NewDecodeJSONFields)
 }
 
 // NewDecodeJSONFields construct a new decode_json_fields processor.
-func NewDecodeJSONFields(c *common.Config) (processors.Processor, error) {
+func NewDecodeJSONFields(c *cfg.C, log *logp.Logger) (beat.Processor, error) {
 	config := defaultConfig
-	logger := logp.NewLogger("truncate_fields")
+	logger := log.Named("decode_json_fields")
 
 	err := c.Unpack(&config)
 	if err != nil {
 		logger.Warn("Error unpacking config for decode_json_fields")
-		return nil, fmt.Errorf("fail to unpack the decode_json_fields configuration: %s", err)
+		return nil, fmt.Errorf("fail to unpack the decode_json_fields configuration: %w", err)
 	}
 
 	f := &decodeJSONFields{
 		fields:        config.Fields,
 		maxDepth:      config.MaxDepth,
+		expandKeys:    config.ExpandKeys,
 		overwriteKeys: config.OverwriteKeys,
 		addErrorKey:   config.AddErrorKey,
 		processArray:  config.ProcessArray,
@@ -101,7 +105,7 @@ func (f *decodeJSONFields) Run(event *beat.Event) (*beat.Event, error) {
 
 	for _, field := range f.fields {
 		data, err := event.GetValue(field)
-		if err != nil && errors.Cause(err) != common.ErrKeyNotFound {
+		if err != nil && !errors.Is(err, mapstr.ErrKeyNotFound) {
 			f.logger.Debugf("Error trying to GetValue for field : %s in event : %v", field, event)
 			errs = append(errs, err.Error())
 			continue
@@ -113,11 +117,12 @@ func (f *decodeJSONFields) Run(event *beat.Event) (*beat.Event, error) {
 			continue
 		}
 
-		var output interface{}
+		var output any
 		err = unmarshal(f.maxDepth, text, &output, f.processArray)
 		if err != nil {
 			f.logger.Debugf("Error trying to unmarshal %s", text)
 			errs = append(errs, err.Error())
+			event.SetErrorWithOption(fmt.Sprintf("parsing input as JSON: %s", err.Error()), f.addErrorKey, text, field)
 			continue
 		}
 
@@ -128,22 +133,30 @@ func (f *decodeJSONFields) Run(event *beat.Event) (*beat.Event, error) {
 
 		var id string
 		if key := f.documentID; key != "" {
-			if dict, ok := output.(map[string]interface{}); ok {
-				if tmp, err := common.MapStr(dict).GetValue(key); err == nil {
+			if dict, ok := output.(map[string]any); ok {
+				if tmp, err := mapstr.M(dict).GetValue(key); err == nil {
 					if v, ok := tmp.(string); ok {
 						id = v
-						common.MapStr(dict).Delete(key)
+						_ = mapstr.M(dict).Delete(key)
 					}
 				}
 			}
 		}
 
 		if target != "" {
+			if f.expandKeys {
+				switch t := output.(type) {
+				case map[string]any:
+					jsontransform.ExpandFields(f.logger, event, t, f.addErrorKey)
+				default:
+					errs = append(errs, "failed to expand keys")
+				}
+			}
 			_, err = event.PutValue(target, output)
 		} else {
 			switch t := output.(type) {
-			case map[string]interface{}:
-				jsontransform.WriteJSONKeys(event, t, f.overwriteKeys, f.addErrorKey)
+			case map[string]any:
+				jsontransform.WriteJSONKeys(event, t, f.expandKeys, f.overwriteKeys, f.addErrorKey)
 			default:
 				errs = append(errs, "failed to add target to root")
 			}
@@ -157,19 +170,19 @@ func (f *decodeJSONFields) Run(event *beat.Event) (*beat.Event, error) {
 
 		if id != "" {
 			if event.Meta == nil {
-				event.Meta = common.MapStr{}
+				event.Meta = mapstr.M{}
 			}
-			event.Meta["_id"] = id
+			event.Meta[events.FieldMetaID] = id
 		}
 	}
 
 	if len(errs) > 0 {
-		return event, fmt.Errorf(strings.Join(errs, ", "))
+		return event, errors.New(strings.Join(errs, ", "))
 	}
 	return event, nil
 }
 
-func unmarshal(maxDepth int, text string, fields *interface{}, processArray bool) error {
+func unmarshal(maxDepth int, text string, fields *any, processArray bool) error {
 	if err := decodeJSON(text, fields); err != nil {
 		return err
 	}
@@ -179,7 +192,7 @@ func unmarshal(maxDepth int, text string, fields *interface{}, processArray bool
 		return nil
 	}
 
-	tryUnmarshal := func(v interface{}) (interface{}, bool) {
+	tryUnmarshal := func(v any) (any, bool) {
 		str, isString := v.(string)
 		if !isString {
 			return v, false
@@ -187,25 +200,25 @@ func unmarshal(maxDepth int, text string, fields *interface{}, processArray bool
 			return str, false
 		}
 
-		var tmp interface{}
+		var tmp any
 		err := unmarshal(maxDepth, str, &tmp, processArray)
 		if err != nil {
-			return v, err == errProcessingSkipped
+			return v, errors.Is(err, errProcessingSkipped)
 		}
 
 		return tmp, true
 	}
 
 	// try to deep unmarshal fields
-	switch O := interface{}(*fields).(type) {
-	case map[string]interface{}:
+	switch O := (*fields).(type) {
+	case map[string]any:
 		for k, v := range O {
 			if decoded, ok := tryUnmarshal(v); ok {
 				O[k] = decoded
 			}
 		}
 	// We want to process arrays here
-	case []interface{}:
+	case []any:
 		if !processArray {
 			return errProcessingSkipped
 		}
@@ -219,7 +232,7 @@ func unmarshal(maxDepth int, text string, fields *interface{}, processArray bool
 	return nil
 }
 
-func decodeJSON(text string, to *interface{}) error {
+func decodeJSON(text string, to *any) error {
 	dec := json.NewDecoder(strings.NewReader(text))
 	dec.UseNumber()
 	err := dec.Decode(to)
@@ -232,12 +245,12 @@ func decodeJSON(text string, to *interface{}) error {
 		return errors.New("multiple json elements found")
 	}
 
-	if _, err := dec.Token(); err != nil && err != io.EOF {
+	if _, err := dec.Token(); err != nil && !errors.Is(err, io.EOF) {
 		return err
 	}
 
-	switch O := interface{}(*to).(type) {
-	case map[string]interface{}:
+	switch O := (*to).(type) {
+	case map[string]any:
 		jsontransform.TransformNumbers(O)
 	}
 	return nil

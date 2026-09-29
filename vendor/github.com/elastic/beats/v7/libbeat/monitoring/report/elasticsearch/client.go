@@ -18,27 +18,31 @@
 package elasticsearch
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"time"
 
-	"github.com/pkg/errors"
+	"go.elastic.co/apm/v2"
 
-	"github.com/elastic/beats/v7/libbeat/common"
+	"github.com/elastic/beats/v7/libbeat/beat/events"
 	"github.com/elastic/beats/v7/libbeat/esleg/eslegclient"
-	"github.com/elastic/beats/v7/libbeat/logp"
 	"github.com/elastic/beats/v7/libbeat/monitoring/report"
 	"github.com/elastic/beats/v7/libbeat/publisher"
-	"github.com/elastic/beats/v7/libbeat/testing"
+	"github.com/elastic/elastic-agent-libs/logp"
+	"github.com/elastic/elastic-agent-libs/mapstr"
+	"github.com/elastic/elastic-agent-libs/testing"
+	"github.com/elastic/elastic-agent-libs/version"
 )
 
-var createDocPrivAvailableESVersion = common.MustNewVersion("7.5.0")
+var createDocPrivAvailableESVersion = version.MustNew("7.5.0")
 
 type publishClient struct {
 	es     *eslegclient.Connection
 	params map[string]string
-	format report.Format
 
 	log *logp.Logger
 }
@@ -46,24 +50,23 @@ type publishClient struct {
 func newPublishClient(
 	es *eslegclient.Connection,
 	params map[string]string,
-	format report.Format,
+	logger *logp.Logger,
 ) (*publishClient, error) {
 	p := &publishClient{
 		es:     es,
 		params: params,
-		format: format,
 
-		log: logp.NewLogger(logSelector),
+		log: logger.Named(logSelector),
 	}
 	return p, nil
 }
 
-func (c *publishClient) Connect() error {
+func (c *publishClient) Connect(ctx context.Context) error {
 	c.log.Debug("Monitoring client: connect.")
 
-	err := c.es.Connect()
+	err := c.es.Connect(ctx)
 	if err != nil {
-		return errors.Wrap(err, "cannot connect underlying Elasticsearch client")
+		return fmt.Errorf("cannot connect underlying Elasticsearch client: %w", err)
 	}
 
 	params := map[string]string{
@@ -71,7 +74,7 @@ func (c *publishClient) Connect() error {
 	}
 	status, body, err := c.es.Request("GET", "/_xpack", "", params, nil)
 	if err != nil {
-		return fmt.Errorf("X-Pack capabilities query failed with: %v", err)
+		return fmt.Errorf("X-Pack capabilities query failed with: %w", err)
 	}
 
 	if status != 200 {
@@ -103,7 +106,7 @@ func (c *publishClient) Close() error {
 	return c.es.Close()
 }
 
-func (c *publishClient) Publish(batch publisher.Batch) error {
+func (c *publishClient) Publish(ctx context.Context, batch publisher.Batch) error {
 	events := batch.Events()
 	var failed []publisher.Event
 	var reason error
@@ -123,28 +126,17 @@ func (c *publishClient) Publish(batch publisher.Batch) error {
 
 		var params = map[string]string{}
 		// Copy params
-		for k, v := range c.params {
-			params[k] = v
-		}
+		maps.Copy(params, c.params)
 		// Extract potential additional params
 		p, err := event.Content.Meta.GetValue("params")
 		if err == nil {
 			p2, ok := p.(map[string]string)
 			if ok {
-				for k, v := range p2 {
-					params[k] = v
-				}
+				maps.Copy(params, p2)
 			}
 		}
 
-		switch c.format {
-		case report.FormatXPackMonitoringBulk:
-			err = c.publishXPackBulk(params, event, typ)
-		case report.FormatBulk:
-			err = c.publishBulk(event, typ)
-		}
-
-		if err != nil {
+		if err := c.publishBulk(ctx, event, typ); err != nil {
 			failed = append(failed, event)
 			reason = err
 		}
@@ -166,28 +158,8 @@ func (c *publishClient) String() string {
 	return "monitoring(" + c.es.URL + ")"
 }
 
-func (c *publishClient) publishXPackBulk(params map[string]string, event publisher.Event, typ string) error {
-	meta := common.MapStr{
-		"_index":   "",
-		"_routing": nil,
-		"_type":    typ,
-	}
-	bulk := [2]interface{}{
-		common.MapStr{"index": meta},
-		report.Event{
-			Timestamp: event.Content.Timestamp,
-			Fields:    event.Content.Fields,
-		},
-	}
-
-	// Currently one request per event is sent. Reason is that each event can contain different
-	// interval params and X-Pack requires to send the interval param.
-	_, err := c.es.SendMonitoringBulk(params, bulk[:])
-	return err
-}
-
-func (c *publishClient) publishBulk(event publisher.Event, typ string) error {
-	meta := common.MapStr{
+func (c *publishClient) publishBulk(ctx context.Context, event publisher.Event, typ string) error {
+	meta := mapstr.M{
 		"_index":   getMonitoringIndexName(),
 		"_routing": nil,
 	}
@@ -197,44 +169,45 @@ func (c *publishClient) publishBulk(event publisher.Event, typ string) error {
 		meta["_type"] = "doc"
 	}
 
-	action := common.MapStr{}
-	var opType string
+	opType := events.OpTypeCreate
 	if esVersion.LessThan(createDocPrivAvailableESVersion) {
-		opType = "index"
-	} else {
-		opType = "create"
+		opType = events.OpTypeIndex
 	}
-	action[opType] = meta
 
-	event.Content.Fields.Put("timestamp", event.Content.Timestamp)
+	action := mapstr.M{
+		opType.String(): meta,
+	}
 
-	fields := common.MapStr{
+	_, _ = event.Content.Fields.Put("timestamp", event.Content.Timestamp)
+
+	fields := mapstr.M{
 		"type": typ,
 		typ:    event.Content.Fields,
 	}
 
 	interval, err := event.Content.Meta.GetValue("interval_ms")
 	if err != nil {
-		return errors.Wrap(err, "could not determine interval_ms field")
+		return fmt.Errorf("could not determine interval_ms field: %w", err)
 	}
-	fields.Put("interval_ms", interval)
+	_, _ = fields.Put("interval_ms", interval)
 
 	clusterUUID, err := event.Content.Meta.GetValue("cluster_uuid")
-	if err != nil && err != common.ErrKeyNotFound {
-		return errors.Wrap(err, "could not determine cluster_uuid field")
+	if err != nil && !errors.Is(err, mapstr.ErrKeyNotFound) {
+		return fmt.Errorf("could not determine cluster_uuid field: %w", err)
 	}
-	fields.Put("cluster_uuid", clusterUUID)
+	_, _ = fields.Put("cluster_uuid", clusterUUID)
 
 	document := report.Event{
 		Timestamp: event.Content.Timestamp,
 		Fields:    fields,
 	}
-	bulk := [2]interface{}{action, document}
+	bulk := [2]any{action, document}
 
 	// Currently one request per event is sent. Reason is that each event can contain different
 	// interval params and X-Pack requires to send the interval param.
-	_, result, err := c.es.Bulk(getMonitoringIndexName(), "", nil, bulk[:])
+	_, result, err := c.es.Bulk(ctx, getMonitoringIndexName(), "", nil, nil, bulk[:])
 	if err != nil {
+		apm.CaptureError(ctx, fmt.Errorf("failed to perform any bulk index operations: %w", err)).Send()
 		return err
 	}
 
@@ -248,9 +221,9 @@ func getMonitoringIndexName() string {
 	return fmt.Sprintf(".monitoring-beats-%v-%s", version, date)
 }
 
-func logBulkFailures(log *logp.Logger, result eslegclient.BulkResult, events []report.Event) {
+func logBulkFailures(log *logp.Logger, result eslegclient.BulkResponse, events []report.Event) {
 	var response struct {
-		Items []map[string]map[string]interface{} `json:"items"`
+		Items []map[string]map[string]any `json:"items"`
 	}
 
 	if err := json.Unmarshal(result, &response); err != nil {

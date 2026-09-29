@@ -20,23 +20,21 @@ package linux
 import (
 	"bufio"
 	"bytes"
-	"io/ioutil"
+	"fmt"
 	"os"
-
-	"github.com/pkg/errors"
 )
 
 const procOneCgroup = "/proc/1/cgroup"
 
 // IsContainerized returns true if this process is containerized.
 func IsContainerized() (bool, error) {
-	data, err := ioutil.ReadFile(procOneCgroup)
+	data, err := os.ReadFile(procOneCgroup)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return false, nil
 		}
 
-		return false, errors.Wrap(err, "failed to read process cgroups")
+		return false, fmt.Errorf("failed to read process cgroups: %w", err)
 	}
 
 	return isContainerizedCgroup(data)
@@ -49,7 +47,7 @@ func isContainerizedCgroup(data []byte) (bool, error) {
 
 		// Following a suggestion on Stack Overflow on how to detect
 		// being inside a container: https://stackoverflow.com/a/20012536/235203
-		if bytes.Contains(line, []byte("docker")) || bytes.Contains(line, []byte(".slice")) || bytes.Contains(line, []byte("lxc")) {
+		if bytes.Contains(line, []byte("docker")) || bytes.Contains(line, []byte(".slice")) || bytes.Contains(line, []byte("lxc")) || bytes.Contains(line, []byte("kubepods")) {
 			return true, nil
 		}
 	}

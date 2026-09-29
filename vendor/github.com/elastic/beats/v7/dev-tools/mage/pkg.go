@@ -18,39 +18,116 @@
 package mage
 
 import (
+	"errors"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
+	"strings"
 
 	"github.com/magefile/mage/mg"
 	"github.com/magefile/mage/sh"
-	"github.com/pkg/errors"
 )
+
+// PackageArgs defines runtime configuration for package builds.
+type PackageArgs struct {
+	Platforms    BuildPlatformList
+	PackageTypes []PackageType
+	Snapshot     bool
+}
+
+// DefaultPackageArgsFromEnv returns package args based on current globals and
+// runtime env var overrides (PLATFORMS, PACKAGES, SNAPSHOT, DEV).
+func DefaultPackageArgsFromEnv() (PackageArgs, error) {
+	snapshot, err := parseBoolEnvOverride("SNAPSHOT", Snapshot)
+	if err != nil {
+		return PackageArgs{},
+			fmt.Errorf("cannot parse env var SNAPSHOT as boolean: %w", err)
+	}
+
+	args := PackageArgs{
+		Platforms: append(BuildPlatformList(nil), Platforms...),
+		Snapshot:  snapshot,
+	}
+
+	if expression := os.Getenv("PLATFORMS"); len(expression) > 0 {
+		args.Platforms = NewPlatformList(expression)
+	}
+	if packageTypes := os.Getenv("PACKAGES"); len(packageTypes) > 0 {
+		args.PackageTypes = ParsePackageTypes(packageTypes)
+	}
+
+	return args, nil
+}
+
+func parseBoolEnvOverride(name string, fallback bool) (bool, error) {
+	value, found := os.LookupEnv(name)
+	if !found || value == "" {
+		return fallback, nil
+	}
+
+	parsed, err := strconv.ParseBool(value)
+	if err != nil {
+		return fallback, fmt.Errorf("failed to parse %s env value: %w", name, err)
+	}
+	return parsed, nil
+}
+
+// PackageWithArgs returns a package build function configured with args.
+func PackageWithArgs(args PackageArgs) func() error {
+	return func() error {
+		return packageWithArgs(args)
+	}
+}
 
 // Package packages the Beat for distribution. It generates packages based on
 // the set of target platforms and registered packaging specifications.
 func Package() error {
-	if len(Platforms) == 0 {
+	args, err := DefaultPackageArgsFromEnv()
+	if err != nil {
+		return err
+	}
+	return packageWithArgs(args)
+}
+
+func packageWithArgs(args PackageArgs) error {
+	platforms := args.Platforms
+	packageTypes := args.PackageTypes
+	snapshot := args.Snapshot
+
+	if len(platforms) == 0 {
 		fmt.Println(">> package: Skipping because the platform list is empty")
 		return nil
 	}
 
 	if len(Packages) == 0 {
 		return errors.New("no package specs are registered. Call " +
-			"UseCommunityBeatPackaging, UseElasticBeatPackaging or USeElasticBeatWithoutXPackPackaging first.")
+			"UseCommunityBeatPackaging, UseElasticBeatPackaging or USeElasticBeatWithoutXPackPackaging first")
 	}
 
-	var tasks []interface{}
-	for _, target := range Platforms {
+	var tasks []any
+	for _, target := range platforms {
 		for _, pkg := range Packages {
-			if pkg.OS != target.GOOS() {
+
+			if mg.Verbose() {
+				log.Printf("Evaluating package %v for target %s", pkg.Spec, target)
+			}
+
+			if pkg.OS != target.GOOS() || pkg.Arch != "" && pkg.Arch != target.Arch() {
 				continue
 			}
 
 			for _, pkgType := range pkg.Types {
-				if pkgType == DMG && runtime.GOOS != "darwin" {
-					log.Printf("Skipping DMG package type because build host isn't darwin")
+				if !isPackageTypeSelected(pkgType, packageTypes) {
+					log.Printf("Skipping %s package type because it is not selected", pkgType)
+					continue
+				}
+
+				if target.Name == "linux/arm64" && pkgType == Docker && runtime.GOARCH != "arm64" {
+					log.Printf("Skipping Docker package type because build host isn't arm")
 					continue
 				}
 
@@ -71,11 +148,25 @@ func Package() error {
 					continue
 				}
 
+				// Filter out non fips-enabled beats
+				if FIPSBuild && !slices.Contains(FIPSConfig.Beats, BeatName) {
+					log.Printf("Skipping creation for beat %v package type %v because beat is not listed as FIPS-capable %v", BeatName, pkgType, FIPSConfig.Beats)
+					continue
+				}
+
+				// Filter out non fips specs
+				if pkg.Spec.FIPS != FIPSBuild {
+					log.Printf("Skipping creation for package type %v because spec.FIPS = %v and FIPSBuild = %v", pkgType, pkg.Spec.FIPS, FIPSBuild)
+					continue
+				}
+
+				agentPackageDrop, _ := os.LookupEnv("AGENT_DROP_PATH")
+
 				spec := pkg.Spec.Clone()
 				spec.OS = target.GOOS()
 				spec.Arch = packageArch
-				spec.Snapshot = Snapshot
-				spec.evalContext = map[string]interface{}{
+				spec.Snapshot = snapshot
+				spec.evalContext = map[string]any{
 					"GOOS":          target.GOOS(),
 					"GOARCH":        target.GOARCH(),
 					"GOARM":         target.GOARM(),
@@ -83,6 +174,7 @@ func Package() error {
 					"AgentArchName": agentPackageArch,
 					"PackageType":   pkgType.String(),
 					"BinaryExt":     binaryExtension(target.GOOS()),
+					"AgentDropPath": agentPackageDrop,
 				}
 
 				spec.packageDir, err = pkgType.PackagingDir(packageStagingDir, target, spec)
@@ -102,6 +194,129 @@ func Package() error {
 	return nil
 }
 
+// Package packages the Beat for IronBank distribution.
+//
+// Use SNAPSHOT=true to build snapshots.
+func Ironbank() error {
+	if FIPSBuild {
+		fmt.Println(">> IronBank images are not supported for FIPS builds")
+		return nil
+	}
+
+	if runtime.GOARCH != "amd64" {
+		fmt.Printf(">> IronBank images are only supported for amd64 arch (%s is not supported)\n", runtime.GOARCH)
+		return nil
+	}
+	if err := prepareIronbankBuild(); err != nil {
+		return fmt.Errorf("failed to prepare the IronBank context: %w", err)
+	}
+	if err := saveIronbank(); err != nil {
+		return fmt.Errorf("failed to save the IronBank context: %w", err)
+	}
+	return nil
+}
+
+func getIronbankContextName() string {
+	version, _ := BeatQualifiedVersion()
+	ironbankBinaryName := "{{.Name}}-ironbank-{{.Version}}{{if .Snapshot}}-SNAPSHOT{{end}}-docker-build-context"
+	// TODO: get the name of the project
+	outputDir, _ := Expand(ironbankBinaryName, map[string]any{
+		"Name":    BeatName,
+		"Version": version,
+	})
+	return outputDir
+}
+
+func prepareIronbankBuild() error {
+	fmt.Println(">> prepareIronbankBuild: prepare the IronBank container context.")
+	buildDir := filepath.Join("build", getIronbankContextName())
+	beatsDir, err := ElasticBeatsDir()
+	if err != nil {
+		return fmt.Errorf("could not get the base dir: %w", err)
+	}
+
+	templatesDir := filepath.Join(beatsDir, "dev-tools", "packaging", "templates", "ironbank", BeatName)
+
+	data := map[string]any{
+		"MajorMinor": BeatMajorMinorVersion(),
+	}
+
+	err = filepath.Walk(templatesDir, func(path string, info os.FileInfo, _ error) error {
+		if !info.IsDir() {
+			target := strings.TrimSuffix(
+				filepath.Join(buildDir, filepath.Base(path)),
+				".tmpl",
+			)
+
+			err := ExpandFile(path, target, data)
+			if err != nil {
+				return fmt.Errorf("expanding template '%s' to '%s': %w", path, target, err)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("cannot create templates for the IronBank: %w", err)
+	}
+
+	// copy license
+	sourceLicense := filepath.Join(beatsDir, "dev-tools", "packaging", "files", "ironbank", "LICENSE")
+	targetLicense := filepath.Join(buildDir, "LICENSE")
+	if err := CopyFile(sourceLicense, targetLicense); err != nil {
+		return fmt.Errorf("cannot copy LICENSE file for the IronBank: %w", err)
+	}
+
+	// copy specific files for the given beat
+	sourceBeatPath := filepath.Join(beatsDir, "dev-tools", "packaging", "files", "ironbank", BeatName)
+	if _, err := os.Stat(sourceBeatPath); !os.IsNotExist(err) {
+		if err := Copy(sourceBeatPath, buildDir); err != nil {
+			return fmt.Errorf("cannot create files for the IronBank: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func saveIronbank() error {
+	fmt.Println(">> saveIronbank: save the IronBank container context.")
+
+	ironbank := getIronbankContextName()
+	buildDir := filepath.Join("build", ironbank)
+	if _, err := os.Stat(buildDir); os.IsNotExist(err) {
+		return fmt.Errorf("cannot find the folder with the ironbank context: %w", err)
+	}
+
+	distributionsDir := "build/distributions"
+	if _, err := os.Stat(distributionsDir); os.IsNotExist(err) {
+		err := os.MkdirAll(distributionsDir, 0o750)
+		if err != nil {
+			return fmt.Errorf("cannot create folder for docker artifacts: %w", err)
+		}
+	}
+	tarGzFile := filepath.Join(distributionsDir, ironbank+".tar.gz")
+
+	// Save the build context as tar.gz artifact
+	err := TarWithOptions(buildDir, tarGzFile, true)
+	if err != nil {
+		return fmt.Errorf("cannot compress the tar.gz file: %w", err)
+	}
+
+	if err = CreateSHA512File(tarGzFile); err != nil {
+		return fmt.Errorf("failed to create .sha512 file: %w", err)
+	}
+	return nil
+}
+
+// isPackageTypeSelected returns true if selected is empty or if pkgType is
+// present on selected. It returns false otherwise.
+func isPackageTypeSelected(pkgType PackageType, selected []PackageType) bool {
+	if len(selected) == 0 {
+		return true
+	}
+
+	return slices.Contains(selected, pkgType)
+}
+
 type packageBuilder struct {
 	Platform BuildPlatform
 	Spec     PackageSpec
@@ -109,10 +324,13 @@ type packageBuilder struct {
 }
 
 func (b packageBuilder) Build() error {
-	fmt.Printf(">> package: Building %v type=%v for platform=%v\n", b.Spec.Name, b.Type, b.Platform.Name)
+	fmt.Printf(">> package: Building %v type=%v for platform=%v fips=%v\n", b.Spec.Name, b.Type, b.Platform.Name, b.Spec.FIPS)
 	log.Printf("Package spec: %+v", b.Spec)
-	return errors.Wrapf(b.Type.Build(b.Spec), "failed building %v type=%v for platform=%v",
-		b.Spec.Name, b.Type, b.Platform.Name)
+	if err := b.Type.Build(b.Spec); err != nil {
+		return fmt.Errorf("failed building %v type=%v for platform=%v fips=%v: %w",
+			b.Spec.Name, b.Type, b.Platform.Name, b.Spec.FIPS, err)
+	}
+	return nil
 }
 
 type testPackagesParams struct {
@@ -178,7 +396,7 @@ func TestPackages(options ...TestPackagesOption) error {
 		args = append(args, "-v")
 	}
 
-	args = append(args, MustExpand("{{ elastic_beats_dir }}/dev-tools/packaging/package_test.go"))
+	args = append(args, MustExpand("{{ elastic_beats_dir }}/dev-tools/packaging/..."))
 
 	if params.HasModules {
 		args = append(args, "--modules")
@@ -207,11 +425,44 @@ func TestPackages(options ...TestPackagesOption) error {
 	args = append(args, "-files", MustExpand("{{.PWD}}/build/distributions/*"))
 
 	if out, err := goTest(args...); err != nil {
-		if !mg.Verbose() {
-			fmt.Println(out)
+		fmt.Println(out)
+		return err
+	}
+
+	return nil
+}
+
+// TestLinuxForCentosGLIBC checks the GLIBC requirements of linux/amd64 and
+// linux/386 binaries to ensure they meet the requirements for RHEL 7 which has
+// glibc 2.17.
+func TestLinuxForCentosGLIBC() error {
+	switch Platform.Name {
+	case "linux/amd64":
+		return TestBinaryGLIBCVersion(filepath.Join("build/golang-crossbuild", BeatName+"-linux-"+Platform.GOARCH), "2.17")
+	default:
+		return nil
+	}
+}
+
+func TestBinaryGLIBCVersion(elfPath, maxGlibcVersion string) error {
+	requiredGlibc, err := ReadGLIBCRequirement(elfPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
 		}
 		return err
 	}
 
+	upperBound, err := NewSemanticVersion(maxGlibcVersion)
+	if err != nil {
+		return err
+	}
+
+	if !requiredGlibc.LessThanOrEqual(upperBound) {
+		return fmt.Errorf("dynamically linked binary %q requires glibc "+
+			"%v, but maximum allowed glibc is %v",
+			elfPath, requiredGlibc, upperBound)
+	}
+	fmt.Printf(">> testBinaryGLIBCVersion: %q requires glibc %v or greater\n", elfPath, requiredGlibc)
 	return nil
 }

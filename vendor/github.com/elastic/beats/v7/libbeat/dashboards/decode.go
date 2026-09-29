@@ -18,48 +18,119 @@
 package dashboards
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 
-	"github.com/elastic/beats/v7/libbeat/common"
-	"github.com/elastic/beats/v7/libbeat/logp"
+	"github.com/elastic/elastic-agent-libs/logp"
+	"github.com/elastic/elastic-agent-libs/mapstr"
 )
 
 var (
 	responseToDecode = []string{
-		"attributes.uiStateJSON",
-		"attributes.visState",
+		"attributes.kibanaSavedObjectMeta.searchSourceJSON",
+		"attributes.layerListJSON",
+		"attributes.mapStateJSON",
 		"attributes.optionsJSON",
 		"attributes.panelsJSON",
-		"attributes.kibanaSavedObjectMeta.searchSourceJSON",
+		"attributes.uiStateJSON",
+		"attributes.visState",
 	}
 )
 
 // DecodeExported decodes an exported dashboard
-func DecodeExported(result common.MapStr) common.MapStr {
+func DecodeExported(exported []byte, logger *logp.Logger) []byte {
 	// remove unsupported chars
-	objects := result["objects"].([]interface{})
-	for _, obj := range objects {
-		o := obj.(common.MapStr)
-		for _, key := range responseToDecode {
-			// All fields are optional, so errors are not caught
-			err := decodeValue(o, key)
-			if err != nil {
-				logp.Debug("dashboards", "Error while decoding dashboard objects: %+v", err)
+	var result bytes.Buffer
+	r := bufio.NewReader(bytes.NewReader(exported))
+	for {
+		line, err := r.ReadBytes('\n')
+		if err != nil {
+			if err == io.EOF {
+				_, err = result.Write(decodeLine(line, logger))
+				if err != nil {
+					return exported
+				}
+				return result.Bytes()
 			}
+			return exported
+		}
+		_, err = result.Write(decodeLine(line, logger))
+		if err != nil {
+			return exported
+		}
+		_, err = result.WriteRune('\n')
+		if err != nil {
+			return exported
 		}
 	}
-	result["objects"] = objects
-	return result
 }
 
-func decodeValue(data common.MapStr, key string) error {
+func decodeLine(line []byte, logger *logp.Logger) []byte {
+	if len(bytes.TrimSpace(line)) == 0 {
+		return line
+	}
+
+	o := mapstr.M{}
+	err := json.Unmarshal(line, &o)
+	if err != nil {
+		return line
+	}
+	o = decodeObject(o, logger)
+	o = decodeEmbeddableConfig(o, logger)
+
+	return []byte(o.String())
+}
+
+func decodeObject(o mapstr.M, logger *logp.Logger) mapstr.M {
+	for _, key := range responseToDecode {
+		// All fields are optional, so errors are not caught
+		err := decodeValue(o, key)
+		if err != nil {
+			logger.Named("dashboards").Debugf("Error while decoding dashboard objects: %+v", err)
+			continue
+		}
+	}
+
+	return o
+}
+
+func decodeEmbeddableConfig(o mapstr.M, logger *logp.Logger) mapstr.M {
+	p, err := o.GetValue("attributes.panelsJSON")
+	if err != nil {
+		return o
+	}
+
+	if panels, ok := p.([]any); ok {
+		for i, pan := range panels {
+			if panel, ok := pan.(map[string]any); ok {
+				panelObj := mapstr.M(panel)
+				embedded, err := panelObj.GetValue("embeddableConfig")
+				if err != nil {
+					continue
+				}
+				if embeddedConfig, ok := embedded.(map[string]any); ok {
+					embeddedConfigObj := mapstr.M(embeddedConfig)
+					panelObj.Put("embeddableConfig", decodeObject(embeddedConfigObj, logger))
+					panels[i] = panelObj
+				}
+			}
+		}
+		o.Put("attributes.panelsJSON", panels)
+	}
+
+	return o
+}
+
+func decodeValue(data mapstr.M, key string) error {
 	v, err := data.GetValue(key)
 	if err != nil {
 		return err
 	}
 	s := v.(string)
-	var d interface{}
+	var d any
 	err = json.Unmarshal([]byte(s), &d)
 	if err != nil {
 		return fmt.Errorf("error decoding %s: %v", key, err)

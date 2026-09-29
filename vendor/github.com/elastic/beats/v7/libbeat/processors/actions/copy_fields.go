@@ -18,16 +18,16 @@
 package actions
 
 import (
+	"errors"
 	"fmt"
 
-	"github.com/pkg/errors"
-
 	"github.com/elastic/beats/v7/libbeat/beat"
-	"github.com/elastic/beats/v7/libbeat/common"
-	"github.com/elastic/beats/v7/libbeat/logp"
 	"github.com/elastic/beats/v7/libbeat/processors"
 	"github.com/elastic/beats/v7/libbeat/processors/checks"
-	jsprocessor "github.com/elastic/beats/v7/libbeat/processors/script/javascript/module/processor"
+	jsprocessor "github.com/elastic/beats/v7/libbeat/processors/script/javascript/module/processor/registry"
+	conf "github.com/elastic/elastic-agent-libs/config"
+	"github.com/elastic/elastic-agent-libs/logp"
+	"github.com/elastic/elastic-agent-libs/mapstr"
 )
 
 type copyFields struct {
@@ -51,37 +51,40 @@ func init() {
 }
 
 // NewCopyFields returns a new copy_fields processor.
-func NewCopyFields(c *common.Config) (processors.Processor, error) {
+func NewCopyFields(c *conf.C, log *logp.Logger) (beat.Processor, error) {
 	config := copyFieldsConfig{
 		IgnoreMissing: false,
 		FailOnError:   true,
 	}
 	err := c.Unpack(&config)
 	if err != nil {
-		return nil, fmt.Errorf("failed to unpack the configuration of copy processor: %s", err)
+		return nil, fmt.Errorf("failed to unpack the configuration of copy processor: %w", err)
 	}
 
 	f := &copyFields{
 		config: config,
-		logger: logp.NewLogger("copy_fields"),
+		logger: log.Named("copy_fields"),
 	}
 	return f, nil
 }
 
 func (f *copyFields) Run(event *beat.Event) (*beat.Event, error) {
-	var backup common.MapStr
-	if f.config.FailOnError {
-		backup = event.Fields.Clone()
+	var backup *beat.Event
+	if f.config.FailOnError && len(f.config.Fields) > 1 {
+		backup = event.Clone()
 	}
 
 	for _, field := range f.config.Fields {
-		err := f.copyField(field.From, field.To, event.Fields)
+		err := f.copyField(field.From, field.To, event)
 		if err != nil {
-			errMsg := fmt.Errorf("Failed to copy fields in copy_fields processor: %s", err)
-			f.logger.Debug(errMsg.Error())
+			errMsg := fmt.Errorf("failed to copy fields in copy_fields processor: %w", err)
+			f.logger.Debugw(errMsg.Error(), logp.TypeKey, logp.EventType)
+
 			if f.config.FailOnError {
-				event.Fields = backup
-				event.PutValue("error.message", errMsg.Error())
+				if backup != nil {
+					event = backup
+				}
+				_, _ = event.PutValue("error.message", errMsg.Error())
 				return event, err
 			}
 		}
@@ -90,27 +93,48 @@ func (f *copyFields) Run(event *beat.Event) (*beat.Event, error) {
 	return event, nil
 }
 
-func (f *copyFields) copyField(from string, to string, fields common.MapStr) error {
-	exists, _ := fields.HasKey(to)
-	if exists {
+func (f *copyFields) copyField(from string, to string, event *beat.Event) error {
+	_, err := event.GetValue(to)
+	if err == nil {
 		return fmt.Errorf("target field %s already exists, drop or rename this field first", to)
 	}
 
-	value, err := fields.GetValue(from)
+	value, err := event.GetValue(from)
 	if err != nil {
-		if f.config.IgnoreMissing && errors.Cause(err) == common.ErrKeyNotFound {
+		if f.config.IgnoreMissing && errors.Is(err, mapstr.ErrKeyNotFound) {
 			return nil
 		}
-		return fmt.Errorf("could not fetch value for key: %s, Error: %s", from, err)
+		return fmt.Errorf("could not fetch value for key: %s, Error: %w", from, err)
 	}
 
-	_, err = fields.Put(to, value)
+	_, err = event.PutValue(to, cloneValue(value))
 	if err != nil {
-		return fmt.Errorf("could not copy value to %s: %v, %+v", to, value, err)
+		return fmt.Errorf("could not copy value to %s: %v, %w", to, value, err)
 	}
 	return nil
 }
 
 func (f *copyFields) String() string {
 	return "copy_fields=" + fmt.Sprintf("%+v", f.config.Fields)
+}
+
+// cloneValue returns a shallow copy of a map. All other types are passed
+// through in the return. This should be used when making straight copies of
+// maps without doing any type conversions.
+func cloneValue(value any) any {
+	switch v := value.(type) {
+	case mapstr.M:
+		return v.Clone()
+	case map[string]any:
+		return mapstr.M(v).Clone()
+	case []any:
+		len := len(v)
+		newArr := make([]any, len)
+		for idx, val := range v {
+			newArr[idx] = cloneValue(val)
+		}
+		return newArr
+	default:
+		return value
+	}
 }

@@ -20,16 +20,18 @@ package processing
 import (
 	"fmt"
 
-	"github.com/elastic/ecs/code/go/ecs"
-
 	"github.com/elastic/beats/v7/libbeat/asset"
 	"github.com/elastic/beats/v7/libbeat/beat"
-	"github.com/elastic/beats/v7/libbeat/common"
-	"github.com/elastic/beats/v7/libbeat/logp"
+	"github.com/elastic/beats/v7/libbeat/ecs"
+	"github.com/elastic/beats/v7/libbeat/features"
+	"github.com/elastic/beats/v7/libbeat/management"
 	"github.com/elastic/beats/v7/libbeat/mapping"
 	"github.com/elastic/beats/v7/libbeat/processors"
-	"github.com/elastic/beats/v7/libbeat/processors/actions"
+	"github.com/elastic/beats/v7/libbeat/processors/actions/addfields"
 	"github.com/elastic/beats/v7/libbeat/processors/timeseries"
+	"github.com/elastic/elastic-agent-libs/config"
+	"github.com/elastic/elastic-agent-libs/logp"
+	"github.com/elastic/elastic-agent-libs/mapstr"
 )
 
 // builder is used to create the event processing pipeline in Beats.  The
@@ -45,8 +47,8 @@ type builder struct {
 
 	// global pipeline fields and tags configurations
 	modifiers   []modifier
-	builtinMeta common.MapStr
-	fields      common.MapStr
+	builtinMeta mapstr.M
+	fields      mapstr.M
 	tags        []string
 
 	// Time series id will be calculated for Events with the TimeSeries flag if this
@@ -57,33 +59,32 @@ type builder struct {
 	// global pipeline processors
 	processors *group
 
-	drop       bool // disabled is set if outputs have been disabled via CLI
 	alwaysCopy bool
 }
 
 type modifier interface {
 	// BuiltinFields defines global fields to be added to every event.
-	BuiltinFields(beat.Info) common.MapStr
+	BuiltinFields(beat.Info) mapstr.M
 
 	// ClientFields defines connection local fields to be added to each event
 	// of a pipeline client.
-	ClientFields(beat.Info, beat.ProcessingConfig) common.MapStr
+	ClientFields(beat.Info, beat.ProcessingConfig) mapstr.M
 }
 
-type builtinModifier func(beat.Info) common.MapStr
+type builtinModifier func(beat.Info) mapstr.M
 
 // MakeDefaultBeatSupport creates a new SupportFactory based on NewDefaultSupport.
 // MakeDefaultBeatSupport automatically adds the `ecs.version`, `host.name` and `agent.X` fields
 // to each event.
 func MakeDefaultBeatSupport(normalize bool) SupportFactory {
-	return MakeDefaultSupport(normalize, WithECS, WithHost, WithBeatMeta("agent"))
+	return MakeDefaultSupport(normalize, nil, WithECS, WithHost, WithAgentMeta())
 }
 
 // MakeDefaultObserverSupport creates a new SupportFactory based on NewDefaultSupport.
 // MakeDefaultObserverSupport automatically adds the `ecs.version` and `observer.X` fields
 // to each event.
 func MakeDefaultObserverSupport(normalize bool) SupportFactory {
-	return MakeDefaultSupport(normalize, WithECS, WithBeatMeta("observer"))
+	return MakeDefaultSupport(normalize, nil, WithECS, WithObserverMeta())
 }
 
 // MakeDefaultSupport creates a new SupportFactory for use with the publisher pipeline.
@@ -93,23 +94,38 @@ func MakeDefaultObserverSupport(normalize bool) SupportFactory {
 // and `processor` settings to the event processing pipeline to be generated.
 // Use WithFields, WithBeatMeta, and other to declare the builtin fields to be added
 // to each event. Builtin fields can be modified using global `processors`, and `fields` only.
+// the fleetDefaultProcessors argument will set the given global-level processors if the beat is currently running under fleet,
+// and no other global-level processors are set.
 func MakeDefaultSupport(
 	normalize bool,
+	fleetDefaultProcessors processors.PluginConfig,
 	modifiers ...modifier,
 ) SupportFactory {
-	return func(info beat.Info, log *logp.Logger, beatCfg *common.Config) (Supporter, error) {
+	return func(info beat.Info, log *logp.Logger, beatCfg *config.C) (Supporter, error) {
 		cfg := struct {
-			common.EventMetadata `config:",inline"`      // Fields and tags to add to each event.
+			mapstr.EventMetadata `config:",inline"`      // Fields and tags to add to each event.
 			Processors           processors.PluginConfig `config:"processors"`
 			TimeSeries           bool                    `config:"timeseries.enabled"`
 		}{}
 		if err := beatCfg.Unpack(&cfg); err != nil {
 			return nil, err
 		}
+		// don't try to "merge" the two lists somehow, if the supportFactory caller requests its own processors, use those
+		// also makes it easier to disable global processors if needed, since they're otherwise hardcoded
+		var rawProcessors processors.PluginConfig
 
-		processors, err := processors.New(cfg.Processors)
+		// don't check the array directly, use HasField, that way processors can easily be bypassed with -E processors=[]
+		if management.UnderAgent() && !beatCfg.HasField("processors") {
+			log.Debugf("In fleet/otel mode with no processors specified, defaulting to global processors")
+			rawProcessors = fleetDefaultProcessors
+
+		} else {
+			rawProcessors = cfg.Processors
+		}
+
+		processors, err := processors.New(rawProcessors, log)
 		if err != nil {
-			return nil, fmt.Errorf("error initializing processors: %v", err)
+			return nil, fmt.Errorf("error initializing processors: %w", err)
 		}
 
 		return newBuilder(info, log, processors, cfg.EventMetadata, modifiers, !normalize, cfg.TimeSeries)
@@ -117,43 +133,67 @@ func MakeDefaultSupport(
 }
 
 // WithFields creates a modifier with the given default builtin fields.
-func WithFields(fields common.MapStr) modifier {
-	return builtinModifier(func(_ beat.Info) common.MapStr {
+func WithFields(fields mapstr.M) modifier {
+	return builtinModifier(func(_ beat.Info) mapstr.M {
 		return fields
 	})
 }
 
 // WithECS modifier adds `ecs.version` builtin fields to a processing pipeline.
-var WithECS modifier = WithFields(common.MapStr{
-	"ecs": common.MapStr{
+var WithECS = WithFields(mapstr.M{
+	"ecs": mapstr.M{
 		"version": ecs.Version,
 	},
 })
 
 // WithHost modifier adds `host.name` builtin fields to a processing pipeline
-var WithHost modifier = builtinModifier(func(info beat.Info) common.MapStr {
-	return common.MapStr{
-		"host": common.MapStr{
-			"name": info.Name,
+var WithHost modifier = builtinModifier(func(info beat.Info) mapstr.M {
+	name := info.Name
+	if override := beat.GetHostnameOverride(); override != "" {
+		name = override
+	}
+	return mapstr.M{
+		"host": mapstr.M{
+			"name": name,
 		},
 	}
 })
 
-// WithBeatMeta adds beat meta information as builtin fields to a processing pipeline.
-// The `key` parameter defines the field to be used.
-func WithBeatMeta(key string) modifier {
-	return builtinModifier(func(info beat.Info) common.MapStr {
-		metadata := common.MapStr{
-			"type":         info.Beat,
+// WithAgentMeta adds agent meta information as builtin fields to a processing
+// pipeline.
+func WithAgentMeta() modifier {
+	return builtinModifier(func(info beat.Info) mapstr.M {
+		hostname := info.FQDNAwareHostname(features.FQDN())
+
+		metadata := mapstr.M{
 			"ephemeral_id": info.EphemeralID.String(),
-			"hostname":     info.Hostname,
 			"id":           info.ID.String(),
+			"name":         hostname,
+			"type":         info.Beat,
+			"version":      info.Version,
+		}
+		if info.Name != "" {
+			metadata["name"] = info.Name
+		}
+		return mapstr.M{"agent": metadata}
+	})
+}
+
+// WithObserverMeta adds beat meta information as builtin fields to a processing
+// pipeline.
+func WithObserverMeta() modifier {
+	return builtinModifier(func(info beat.Info) mapstr.M {
+		metadata := mapstr.M{
+			"type":         info.Beat,                 // Per ECS this is not a valid type value.
+			"ephemeral_id": info.EphemeralID.String(), // Not in ECS.
+			"hostname":     info.Hostname,
+			"id":           info.ID.String(), // Not in ECS.
 			"version":      info.Version,
 		}
 		if info.Name != info.Hostname {
-			metadata.Put("name", info.Name)
+			metadata["name"] = info.Name
 		}
-		return common.MapStr{key: metadata}
+		return mapstr.M{"observer": metadata}
 	})
 }
 
@@ -161,7 +201,7 @@ func newBuilder(
 	info beat.Info,
 	log *logp.Logger,
 	processors *processors.Processors,
-	eventMeta common.EventMetadata,
+	eventMeta mapstr.EventMetadata,
 	modifiers []modifier,
 	skipNormalize bool,
 	timeSeries bool,
@@ -183,7 +223,7 @@ func newBuilder(
 		b.processors = tmp
 	}
 
-	builtin := common.MapStr{}
+	builtin := mapstr.M{}
 	for _, mod := range modifiers {
 		m := mod.BuiltinFields(info)
 		if len(m) > 0 {
@@ -194,9 +234,11 @@ func newBuilder(
 		b.builtinMeta = builtin
 	}
 
-	if fields := eventMeta.Fields; len(fields) > 0 {
-		b.fields = common.MapStr{}
-		common.MergeFields(b.fields, fields.Clone(), eventMeta.FieldsUnderRoot)
+	if len(eventMeta.Fields) > 0 {
+		b.fields = mapstr.M{}
+		if err := mapstr.MergeFields(b.fields, eventMeta.Fields.Clone(), eventMeta.FieldsUnderRoot); err != nil {
+			return nil, fmt.Errorf("failed merging event metadata into fields: %w", err)
+		}
 	}
 
 	if timeSeries {
@@ -218,6 +260,19 @@ func newBuilder(
 	}
 
 	return b, nil
+}
+
+// Processors returns a string description of the processor config
+func (b *builder) Processors() []string {
+	procList := []string{}
+
+	if b.processors != nil {
+		for _, proc := range b.processors.list {
+			procList = append(procList, proc.String())
+		}
+	}
+
+	return procList
 }
 
 // Create combines the builder configuration with the client settings
@@ -248,12 +303,18 @@ func (b *builder) Create(cfg beat.ProcessingConfig, drop bool) (beat.Processor, 
 	needsCopy := b.alwaysCopy || localProcessors != nil || b.processors != nil
 
 	builtin := b.builtinMeta
-	var clientFields common.MapStr
+	if cfg.DisableHost {
+		tmp := builtin.Clone()
+		delete(tmp, "host")
+		builtin = tmp
+	}
+
+	var clientFields mapstr.M
 	for _, mod := range b.modifiers {
 		m := mod.ClientFields(b.info, cfg)
 		if len(m) > 0 {
 			if clientFields == nil {
-				clientFields = common.MapStr{}
+				clientFields = mapstr.M{}
 			}
 			clientFields.DeepUpdate(m.Clone())
 		}
@@ -264,9 +325,13 @@ func (b *builder) Create(cfg beat.ProcessingConfig, drop bool) (beat.Processor, 
 		builtin = tmp
 	}
 
-	if !b.skipNormalize {
-		// setup 1: generalize/normalize output (P)
-		processors.add(newGeneralizeProcessor(cfg.KeepNull))
+	// setup 1: generalize/normalize output (P)
+	if cfg.EventNormalization != nil {
+		if *cfg.EventNormalization {
+			processors.add(newGeneralizeProcessor(cfg.KeepNull, b.log))
+		}
+	} else if !b.skipNormalize {
+		processors.add(newGeneralizeProcessor(cfg.KeepNull, b.log))
 	}
 
 	// setup 2: add Meta from client config (C)
@@ -279,14 +344,19 @@ func (b *builder) Create(cfg beat.ProcessingConfig, drop bool) (beat.Processor, 
 	tags = append(tags, b.tags...)
 	tags = append(tags, cfg.EventMetadata.Tags...)
 	if len(tags) > 0 {
-		processors.add(actions.NewAddTags("tags", tags))
+		processors.add(newProcessor("add_tags", func(event *beat.Event) (*beat.Event, error) {
+			_ = mapstr.AddTagsWithKey(event.Fields, "tags", tags)
+			return event, nil
+		}))
 	}
 
 	// setup 3, 4, 5: client config fields + pipeline fields + client fields + dyn metadata
 	fields := cfg.Fields.Clone()
 	fields.DeepUpdate(b.fields.Clone())
 	if em := cfg.EventMetadata; len(em.Fields) > 0 {
-		common.MergeFieldsDeep(fields, em.Fields.Clone(), em.FieldsUnderRoot)
+		if err := mapstr.MergeFieldsDeep(fields, em.Fields.Clone(), em.FieldsUnderRoot); err != nil {
+			return nil, fmt.Errorf("failed merging client event metadata into fields: %w", err)
+		}
 	}
 
 	if len(fields) > 0 {
@@ -295,11 +365,11 @@ func (b *builder) Create(cfg beat.ProcessingConfig, drop bool) (beat.Processor, 
 		// With dynamic fields potentially changing at any time, we need to copy,
 		// so we do not change shared structures be accident.
 		fieldsNeedsCopy := needsCopy || cfg.DynamicFields != nil || hasKeyAnyOf(fields, builtin)
-		processors.add(actions.NewAddFields(fields, fieldsNeedsCopy, true))
+		processors.add(addfields.NewAddFields(fields, fieldsNeedsCopy, true))
 	}
 
 	if cfg.DynamicFields != nil {
-		checkCopy := func(m common.MapStr) bool {
+		checkCopy := func(m mapstr.M) bool {
 			return needsCopy || hasKeyAnyOf(m, builtin)
 		}
 		processors.add(makeAddDynMetaProcessor("dynamicFields", cfg.DynamicFields, checkCopy))
@@ -310,19 +380,28 @@ func (b *builder) Create(cfg beat.ProcessingConfig, drop bool) (beat.Processor, 
 
 	// setup 6: add beats and host metadata
 	if meta := builtin; len(meta) > 0 {
-		processors.add(actions.NewAddFields(meta, needsCopy, false))
+		processors.add(addfields.NewAddFields(meta, needsCopy, false))
 	}
 
 	// setup 8: pipeline processors list
-	processors.add(b.processors)
+	if b.processors != nil {
+		// function processor hides implementation of processors.PathSetter
+		err := b.processors.SetPaths(b.info.Paths)
+		if err != nil {
+			return nil, fmt.Errorf("failed setting paths for global processors: %w", err)
+		}
+
+		// Add the global pipeline as a function processor, so clients cannot close it
+		processors.add(newProcessor(b.processors.title, b.processors.Run))
+	}
 
 	// setup 9: time series metadata
 	if b.timeSeries {
-		processors.add(timeseries.NewTimeSeriesProcessor(b.timeseriesFields))
+		processors.add(timeseries.NewTimeSeriesProcessor(b.timeseriesFields, b.log))
 	}
 
 	// setup 10: debug print final event (P)
-	if b.log.IsDebug() {
+	if b.log.IsDebug() || management.UnderAgent() {
 		processors.add(debugPrintProcessor(b.info, b.log))
 	}
 
@@ -331,13 +410,25 @@ func (b *builder) Create(cfg beat.ProcessingConfig, drop bool) (beat.Processor, 
 		processors.add(dropDisabledProcessor)
 	}
 
+	err := processors.SetPaths(b.info.Paths)
+	if err != nil {
+		return nil, fmt.Errorf("failed to set paths for processing pipeline: %w", err)
+	}
+
 	return processors, nil
+}
+
+func (b *builder) Close() error {
+	if b.processors != nil {
+		return b.processors.Close()
+	}
+	return nil
 }
 
 func makeClientProcessors(
 	log *logp.Logger,
 	cfg beat.ProcessingConfig,
-) processors.Processor {
+) beat.Processor {
 	procs := cfg.Processor
 	if procs == nil || len(procs.All()) == 0 {
 		return nil
@@ -348,10 +439,10 @@ func makeClientProcessors(
 	return p
 }
 
-func (b builtinModifier) BuiltinFields(info beat.Info) common.MapStr {
+func (b builtinModifier) BuiltinFields(info beat.Info) mapstr.M {
 	return b(info)
 }
 
-func (b builtinModifier) ClientFields(_ beat.Info, _ beat.ProcessingConfig) common.MapStr {
+func (b builtinModifier) ClientFields(_ beat.Info, _ beat.ProcessingConfig) mapstr.M {
 	return nil
 }

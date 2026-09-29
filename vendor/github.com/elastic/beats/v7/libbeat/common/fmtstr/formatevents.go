@@ -19,14 +19,13 @@ package fmtstr
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"reflect"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/pkg/errors"
 
 	"github.com/elastic/beats/v7/libbeat/beat"
 	"github.com/elastic/beats/v7/libbeat/common"
@@ -85,12 +84,11 @@ type eventEvalContext struct {
 }
 
 var (
-	errMissingKeys   = errors.New("missing keys")
 	errConvertString = errors.New("can not convert to string")
 )
 
 var eventCtxPool = &sync.Pool{
-	New: func() interface{} { return &eventEvalContext{} },
+	New: func() any { return &eventEvalContext{} },
 }
 
 func newEventCtx(sz int) *eventEvalContext {
@@ -153,22 +151,27 @@ func CompileEvent(in string) (*EventFormatString, error) {
 
 // Unpack tries to initialize the EventFormatString from provided value
 // (which must be a string). Unpack method satisfies go-ucfg.Unpacker interface
-// required by common.Config, in order to use EventFormatString with
+// required by config.C, in order to use EventFormatString with
 // `common.(*Config).Unpack()`.
-func (fs *EventFormatString) Unpack(v interface{}) error {
+func (fs *EventFormatString) Unpack(v any) error {
 	s, err := tryConvString(v)
 	if err != nil {
-		return err
+		return fmt.Errorf("error converting type %T to event formatter: %w", v, err)
 	}
 
 	tmp, err := CompileEvent(s)
 	if err != nil {
-		return err
+		return fmt.Errorf("error compiling event formatter: %w", err)
 	}
 
 	// init fs from tmp
 	*fs = *tmp
 	return nil
+}
+
+// IsInitialized returns true if the underlying event formatter is prepared to format an event
+func (fs *EventFormatString) IsInitialized() bool {
+	return fs.formatter != nil
 }
 
 // NumFields returns number of unique event fields used by the format string.
@@ -191,6 +194,9 @@ func (fs *EventFormatString) Fields() []string {
 // Run executes the format string returning a new expanded string or an error
 // if execution or event field expansion fails.
 func (fs *EventFormatString) Run(event *beat.Event) (string, error) {
+	if !fs.IsInitialized() {
+		return "", fmt.Errorf("event formatter is nil")
+	}
 	ctx := newEventCtx(len(fs.fields))
 	defer releaseCtx(ctx)
 
@@ -297,7 +303,7 @@ func (e *eventFieldCompiler) compileEventField(
 	ops []VariableOp,
 ) (FormatEvaler, error) {
 	if len(ops) > 1 {
-		return nil, errors.New("Too many format modifiers given")
+		return nil, errors.New("too many format modifiers given")
 	}
 
 	defaultValue := ""
@@ -309,7 +315,7 @@ func (e *eventFieldCompiler) compileEventField(
 		defaultValue = op.param
 	}
 
-	path, err := parseEventPath(field)
+	path, err := ParseEventPath(field)
 	if err != nil {
 		return nil, err
 	}
@@ -341,34 +347,26 @@ func (e *eventFieldCompiler) compileTimestamp(
 	ops []VariableOp,
 ) (FormatEvaler, error) {
 	if expression[0] != '+' {
-		return nil, errors.New("No timestamp expression")
+		return nil, errors.New("no timestamp expression")
 	}
 
 	formatter, err := dtfmt.NewFormatter(expression[1:])
 	if err != nil {
-		return nil, fmt.Errorf("%v in timestamp expression", err)
+		return nil, fmt.Errorf("%w in timestamp expression", err)
 	}
 
 	e.timestamp = true
 	return &eventTimestampEvaler{formatter}, nil
 }
 
-func (e *eventFieldEvaler) Eval(c interface{}, out *bytes.Buffer) error {
-	type stringer interface {
-		String() string
-	}
-
+func (e *eventFieldEvaler) Eval(c any, out *bytes.Buffer) error {
 	ctx := c.(*eventEvalContext)
 	s := ctx.keys[e.index]
 	_, err := out.WriteString(s)
 	return err
 }
 
-func (e *defaultEventFieldEvaler) Eval(c interface{}, out *bytes.Buffer) error {
-	type stringer interface {
-		String() string
-	}
-
+func (e *defaultEventFieldEvaler) Eval(c any, out *bytes.Buffer) error {
 	ctx := c.(*eventEvalContext)
 	s := ctx.keys[e.index]
 	if s == "" {
@@ -378,15 +376,15 @@ func (e *defaultEventFieldEvaler) Eval(c interface{}, out *bytes.Buffer) error {
 	return err
 }
 
-func (e *eventTimestampEvaler) Eval(c interface{}, out *bytes.Buffer) error {
+func (e *eventTimestampEvaler) Eval(c any, out *bytes.Buffer) error {
 	ctx := c.(*eventEvalContext)
 	_, err := e.formatter.Write(out, ctx.ts)
 	return err
 }
 
-func parseEventPath(field string) (string, error) {
+func ParseEventPath(field string) (string, error) {
 	field = strings.Trim(field, " \n\r\t")
-	var fields []string
+	fields := []string{}
 
 	for len(field) > 0 {
 		if field[0] != '[' {
@@ -420,12 +418,12 @@ func fieldString(event *beat.Event, field string) (string, error) {
 
 	s, err := tryConvString(v)
 	if err != nil {
-		return s, errors.Wrapf(err, "can not convert key '%v' value to string", v)
+		return s, fmt.Errorf("can not convert key '%v' value to string: %w", v, err)
 	}
 	return s, nil
 }
 
-func tryConvString(v interface{}) (string, error) {
+func tryConvString(v any) (string, error) {
 	type stringer interface {
 		String() string
 	}

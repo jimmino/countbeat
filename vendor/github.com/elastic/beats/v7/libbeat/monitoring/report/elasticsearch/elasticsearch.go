@@ -18,36 +18,39 @@
 package elasticsearch
 
 import (
+	"context"
 	"errors"
-	"fmt"
 	"io"
-	"math/rand"
-	"net/url"
+	"maps"
+	"math/rand/v2"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/elastic/beats/v7/libbeat/beat"
+	"github.com/elastic/beats/v7/libbeat/beatmonitoring"
 	"github.com/elastic/beats/v7/libbeat/common"
-	"github.com/elastic/beats/v7/libbeat/common/transport/tlscommon"
 	"github.com/elastic/beats/v7/libbeat/esleg/eslegclient"
-	"github.com/elastic/beats/v7/libbeat/logp"
-	"github.com/elastic/beats/v7/libbeat/monitoring"
 	"github.com/elastic/beats/v7/libbeat/monitoring/report"
 	"github.com/elastic/beats/v7/libbeat/outputs"
 	"github.com/elastic/beats/v7/libbeat/publisher/pipeline"
 	"github.com/elastic/beats/v7/libbeat/publisher/processing"
-	"github.com/elastic/beats/v7/libbeat/publisher/queue"
-	"github.com/elastic/beats/v7/libbeat/publisher/queue/memqueue"
+	conf "github.com/elastic/elastic-agent-libs/config"
+	"github.com/elastic/elastic-agent-libs/logp"
+	"github.com/elastic/elastic-agent-libs/mapstr"
+	"github.com/elastic/elastic-agent-libs/monitoring"
+	"github.com/elastic/elastic-agent-libs/transport/httpcommon"
 )
 
 type reporter struct {
-	done   *stopper
-	logger *logp.Logger
+	done       *stopper
+	logger     *logp.Logger
+	monitoring beatmonitoring.Monitoring
 
 	checkRetry time.Duration
 
 	// event metadata
-	beatMeta common.MapStr
+	beatMeta mapstr.M
 	tags     []string
 
 	// pipeline
@@ -55,17 +58,12 @@ type reporter struct {
 	client   beat.Client
 
 	out []outputs.NetworkClient
+	wg  sync.WaitGroup
 }
 
 const logSelector = "monitoring"
 
 var errNoMonitoring = errors.New("xpack monitoring not available")
-
-// default monitoring api parameters
-var defaultParams = map[string]string{
-	"system_id":          "beats",
-	"system_api_version": "7",
-}
 
 func init() {
 	report.RegisterReporterFactory("elasticsearch", makeReporter)
@@ -82,9 +80,7 @@ func defaultConfig(settings report.Settings) config {
 		APIKey:           "",
 		ProxyURL:         "",
 		CompressionLevel: 0,
-		TLS:              nil,
 		MaxRetries:       3,
-		Timeout:          60 * time.Second,
 		MetricsPeriod:    10 * time.Second,
 		StatePeriod:      1 * time.Minute,
 		BulkMaxSize:      50,
@@ -94,23 +90,19 @@ func defaultConfig(settings report.Settings) config {
 			Init: 1 * time.Second,
 			Max:  60 * time.Second,
 		},
-		Format:      report.FormatXPackMonitoringBulk,
 		ClusterUUID: settings.ClusterUUID,
+		Transport:   httpcommon.DefaultHTTPTransportSettings(),
 	}
 
 	if settings.DefaultUsername != "" {
 		c.Username = settings.DefaultUsername
 	}
 
-	if settings.Format != report.FormatUnknown {
-		c.Format = settings.Format
-	}
-
 	return c
 }
 
-func makeReporter(beat beat.Info, settings report.Settings, cfg *common.Config) (report.Reporter, error) {
-	log := logp.NewLogger(logSelector)
+func makeReporter(beat beat.Info, mon beatmonitoring.Monitoring, settings report.Settings, cfg *conf.C) (report.Reporter, error) {
+	log := beat.Logger.Named(logSelector)
 	config := defaultConfig(settings)
 	if err := cfg.Unpack(&config); err != nil {
 		return nil, err
@@ -129,25 +121,7 @@ func makeReporter(beat beat.Info, settings report.Settings, cfg *common.Config) 
 		windowSize = 1
 	}
 
-	proxyURL, err := common.ParseURL(config.ProxyURL)
-	if err != nil {
-		return nil, err
-	}
-	if proxyURL != nil {
-		log.Infof("Using proxy URL: %s", proxyURL)
-	}
-	tlsConfig, err := tlscommon.LoadTLSConfig(config.TLS)
-	if err != nil {
-		return nil, err
-	}
-
-	params := map[string]string{}
-	for k, v := range defaultParams {
-		params[k] = v
-	}
-	for k, v := range config.Params {
-		params[k] = v
-	}
+	params := makeClientParams(config)
 
 	hosts, err := outputs.ReadHostList(cfg)
 	if err != nil {
@@ -157,29 +131,32 @@ func makeReporter(beat beat.Info, settings report.Settings, cfg *common.Config) 
 		return nil, errors.New("empty hosts list")
 	}
 
-	var clients []outputs.NetworkClient
-	for _, host := range hosts {
-		client, err := makeClient(host, params, proxyURL, tlsConfig, &config)
+	clients := make([]outputs.NetworkClient, len(hosts))
+	for i, host := range hosts {
+		client, err := makeClient(host, params, &config, beat)
 		if err != nil {
 			return nil, err
 		}
-		clients = append(clients, client)
+		clients[i] = client
 	}
-
-	queueFactory := func(ackListener queue.ACKListener) (queue.Queue, error) {
-		return memqueue.NewQueue(log,
-			memqueue.Settings{
-				ACKListener: ackListener,
-				Events:      20,
-			}), nil
-	}
-
-	monitoring := monitoring.Default.GetRegistry("xpack.monitoring")
 
 	outClient := outputs.NewFailoverClient(clients)
 	outClient = outputs.WithBackoff(outClient, config.Backoff.Init, config.Backoff.Max)
 
-	processing, err := processing.MakeDefaultSupport(true)(beat, log, common.NewConfig())
+	processing, err := processing.MakeDefaultSupport(true, nil)(beat, log, conf.NewConfig())
+	if err != nil {
+		return nil, err
+	}
+
+	queueConfig := conf.Namespace{}
+	conf, err := conf.NewConfigFrom(map[string]any{
+		"mem.events":           32,
+		"mem.flush.min_events": 1,
+	})
+	if err != nil {
+		return nil, err
+	}
+	err = queueConfig.Unpack(conf)
 	if err != nil {
 		return nil, err
 	}
@@ -187,10 +164,10 @@ func makeReporter(beat beat.Info, settings report.Settings, cfg *common.Config) 
 	pipeline, err := pipeline.New(
 		beat,
 		pipeline.Monitors{
-			Metrics: monitoring,
+			Metrics: mon.StatsRegistry().GetOrCreateRegistry("monitoring"),
 			Logger:  log,
 		},
-		queueFactory,
+		queueConfig,
 		outputs.Group{
 			Clients:   []outputs.Client{outClient},
 			BatchSize: windowSize,
@@ -207,12 +184,13 @@ func makeReporter(beat beat.Info, settings report.Settings, cfg *common.Config) 
 
 	pipeConn, err := pipeline.Connect()
 	if err != nil {
-		pipeline.Close()
+		pipeline.Disconnect(context.Background())
 		return nil, err
 	}
 
 	r := &reporter{
 		logger:     log,
+		monitoring: mon,
 		done:       newStopper(),
 		beatMeta:   makeMeta(beat),
 		tags:       config.Tags,
@@ -221,6 +199,7 @@ func makeReporter(beat beat.Info, settings report.Settings, cfg *common.Config) 
 		client:     pipeConn,
 		out:        clients,
 	}
+	r.wg.Add(1)
 	go r.initLoop(config)
 	return r, nil
 }
@@ -228,12 +207,16 @@ func makeReporter(beat beat.Info, settings report.Settings, cfg *common.Config) 
 func (r *reporter) Stop() {
 	r.done.Stop()
 	r.client.Close()
-	r.pipeline.Close()
+	r.pipeline.Disconnect(context.Background())
+	r.wg.Wait()
 }
 
 func (r *reporter) initLoop(c config) {
 	r.logger.Debug("Start monitoring endpoint init loop.")
-	defer r.logger.Debug("Finish monitoring endpoint init loop.")
+	defer func() {
+		r.logger.Debug("Finish monitoring endpoint init loop.")
+		r.wg.Done()
+	}()
 
 	log := r.logger
 
@@ -241,8 +224,10 @@ func (r *reporter) initLoop(c config) {
 
 	for {
 		// Select one configured endpoint by random and check if xpack is available
-		client := r.out[rand.Intn(len(r.out))]
-		err := client.Connect()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		client := r.out[rand.IntN(len(r.out))]
+		err := client.Connect(ctx)
 		if err == nil {
 			closing(log, client)
 			break
@@ -264,12 +249,12 @@ func (r *reporter) initLoop(c config) {
 	log.Info("Successfully connected to X-Pack Monitoring endpoint.")
 
 	// Start collector and send loop if monitoring endpoint has been found.
-	go r.snapshotLoop("state", "state", c.StatePeriod, c.ClusterUUID)
+	go r.snapshotLoop(r.monitoring.StateRegistry(), "state", "state", c.StatePeriod, c.ClusterUUID)
 	// For backward compatibility stats is named to metrics.
-	go r.snapshotLoop("stats", "metrics", c.MetricsPeriod, c.ClusterUUID)
+	go r.snapshotLoop(r.monitoring.StatsRegistry(), "stats", "metrics", c.MetricsPeriod, c.ClusterUUID)
 }
 
-func (r *reporter) snapshotLoop(namespace, prefix string, period time.Duration, clusterUUID string) {
+func (r *reporter) snapshotLoop(registry *monitoring.Registry, namespace, prefix string, period time.Duration, clusterUUID string) {
 	ticker := time.NewTicker(period)
 	defer ticker.Stop()
 
@@ -287,13 +272,13 @@ func (r *reporter) snapshotLoop(namespace, prefix string, period time.Duration, 
 		case ts = <-ticker.C:
 		}
 
-		snapshot := makeSnapshot(monitoring.GetNamespace(namespace).GetRegistry())
+		snapshot := makeSnapshot(registry)
 		if snapshot == nil {
 			log.Debug("Empty snapshot.")
 			continue
 		}
 
-		fields := common.MapStr{
+		fields := mapstr.M{
 			"beat": r.beatMeta,
 			prefix: snapshot,
 		}
@@ -301,7 +286,7 @@ func (r *reporter) snapshotLoop(namespace, prefix string, period time.Duration, 
 			fields["tags"] = r.tags
 		}
 
-		meta := common.MapStr{
+		meta := mapstr.M{
 			"type":        "beats_" + namespace,
 			"interval_ms": int64(period / time.Millisecond),
 			// Converting to seconds as interval only accepts `s` as unit
@@ -309,10 +294,10 @@ func (r *reporter) snapshotLoop(namespace, prefix string, period time.Duration, 
 		}
 
 		if clusterUUID == "" {
-			clusterUUID = getClusterUUID()
+			clusterUUID = getClusterUUID(r.monitoring)
 		}
 		if clusterUUID != "" {
-			meta.Put("cluster_uuid", clusterUUID)
+			_, _ = meta.Put("cluster_uuid", clusterUUID)
 		}
 
 		r.client.Publish(beat.Event{
@@ -323,13 +308,7 @@ func (r *reporter) snapshotLoop(namespace, prefix string, period time.Duration, 
 	}
 }
 
-func makeClient(
-	host string,
-	params map[string]string,
-	proxyURL *url.URL,
-	tlsConfig *tlscommon.TLSConfig,
-	config *config,
-) (outputs.NetworkClient, error) {
+func makeClient(host string, params map[string]string, config *config, beat beat.Info) (outputs.NetworkClient, error) {
 	url, err := common.MakeURL(config.Protocol, "", host, 9200)
 	if err != nil {
 		return nil, err
@@ -337,25 +316,21 @@ func makeClient(
 
 	esClient, err := eslegclient.NewConnection(eslegclient.ConnectionSettings{
 		URL:              url,
-		Proxy:            proxyURL,
-		TLS:              tlsConfig,
+		Beatname:         beat.Beat,
 		Username:         config.Username,
 		Password:         config.Password,
 		APIKey:           config.APIKey,
 		Parameters:       params,
 		Headers:          config.Headers,
-		Timeout:          config.Timeout,
 		CompressionLevel: config.CompressionLevel,
-	})
+		Transport:        config.Transport,
+		UserAgent:        beat.UserAgent,
+	}, beat.Logger)
 	if err != nil {
 		return nil, err
 	}
 
-	if config.Format != report.FormatXPackMonitoringBulk && config.Format != report.FormatBulk {
-		return nil, fmt.Errorf("unknown reporting format: %v", config.Format)
-	}
-
-	return newPublishClient(esClient, params, config.Format)
+	return newPublishClient(esClient, params, beat.Logger)
 }
 
 func closing(log *logp.Logger, c io.Closer) {
@@ -364,8 +339,8 @@ func closing(log *logp.Logger, c io.Closer) {
 	}
 }
 
-func makeMeta(beat beat.Info) common.MapStr {
-	return common.MapStr{
+func makeMeta(beat beat.Info) mapstr.M {
+	return mapstr.M{
 		"type":    beat.Beat,
 		"version": beat.Version,
 		"name":    beat.Name,
@@ -374,8 +349,8 @@ func makeMeta(beat beat.Info) common.MapStr {
 	}
 }
 
-func getClusterUUID() string {
-	stateRegistry := monitoring.GetNamespace("state").GetRegistry()
+func getClusterUUID(mon beatmonitoring.Monitoring) string {
+	stateRegistry := mon.StateRegistry()
 	outputsRegistry := stateRegistry.GetRegistry("outputs")
 	if outputsRegistry == nil {
 		return ""
@@ -388,4 +363,12 @@ func getClusterUUID() string {
 
 	snapshot := monitoring.CollectFlatSnapshot(elasticsearchRegistry, monitoring.Full, false)
 	return snapshot.Strings["cluster_uuid"]
+}
+
+func makeClientParams(config config) map[string]string {
+	params := map[string]string{}
+
+	maps.Copy(params, config.Params)
+
+	return params
 }

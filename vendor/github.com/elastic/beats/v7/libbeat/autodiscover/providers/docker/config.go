@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// +build linux darwin windows
+//go:build linux || darwin || windows
 
 package docker
 
@@ -23,29 +23,35 @@ import (
 	"time"
 
 	"github.com/elastic/beats/v7/libbeat/autodiscover/template"
-	"github.com/elastic/beats/v7/libbeat/common"
-	"github.com/elastic/beats/v7/libbeat/common/docker"
+	"github.com/elastic/beats/v7/pkg/autodiscover/docker"
+	"github.com/elastic/elastic-agent-libs/config"
 )
+
+// AllSupportedHints includes the set of all supported hints for both logs and metrics autodiscovery
+var AllSupportedHints = []string{"enabled", "module", "metricsets", "hosts", "period", "timeout", "metrics_path", "username", "password", "stream", "processors", "multiline", "json", "disable", "ssl", "metrics_filters", "raw", "include_lines", "exclude_lines", "fileset", "pipeline", "raw"}
 
 // Config for docker autodiscover provider
 type Config struct {
 	Host           string                  `config:"host"`
 	TLS            *docker.TLSConfig       `config:"ssl"`
 	Prefix         string                  `config:"prefix"`
-	Hints          *common.Config          `config:"hints"`
-	Builders       []*common.Config        `config:"builders"`
-	Appenders      []*common.Config        `config:"appenders"`
+	Hints          *config.C               `config:"hints"`
+	Builders       []*config.C             `config:"builders"`
+	Appenders      []*config.C             `config:"appenders"`
 	Templates      template.MapperSettings `config:"templates"`
 	Dedot          bool                    `config:"labels.dedot"`
 	CleanupTimeout time.Duration           `config:"cleanup_timeout" validate:"positive"`
 }
+
+// DefaultCleanupTimeout Public variable, so specific beats (as Filebeat) can set a different cleanup timeout if they need it.
+var DefaultCleanupTimeout time.Duration = 0
 
 func defaultConfig() *Config {
 	return &Config{
 		Host:           "unix:///var/run/docker.sock",
 		Prefix:         "co.elastic",
 		Dedot:          true,
-		CleanupTimeout: 60 * time.Second,
+		CleanupTimeout: DefaultCleanupTimeout,
 	}
 }
 

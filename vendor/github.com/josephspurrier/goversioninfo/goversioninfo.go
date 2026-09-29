@@ -6,11 +6,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"os"
 	"reflect"
+	"regexp"
 	"strconv"
+	"strings"
 
 	"github.com/akavel/rsrc/binutil"
 	"github.com/akavel/rsrc/coff"
@@ -135,6 +136,41 @@ func padBytes(i int) []byte {
 	return make([]byte, i)
 }
 
+// NewFileVersion parses semver version string into a FileVersion object
+func NewFileVersion(version string) (FileVersion, error) {
+	re := regexp.MustCompile(`^(\d+)\.(\d+)\.(\d+)(?:\.(\d+))?`)
+
+	comps := re.FindStringSubmatch(version)
+	if len(comps) == 0 {
+		return FileVersion{}, fmt.Errorf("version expected to start from x.y.z")
+	}
+
+	// First match group is a whole matched string.
+	comps = comps[1:]
+	if comps[3] == "" {
+		comps = comps[:3]
+	}
+
+	nums := make([]int, len(comps))
+	for i := range nums {
+		n, err := strconv.Atoi(comps[i])
+		if err != nil {
+			return FileVersion{}, fmt.Errorf("%s: %s", comps[i], err)
+		}
+		nums[i] = n
+	}
+
+	res := FileVersion{
+		Major: nums[0],
+		Minor: nums[1],
+		Patch: nums[2],
+	}
+	if len(nums) == 4 {
+		res.Build = nums[3]
+	}
+	return res, nil
+}
+
 func (f FileVersion) getVersionHighString() string {
 	return fmt.Sprintf("%04x%04x", f.Major, f.Minor)
 }
@@ -160,7 +196,7 @@ func (t Translation) getTranslation() string {
 // IO Methods
 // *****************************************************************************
 
-// Walk writes the data buffer with hexidecimal data from the structs
+// Walk writes the data buffer with hexadecimal data from the structs
 func (vi *VersionInfo) Walk() {
 	// Create a buffer
 	var b bytes.Buffer
@@ -181,25 +217,23 @@ func (vi *VersionInfo) Walk() {
 // arch must be an architecture string accepted by coff.Arch, like "386" or "amd64"
 func (vi *VersionInfo) WriteSyso(filename string, arch string) error {
 
-	// Channel for generating IDs
-	newID := make(chan uint16)
-	go func() {
-		for i := uint16(1); ; i++ {
-			newID <- i
-		}
-	}()
+	var i uint16
+	newID := func() uint16 {
+		i++
+		return i
+	}
 
 	// Create a new RSRC section
-	coff := coff.NewRSRC()
+	rsrc := coff.NewRSRC()
 
-	// Set the architechture
-	err := coff.Arch(arch)
+	// Set the architecture
+	err := rsrc.Arch(arch)
 	if err != nil {
 		return err
 	}
 
 	// ID 16 is for Version Information
-	coff.AddResource(16, 1, SizedReader{bytes.NewBuffer(vi.Buffer.Bytes())})
+	rsrc.AddResource(16, 1, SizedReader{bytes.NewBuffer(vi.Buffer.Bytes())})
 
 	// If manifest is enabled
 	if vi.ManifestPath != "" {
@@ -210,26 +244,86 @@ func (vi *VersionInfo) WriteSyso(filename string, arch string) error {
 		}
 		defer manifest.Close()
 
-		id := <-newID
-		coff.AddResource(rtManifest, id, manifest)
+		id := newID()
+		rsrc.AddResource(rtManifest, id, manifest)
 	}
 
 	// If icon is enabled
 	if vi.IconPath != "" {
-		if err := addIcon(coff, vi.IconPath, newID); err != nil {
+		if err := addIcon(rsrc, vi.IconPath, newID); err != nil {
 			return err
 		}
 	}
 
-	coff.Freeze()
+	rsrc.Freeze()
 
 	// Write to file
-	return writeCoff(coff, filename)
+	return writeCoff(rsrc, filename)
 }
 
 // WriteHex creates a hex file for debugging version info
 func (vi *VersionInfo) WriteHex(filename string) error {
-	return ioutil.WriteFile(filename, vi.Buffer.Bytes(), 0655)
+	return os.WriteFile(filename, vi.Buffer.Bytes(), 0655)
+}
+
+// WriteGo creates a Go file that contains the version info so you can access
+// it in the application
+func (vi *VersionInfo) WriteGo(filename, packageName string) error {
+	if len(packageName) == 0 {
+		packageName = "main"
+	}
+
+	out, err := os.Create(filename)
+	if err != nil {
+		return err
+	}
+
+	ffib, err := json.MarshalIndent(vi.FixedFileInfo, "\t", "\t")
+	if err != nil {
+		return err
+	}
+
+	sfib, err := json.MarshalIndent(vi.StringFileInfo, "\t", "\t")
+	if err != nil {
+		return err
+	}
+
+	vfib, err := json.MarshalIndent(vi.VarFileInfo, "\t", "\t")
+	if err != nil {
+		return err
+	}
+
+	replace := "`\" + \"`\" + \"`"
+	str := "`{\n\t"
+	str += `"FixedFileInfo":`
+	str += strings.Replace(string(ffib), "`", replace, -1)
+	str += ",\n\t"
+	str += `"StringFileInfo":`
+	str += strings.Replace(string(sfib), "`", replace, -1)
+	str += ",\n\t"
+	str += `"VarFileInfo":`
+	str += strings.Replace(string(vfib), "`", replace, -1)
+	str += "\n"
+	str += "}`"
+	fmt.Fprintf(out, `// Auto-generated file by goversioninfo. Do not edit.
+package %v
+
+import (
+	"encoding/json"
+
+	"github.com/josephspurrier/goversioninfo"
+)
+
+func unmarshalGoVersionInfo(b []byte) goversioninfo.VersionInfo {
+	vi := goversioninfo.VersionInfo{}
+	json.Unmarshal(b, &vi)
+	return vi
+}
+
+var versionInfo = unmarshalGoVersionInfo([]byte(%v))
+`, packageName, string(str))
+
+	return nil
 }
 
 func writeCoff(coff *coff.Coff, fnameout string) error {

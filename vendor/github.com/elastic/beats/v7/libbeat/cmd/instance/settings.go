@@ -22,7 +22,7 @@ import (
 
 	"github.com/elastic/beats/v7/libbeat/cfgfile"
 	"github.com/elastic/beats/v7/libbeat/idxmgmt"
-	"github.com/elastic/beats/v7/libbeat/idxmgmt/ilm"
+	"github.com/elastic/beats/v7/libbeat/idxmgmt/lifecycle"
 	"github.com/elastic/beats/v7/libbeat/monitoring/report"
 	"github.com/elastic/beats/v7/libbeat/publisher/processing"
 )
@@ -33,6 +33,7 @@ type Settings struct {
 	IndexPrefix     string
 	Version         string
 	HasDashboards   bool
+	ElasticLicensed bool
 	Monitoring      report.Settings
 	RunFlags        *pflag.FlagSet
 	ConfigOverrides []cfgfile.ConditionalOverride
@@ -41,9 +42,15 @@ type Settings struct {
 
 	// load custom index manager. The config object will be the Beats root configuration.
 	IndexManagement idxmgmt.SupportFactory
-	ILM             ilm.SupportFactory
+	ILM             lifecycle.SupportFactory
 
 	Processing processing.SupportFactory
 
-	Umask *int
+	// InputQueueSize is the size for the internal publisher queue in the
+	// publisher pipeline. This is only useful when the Beat plans to use
+	// beat.DropIfFull PublishMode. Leave as zero for default.
+	InputQueueSize int
+
+	// Initialize functions that are called in-order to initialize unique items for the beat.
+	Initialize []func()
 }

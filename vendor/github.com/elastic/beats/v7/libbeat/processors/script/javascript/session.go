@@ -18,17 +18,17 @@
 package javascript
 
 import (
+	"errors"
+	"fmt"
 	"reflect"
-	"sync"
 	"time"
 
 	"github.com/dop251/goja"
-	"github.com/pkg/errors"
 	"go.uber.org/zap"
 
 	"github.com/elastic/beats/v7/libbeat/beat"
-	"github.com/elastic/beats/v7/libbeat/common"
-	"github.com/elastic/beats/v7/libbeat/logp"
+	"github.com/elastic/elastic-agent-libs/logp"
+	"github.com/elastic/elastic-agent-libs/mapstr"
 )
 
 const (
@@ -43,7 +43,7 @@ const (
 
 // Session is an instance of the processor.
 type Session interface {
-	// Runtime returns the Javascript runtime used for this session.
+	// Runtime returns the JavaScript runtime used for this session.
 	Runtime() *goja.Runtime
 
 	// Event returns a pointer to the current event being processed.
@@ -82,17 +82,25 @@ type session struct {
 	tagOnException string
 }
 
-func newSession(p *goja.Program, conf Config, test bool) (*session, error) {
+func newSession(p *goja.Program, conf Config, test bool, logger *logp.Logger) (*session, error) {
+	// Create a logger
+	logger = logger.Named(logName)
+	if conf.Tag != "" {
+		logger = logger.With("instance_id", conf.Tag)
+	}
+	// Measure load times
+	start := time.Now()
+	defer func() {
+		took := time.Since(start)
+		logger.Debugf("Load of javascript pipeline took %v", took)
+	}()
 	// Setup JS runtime.
 	s := &session{
 		vm:             goja.New(),
-		log:            logp.NewLogger(logName),
+		log:            logger,
 		makeEvent:      newBeatEventV0,
 		timeout:        conf.Timeout,
 		tagOnException: conf.TagOnException,
-	}
-	if conf.Tag != "" {
-		s.log = s.log.With("instance_id", conf.Tag)
 	}
 
 	// Register modules.
@@ -138,13 +146,13 @@ func (s *session) setProcessFunction() error {
 		return errors.New("process is not a function")
 	}
 	if err := s.vm.ExportTo(processFunc, &s.processFunc); err != nil {
-		return errors.Wrap(err, "failed to export process function")
+		return fmt.Errorf("failed to export process function: %w", err)
 	}
 	return nil
 }
 
 // registerScriptParams calls the register() function and passes the params.
-func (s *session) registerScriptParams(params map[string]interface{}) error {
+func (s *session) registerScriptParams(params map[string]any) error {
 	registerFunc := s.vm.Get(registerFunction)
 	if registerFunc == nil {
 		return errors.New("params were provided but no register function was found")
@@ -154,10 +162,10 @@ func (s *session) registerScriptParams(params map[string]interface{}) error {
 	}
 	var register goja.Callable
 	if err := s.vm.ExportTo(registerFunc, &register); err != nil {
-		return errors.Wrap(err, "failed to export register function")
+		return fmt.Errorf("failed to export register function: %w", err)
 	}
 	if _, err := register(goja.Undefined(), s.Runtime().ToValue(params)); err != nil {
-		return errors.Wrap(err, "failed to register script_params")
+		return fmt.Errorf("failed to register script_params: %w", err)
 	}
 	s.log.Debug("Registered params with processor")
 	return nil
@@ -172,11 +180,11 @@ func (s *session) executeTestFunction() error {
 		}
 		var test goja.Callable
 		if err := s.vm.ExportTo(testFunc, &test); err != nil {
-			return errors.Wrap(err, "failed to export test function")
+			return fmt.Errorf("failed to export test function: %w", err)
 		}
 		_, err := test(goja.Undefined(), nil)
 		if err != nil {
-			return errors.Wrap(err, "failed in test() function")
+			return fmt.Errorf("failed in test() function: %w", err)
 		}
 		s.log.Debugf("Successful test() execution for processor.")
 	}
@@ -202,17 +210,16 @@ func (s *session) runProcessFunc(b *beat.Event) (out *beat.Event, err error) {
 		if r := recover(); r != nil {
 			s.log.Errorw("The javascript processor caused an unexpected panic "+
 				"while processing an event. Recovering, but please report this.",
-				"event", common.MapStr{"original": b.Fields.String()},
 				"panic", r,
 				zap.Stack("stack"))
 			if !s.evt.IsCancelled() {
 				out = b
 			}
-			err = errors.Errorf("unexpected panic in javascript processor: %v", r)
+			err = fmt.Errorf("unexpected panic in javascript processor: %v", r)
 			if s.tagOnException != "" {
-				common.AddTags(b.Fields, []string{s.tagOnException})
+				_ = mapstr.AddTags(b.Fields, []string{s.tagOnException})
 			}
-			appendString(b.Fields, "error.message", err.Error(), false)
+			_ = appendString(b.Fields, "error.message", err.Error(), false)
 		}
 	}()
 
@@ -231,10 +238,10 @@ func (s *session) runProcessFunc(b *beat.Event) (out *beat.Event, err error) {
 
 	if _, err = s.processFunc(goja.Undefined(), s.evt.JSObject()); err != nil {
 		if s.tagOnException != "" {
-			common.AddTags(b.Fields, []string{s.tagOnException})
+			_ = mapstr.AddTags(b.Fields, []string{s.tagOnException})
 		}
-		appendString(b.Fields, "error.message", err.Error(), false)
-		return b, errors.Wrap(err, "failed in process function")
+		_ = appendString(b.Fields, "error.message", err.Error(), false)
+		return b, fmt.Errorf("failed in process function: %w", err)
 	}
 
 	if s.evt.IsCancelled() {
@@ -243,7 +250,7 @@ func (s *session) runProcessFunc(b *beat.Event) (out *beat.Event, err error) {
 	return b, nil
 }
 
-// Runtime returns the Javascript runtime used for this session.
+// Runtime returns the JavaScript runtime used for this session.
 func (s *session) Runtime() *goja.Runtime {
 	return s.vm
 }
@@ -254,45 +261,69 @@ func (s *session) Event() Event {
 }
 
 func init() {
-	// Register common.MapStr as being a simple map[string]interface{} for
+	// Register mapstr.M as being a simple map[string]any for
 	// treatment within the JS VM.
 	AddSessionHook("_type_mapstr", func(s Session) {
-		s.Runtime().RegisterSimpleMapType(reflect.TypeOf(common.MapStr(nil)),
-			func(i interface{}) map[string]interface{} {
-				return map[string]interface{}(i.(common.MapStr))
+		s.Runtime().RegisterSimpleMapType(reflect.TypeFor[mapstr.M](),
+			func(i any) map[string]any {
+				return i.(mapstr.M) //nolint:errcheck //keep behavior for now
 			},
 		)
 	})
 }
 
 type sessionPool struct {
-	pool *sync.Pool
+	New                func() *session
+	C                  chan *session
+	NewSessionsAllowed bool
 }
 
-func newSessionPool(p *goja.Program, c Config) (*sessionPool, error) {
-	s, err := newSession(p, c, true)
+func newSessionPool(p *goja.Program, c Config, logger *logp.Logger) (*sessionPool, error) {
+	s, err := newSession(p, c, true, logger)
 	if err != nil {
 		return nil, err
 	}
 
-	pool := &sync.Pool{
-		New: func() interface{} {
-			s, _ := newSession(p, c, false)
+	pool := sessionPool{
+		New: func() *session {
+			s, _ := newSession(p, c, false, logger)
 			return s
 		},
+		C:                  make(chan *session, c.MaxCachedSessions),
+		NewSessionsAllowed: !c.OnlyCachedSessions,
 	}
 	pool.Put(s)
 
-	return &sessionPool{pool}, nil
+	// If we are not allowed to create new sessions, pre-cache requested sessions
+	if !pool.NewSessionsAllowed {
+		for i := 0; i < c.MaxCachedSessions-1; i++ {
+			pool.Put(pool.New())
+		}
+	}
+
+	return &pool, nil
 }
 
 func (p *sessionPool) Get() *session {
-	s, _ := p.pool.Get().(*session)
-	return s
+
+	if !p.NewSessionsAllowed {
+		return <-p.C
+	}
+
+	// Try to get a session from the pool, if none is available, create a new one
+	select {
+	case s := <-p.C:
+		return s
+	default:
+		return p.New()
+	}
 }
 
 func (p *sessionPool) Put(s *session) {
 	if s != nil {
-		p.pool.Put(s)
+		select {
+		case p.C <- s:
+		default:
+		}
 	}
 }

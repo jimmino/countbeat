@@ -19,19 +19,19 @@ package jolokia
 
 import (
 	"encoding/json"
+	"fmt"
 	"net"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/gofrs/uuid"
-	"github.com/pkg/errors"
+	"github.com/gofrs/uuid/v5"
 
-	"github.com/elastic/beats/v7/libbeat/common"
-	"github.com/elastic/beats/v7/libbeat/common/bus"
 	s "github.com/elastic/beats/v7/libbeat/common/schema"
 	c "github.com/elastic/beats/v7/libbeat/common/schema/mapstriface"
-	"github.com/elastic/beats/v7/libbeat/logp"
+	"github.com/elastic/beats/v7/pkg/autodiscover/bus"
+	"github.com/elastic/elastic-agent-libs/logp"
+	"github.com/elastic/elastic-agent-libs/mapstr"
 )
 
 // Jolokia Discovery query
@@ -76,7 +76,7 @@ type Event struct {
 	ProviderUUID uuid.UUID
 	Type         string
 	AgentID      string
-	Message      common.MapStr
+	Message      mapstr.M
 }
 
 // BusEvent converts a Jolokia Discovery event to a autodiscover bus event
@@ -86,7 +86,7 @@ func (e *Event) BusEvent() bus.Event {
 		"provider": e.ProviderUUID,
 		"id":       e.AgentID,
 		"jolokia":  e.Message,
-		"meta": common.MapStr{
+		"meta": mapstr.M{
 			"jolokia": e.Message,
 		},
 	}
@@ -99,7 +99,7 @@ type Instance struct {
 	LastSeen      time.Time
 	LastInterface *InterfaceConfig
 	AgentID       string
-	Message       common.MapStr
+	Message       mapstr.M
 }
 
 // Discovery controls the Jolokia Discovery probes
@@ -123,9 +123,8 @@ func (d *Discovery) Start() {
 	d.instances = make(map[string]*Instance)
 	d.events = make(chan Event)
 	d.stop = make(chan struct{})
-	if d.log == nil {
-		d.log = logp.NewLogger("jolokia")
-	}
+	d.log = d.log.Named("jolokia")
+
 	go d.run()
 }
 
@@ -143,7 +142,6 @@ func (d *Discovery) Events() <-chan Event {
 
 func (d *Discovery) run() {
 	for _, i := range d.Interfaces {
-		i := i
 		go func() {
 			for {
 				d.sendProbe(i)
@@ -187,7 +185,7 @@ func matchInterfaceName(name, candidate string) bool {
 func getIPv4Addr(i net.Interface) (net.IP, error) {
 	addrs, err := i.Addrs()
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to get addresses for "+i.Name)
+		return nil, fmt.Errorf("failed to get addresses for "+i.Name+": %w", err)
 	}
 	for _, a := range addrs {
 		if ip, _, err := net.ParseCIDR(a.String()); err == nil && ip != nil {
@@ -222,11 +220,9 @@ func (d *Discovery) sendProbe(config InterfaceConfig) {
 			continue
 		}
 
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 
-			conn, err := net.ListenPacket("udp4", net.JoinHostPort(ip.String(), "0"))
+			conn, err := net.ListenPacket("udp4", net.JoinHostPort(ip.String(), "0")) //nolint:noctx // legacy UDP discovery
 			if err != nil {
 				log.Error(err.Error())
 				return
@@ -234,11 +230,10 @@ func (d *Discovery) sendProbe(config InterfaceConfig) {
 			defer conn.Close()
 
 			// Avoid having sockets open more time than needed
-			timeout := config.ProbeTimeout
-			if timeout > config.Interval {
-				timeout = config.Interval
+			timeout := min(config.ProbeTimeout, config.Interval)
+			if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+				log.Error(err.Error())
 			}
-			conn.SetDeadline(time.Now().Add(timeout))
 
 			if _, err := conn.WriteTo(queryMessage, &discoveryAddress); err != nil {
 				log.Error(err.Error())
@@ -249,12 +244,13 @@ func (d *Discovery) sendProbe(config InterfaceConfig) {
 			for {
 				n, _, err := conn.ReadFrom(b)
 				if err != nil {
+					//nolint:errorlint // false positive
 					if netErr, ok := err.(net.Error); !ok || !netErr.Timeout() {
 						log.Error(err.Error())
 					}
 					return
 				}
-				m := make(map[string]interface{})
+				m := make(map[string]any)
 				err = json.Unmarshal(b[:n], &m)
 				if err != nil {
 					log.Error(err.Error())
@@ -267,12 +263,12 @@ func (d *Discovery) sendProbe(config InterfaceConfig) {
 				}
 				d.update(config, message)
 			}
-		}()
+		})
 	}
 	wg.Wait()
 }
 
-func (d *Discovery) update(config InterfaceConfig, message common.MapStr) {
+func (d *Discovery) update(config InterfaceConfig, message mapstr.M) {
 	log := d.log
 
 	v, err := message.GetValue("agent.id")

@@ -19,19 +19,30 @@ package actions
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"slices"
+	"strings"
 
-	"github.com/pkg/errors"
-	"go.uber.org/multierr"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+
+	"github.com/elastic/beats/v7/libbeat/common/match"
+	"github.com/elastic/beats/v7/libbeat/otel/otelmap"
 
 	"github.com/elastic/beats/v7/libbeat/beat"
-	"github.com/elastic/beats/v7/libbeat/common"
 	"github.com/elastic/beats/v7/libbeat/processors"
 	"github.com/elastic/beats/v7/libbeat/processors/checks"
+	jsprocessor "github.com/elastic/beats/v7/libbeat/processors/script/javascript/module/processor/registry"
+	conf "github.com/elastic/elastic-agent-libs/config"
+	"github.com/elastic/elastic-agent-libs/logp"
+	"github.com/elastic/elastic-agent-libs/mapstr"
 )
+
+var _ processors.PdataProcessor = (*dropFields)(nil)
 
 type dropFields struct {
 	Fields        []string
+	RegexpFields  []match.Matcher
 	IgnoreMissing bool
 }
 
@@ -40,44 +51,97 @@ func init() {
 		checks.ConfigChecked(newDropFields,
 			checks.RequireFields("fields"),
 			checks.AllowedFields("fields", "when", "ignore_missing")))
+
+	jsprocessor.RegisterPlugin("DropFields", newDropFields)
 }
 
-func newDropFields(c *common.Config) (processors.Processor, error) {
+func newDropFields(c *conf.C, log *logp.Logger) (beat.Processor, error) {
 	config := struct {
 		Fields        []string `config:"fields"`
 		IgnoreMissing bool     `config:"ignore_missing"`
 	}{}
 	err := c.Unpack(&config)
 	if err != nil {
-		return nil, fmt.Errorf("fail to unpack the drop_fields configuration: %s", err)
+		return nil, fmt.Errorf("fail to unpack the drop_fields configuration: %w", err)
 	}
 
-	/* remove read only fields */
+	// Do not drop manadatory fields
+	var configFields []string
 	for _, readOnly := range processors.MandatoryExportedFields {
-		for i, field := range config.Fields {
-			if readOnly == field {
-				config.Fields = append(config.Fields[:i], config.Fields[i+1:]...)
+		for _, field := range config.Fields {
+			if readOnly == field || strings.HasPrefix(field, readOnly+".") {
+				continue
 			}
+			configFields = append(configFields, field)
 		}
 	}
 
-	f := &dropFields{Fields: config.Fields, IgnoreMissing: config.IgnoreMissing}
+	// Parse regexp containing fields and removes them from initial config
+	regexpFields := make([]match.Matcher, 0)
+	for i, v := range slices.Backward(configFields) {
+		field := v
+		if strings.HasPrefix(field, "/") && strings.HasSuffix(field, "/") && len(field) > 2 {
+			configFields = append(configFields[:i], configFields[i+1:]...)
+
+			matcher, err := match.Compile(field[1 : len(field)-1])
+			if err != nil {
+				return nil, fmt.Errorf("wrong configuration in drop_fields[%d]=%s. %w", i, field, err)
+			}
+
+			regexpFields = append(regexpFields, matcher)
+		}
+	}
+
+	f := &dropFields{Fields: configFields, IgnoreMissing: config.IgnoreMissing, RegexpFields: regexpFields}
 	return f, nil
 }
 
 func (f *dropFields) Run(event *beat.Event) (*beat.Event, error) {
 	var errs []error
 
+	// remove exact match fields
 	for _, field := range f.Fields {
-		if err := event.Delete(field); err != nil {
-			if f.IgnoreMissing && err == common.ErrKeyNotFound {
-				continue
+		f.deleteField(event, field, &errs)
+	}
+
+	// remove fields contained in regexp expressions
+	for _, regex := range f.RegexpFields {
+		for _, field := range *event.Fields.FlattenKeys() {
+			if regex.MatchString(field) {
+				f.deleteField(event, field, &errs)
 			}
-			errs = append(errs, errors.Wrapf(err, "failed to drop field [%v]", field))
 		}
 	}
 
-	return event, multierr.Combine(errs...)
+	return event, errors.Join(errs...)
+}
+
+func (f *dropFields) deleteField(event *beat.Event, field string, errs *[]error) {
+	if err := event.Delete(field); err != nil {
+		if !f.IgnoreMissing || !errors.Is(err, mapstr.ErrKeyNotFound) {
+			*errs = append(*errs, fmt.Errorf("failed to drop field [%v], error: %w", field, err))
+		}
+	}
+}
+
+func (f *dropFields) RunPdata(body pcommon.Map) (bool, error) {
+	var errs []error
+
+	for _, field := range f.Fields {
+		if !otelmap.DeleteAtPath(field, body) && !f.IgnoreMissing {
+			errs = append(errs, fmt.Errorf("failed to drop field [%v], error: %w", field, mapstr.ErrKeyNotFound))
+		}
+	}
+
+	for _, regex := range f.RegexpFields {
+		for _, field := range otelmap.FlattenKeys(body) {
+			if regex.MatchString(field) {
+				otelmap.DeleteAtPath(field, body)
+			}
+		}
+	}
+
+	return false, errors.Join(errs...)
 }
 
 func (f *dropFields) String() string {
