@@ -24,14 +24,12 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/pkg/errors"
-
 	"github.com/elastic/beats/v7/libbeat/beat"
-	"github.com/elastic/beats/v7/libbeat/common"
 	"github.com/elastic/beats/v7/libbeat/common/flowhash"
-	"github.com/elastic/beats/v7/libbeat/logp"
 	"github.com/elastic/beats/v7/libbeat/processors"
-	jsprocessor "github.com/elastic/beats/v7/libbeat/processors/script/javascript/module/processor"
+	jsprocessor "github.com/elastic/beats/v7/libbeat/processors/script/javascript/module/processor/registry"
+	cfg "github.com/elastic/elastic-agent-libs/config"
+	"github.com/elastic/elastic-agent-libs/logp"
 )
 
 const logName = "processor.community_id"
@@ -51,31 +49,28 @@ type processor struct {
 // values that are incorporated into the hash vary by protocol.
 //
 // TCP / UDP / SCTP:
-//   IP src / IP dst / IP proto / source port / dest port
+// IP src / IP dst / IP proto / source port / dest port
 //
 // ICMPv4 / ICMPv6:
-//   IP src / IP dst / IP proto / ICMP type + "counter-type" or code
+// IP src / IP dst / IP proto / ICMP type + "counter-type" or code
 //
 // Other IP-borne protocols:
-//   IP src / IP dst / IP proto
-func New(cfg *common.Config) (processors.Processor, error) {
+// IP src / IP dst / IP proto
+func New(cfg *cfg.C, log *logp.Logger) (beat.Processor, error) {
 	c := defaultConfig()
 	if err := cfg.Unpack(&c); err != nil {
-		return nil, errors.Wrap(err, "fail to unpack the community_id configuration")
+		return nil, fmt.Errorf("fail to unpack the community_id configuration: %w", err)
 	}
 
-	return newFromConfig(c)
+	return newFromConfig(c, log)
 }
 
-func newFromConfig(c config) (*processor, error) {
-	hasher := flowhash.CommunityID
-	if c.Seed != 0 {
-		hasher = flowhash.NewCommunityID(c.Seed, flowhash.Base64Encoding, crypto.SHA1)
-	}
+func newFromConfig(c config, log *logp.Logger) (*processor, error) {
+	hasher := flowhash.NewCommunityID(c.Seed, flowhash.Base64Encoding, crypto.SHA1)
 
 	return &processor{
 		config: c,
-		log:    logp.NewLogger(logName),
+		log:    log.Named(logName),
 		hasher: hasher,
 	}, nil
 }
@@ -154,20 +149,22 @@ func (p *processor) buildFlow(event *beat.Event) *flowhash.Flow {
 		if err != nil {
 			return nil
 		}
-		flow.SourcePort, ok = tryToUint16(v)
-		if !ok || flow.SourcePort == 0 {
+		sp, ok := tryToUint(v)
+		if !ok || sp > 65535 {
 			return nil
 		}
+		flow.SourcePort = uint16(sp)
 
 		// destination port
 		v, err = event.GetValue(p.Fields.DestinationPort)
 		if err != nil {
 			return nil
 		}
-		flow.DestinationPort, ok = tryToUint16(v)
-		if !ok || flow.DestinationPort == 0 {
+		dp, ok := tryToUint(v)
+		if !ok || dp > 65535 {
 			return nil
 		}
+		flow.DestinationPort = uint16(dp)
 	case icmpProtocol, icmpIPv6Protocol:
 		// Return a flow even if the ICMP type/code is unavailable.
 		if t, c, ok := getICMPTypeCode(event, p.Fields.ICMPType, p.Fields.ICMPCode); ok {
@@ -199,7 +196,7 @@ func getICMPTypeCode(event *beat.Event, typeField, codeField string) (t, c uint8
 	return t, c, true
 }
 
-func tryToIP(from interface{}) (net.IP, bool) {
+func tryToIP(from any) (net.IP, bool) {
 	switch v := from.(type) {
 	case net.IP:
 		return v, true
@@ -211,43 +208,43 @@ func tryToIP(from interface{}) (net.IP, bool) {
 	}
 }
 
-// tryToUint16 tries to coerce the given interface to an uint16. On success it
+// tryToUint tries to coerce the given interface to an uint16. On success it
 // returns the int value and true.
-func tryToUint16(from interface{}) (uint16, bool) {
+func tryToUint(from any) (uint, bool) {
 	switch v := from.(type) {
 	case int:
-		return uint16(v), true
+		return uint(v), true
 	case int8:
-		return uint16(v), true
+		return uint(v), true
 	case int16:
-		return uint16(v), true
+		return uint(v), true
 	case int32:
-		return uint16(v), true
+		return uint(v), true
 	case int64:
-		return uint16(v), true
+		return uint(v), true
 	case uint:
-		return uint16(v), true
-	case uint8:
-		return uint16(v), true
-	case uint16:
 		return v, true
+	case uint8:
+		return uint(v), true
+	case uint16:
+		return uint(v), true
 	case uint32:
-		return uint16(v), true
+		return uint(v), true
 	case uint64:
-		return uint16(v), true
+		return uint(v), true
 	case string:
-		num, err := strconv.ParseUint(v, 0, 16)
+		num, err := strconv.ParseUint(v, 0, 64)
 		if err != nil {
 			return 0, false
 		}
-		return uint16(num), true
+		return uint(num), true
 	default:
 		return 0, false
 	}
 }
 
-func tryToUint8(from interface{}) (uint8, bool) {
-	to, ok := tryToUint16(from)
+func tryToUint8(from any) (uint8, bool) {
+	to, ok := tryToUint(from)
 	return uint8(to), ok
 }
 
@@ -278,7 +275,7 @@ var transports = map[string]uint8{
 	"sctp":      sctpProtocol,
 }
 
-func tryToIANATransportProtocol(from interface{}) (uint8, bool) {
+func tryToIANATransportProtocol(from any) (uint8, bool) {
 	switch v := from.(type) {
 	case string:
 		transport, found := transports[v]

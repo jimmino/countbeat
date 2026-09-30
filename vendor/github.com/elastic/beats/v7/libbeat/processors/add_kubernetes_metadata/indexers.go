@@ -19,12 +19,14 @@ package add_kubernetes_metadata
 
 import (
 	"fmt"
+	"net"
+	"strconv"
 
-	"github.com/elastic/beats/v7/libbeat/common/kubernetes/metadata"
-
-	"github.com/elastic/beats/v7/libbeat/common"
-	"github.com/elastic/beats/v7/libbeat/common/kubernetes"
-	"github.com/elastic/beats/v7/libbeat/logp"
+	"github.com/elastic/beats/v7/pkg/autodiscover/kubernetes"
+	"github.com/elastic/beats/v7/pkg/autodiscover/kubernetes/metadata"
+	"github.com/elastic/elastic-agent-libs/config"
+	"github.com/elastic/elastic-agent-libs/logp"
+	"github.com/elastic/elastic-agent-libs/mapstr"
 )
 
 const (
@@ -50,7 +52,7 @@ type Indexer interface {
 // MetadataIndex holds a pair of index -> metadata info
 type MetadataIndex struct {
 	Index string
-	Data  common.MapStr
+	Data  mapstr.M
 }
 
 type Indexers struct {
@@ -58,7 +60,7 @@ type Indexers struct {
 }
 
 // IndexerConstructor builds a new indexer from its settings
-type IndexerConstructor func(config common.Config, metaGen metadata.MetaGen) (Indexer, error)
+type IndexerConstructor func(config config.C, metaGen metadata.MetaGen) (Indexer, error)
 
 // NewIndexers builds indexers object
 func NewIndexers(configs PluginConfig, metaGen metadata.MetaGen) *Indexers {
@@ -90,9 +92,7 @@ func NewIndexers(configs PluginConfig, metaGen metadata.MetaGen) *Indexers {
 func (i *Indexers) GetIndexes(pod *kubernetes.Pod) []string {
 	var indexes []string
 	for _, indexer := range i.indexers {
-		for _, i := range indexer.GetIndexes(pod) {
-			indexes = append(indexes, i)
-		}
+		indexes = append(indexes, indexer.GetIndexes(pod)...)
 	}
 	return indexes
 }
@@ -101,20 +101,14 @@ func (i *Indexers) GetIndexes(pod *kubernetes.Pod) []string {
 func (i *Indexers) GetMetadata(pod *kubernetes.Pod) []MetadataIndex {
 	var metadata []MetadataIndex
 	for _, indexer := range i.indexers {
-		for _, m := range indexer.GetMetadata(pod) {
-			metadata = append(metadata, m)
-		}
+		metadata = append(metadata, indexer.GetMetadata(pod)...)
 	}
 	return metadata
 }
 
 // Empty returns true if indexers list is empty
 func (i *Indexers) Empty() bool {
-	if len(i.indexers) == 0 {
-		return true
-	}
-
-	return false
+	return len(i.indexers) == 0
 }
 
 // PodNameIndexer implements default indexer based on pod name
@@ -123,7 +117,7 @@ type PodNameIndexer struct {
 }
 
 // NewPodNameIndexer initializes and returns a PodNameIndexer
-func NewPodNameIndexer(_ common.Config, metaGen metadata.MetaGen) (Indexer, error) {
+func NewPodNameIndexer(_ config.C, metaGen metadata.MetaGen) (Indexer, error) {
 	return &PodNameIndexer{metaGen: metaGen}, nil
 }
 
@@ -149,7 +143,7 @@ type PodUIDIndexer struct {
 }
 
 // NewPodUIDIndexer initializes and returns a PodUIDIndexer
-func NewPodUIDIndexer(_ common.Config, metaGen metadata.MetaGen) (Indexer, error) {
+func NewPodUIDIndexer(_ config.C, metaGen metadata.MetaGen) (Indexer, error) {
 	return &PodUIDIndexer{metaGen: metaGen}, nil
 }
 
@@ -175,22 +169,27 @@ type ContainerIndexer struct {
 }
 
 // NewContainerIndexer initializes and returns a ContainerIndexer
-func NewContainerIndexer(_ common.Config, metaGen metadata.MetaGen) (Indexer, error) {
+func NewContainerIndexer(_ config.C, metaGen metadata.MetaGen) (Indexer, error) {
 	return &ContainerIndexer{metaGen: metaGen}, nil
 }
 
 // GetMetadata returns the composed metadata list from all registered indexers
 func (c *ContainerIndexer) GetMetadata(pod *kubernetes.Pod) []MetadataIndex {
 	var m []MetadataIndex
-	for _, status := range append(pod.Status.ContainerStatuses, pod.Status.InitContainerStatuses...) {
-		cID := kubernetes.ContainerID(status)
+	for _, status := range getContainerStatusesInPod(pod) {
+		cID, runtime := kubernetes.ContainerIDWithRuntime(status)
 		if cID == "" {
 			continue
 		}
 		m = append(m, MetadataIndex{
 			Index: cID,
-			Data: c.metaGen.Generate(pod, metadata.WithFields("container.name", status.Name),
-				metadata.WithFields("container.image", status.Image)),
+			Data: c.metaGen.Generate(
+				pod,
+				metadata.WithFields("container.name", status.Name),
+				metadata.WithFields("container.image", status.Image),
+				metadata.WithFields("container.id", cID),
+				metadata.WithFields("container.runtime", runtime),
+			),
 		})
 	}
 
@@ -200,7 +199,7 @@ func (c *ContainerIndexer) GetMetadata(pod *kubernetes.Pod) []MetadataIndex {
 // GetIndexes returns the indexes for the given Pod
 func (c *ContainerIndexer) GetIndexes(pod *kubernetes.Pod) []string {
 	var containers []string
-	for _, status := range append(pod.Status.ContainerStatuses, pod.Status.InitContainerStatuses...) {
+	for _, status := range getContainerStatusesInPod(pod) {
 		cID := kubernetes.ContainerID(status)
 		if cID == "" {
 			continue
@@ -216,7 +215,7 @@ type IPPortIndexer struct {
 }
 
 // NewIPPortIndexer creates and returns a new indexer for pod IP & ports
-func NewIPPortIndexer(_ common.Config, metaGen metadata.MetaGen) (Indexer, error) {
+func NewIPPortIndexer(_ config.C, metaGen metadata.MetaGen) (Indexer, error) {
 	return &IPPortIndexer{metaGen: metaGen}, nil
 }
 
@@ -234,14 +233,30 @@ func (h *IPPortIndexer) GetMetadata(pod *kubernetes.Pod) []MetadataIndex {
 		Data:  h.metaGen.Generate(pod),
 	})
 
+	cIDs := make(map[string]string)
+	runtimes := make(map[string]string)
+	for _, status := range getContainerStatusesInPod(pod) {
+		cID, runtime := kubernetes.ContainerIDWithRuntime(status)
+		if cID == "" {
+			continue
+		}
+		cIDs[status.Name] = cID
+		runtimes[status.Name] = runtime
+	}
+
 	for _, container := range pod.Spec.Containers {
 		for _, port := range container.Ports {
 			if port.ContainerPort != 0 {
 
 				m = append(m, MetadataIndex{
-					Index: fmt.Sprintf("%s:%d", pod.Status.PodIP, port.ContainerPort),
-					Data: h.metaGen.Generate(pod, metadata.WithFields("container.name", container.Name),
-						metadata.WithFields("container.image", container.Image)),
+					Index: net.JoinHostPort(pod.Status.PodIP, strconv.Itoa(int(port.ContainerPort))),
+					Data: h.metaGen.Generate(
+						pod,
+						metadata.WithFields("container.name", container.Name),
+						metadata.WithFields("container.image", container.Image),
+						metadata.WithFields("container.id", cIDs[container.Name]),
+						metadata.WithFields("container.runtime", runtimes[container.Name]),
+					),
 				})
 			}
 		}
@@ -266,10 +281,21 @@ func (h *IPPortIndexer) GetIndexes(pod *kubernetes.Pod) []string {
 
 		for _, port := range ports {
 			if port.ContainerPort != 0 {
-				hostPorts = append(hostPorts, fmt.Sprintf("%s:%d", pod.Status.PodIP, port.ContainerPort))
+				hostPorts = append(hostPorts, net.JoinHostPort(pod.Status.PodIP, strconv.Itoa(int(port.ContainerPort))))
 			}
 		}
 	}
 
 	return hostPorts
+}
+
+func getContainerStatusesInPod(pod *kubernetes.Pod) []kubernetes.PodContainerStatus {
+	if pod == nil {
+		return nil
+	}
+	var statuses []kubernetes.PodContainerStatus
+	statuses = append(statuses, pod.Status.ContainerStatuses...)
+	statuses = append(statuses, pod.Status.InitContainerStatuses...)
+	statuses = append(statuses, pod.Status.EphemeralContainerStatuses...)
+	return statuses
 }

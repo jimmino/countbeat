@@ -1,0 +1,198 @@
+// Copyright 2020 The Gitea Authors. All rights reserved.
+// Use of this source code is governed by a MIT-style
+// license that can be found in the LICENSE file.
+
+package gitea
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+
+	version "github.com/hashicorp/go-version"
+)
+
+func (c *Client) getServerVersionResponse(ctx context.Context) ([]byte, *Response, error) {
+	c.mutex.RLock()
+	debug := c.debug
+	if debug {
+		fmt.Printf("GET: %s\nBody: <nil>\n", c.url+"/api/v1/version")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url+"/api/v1/version", nil)
+	if err != nil {
+		c.mutex.RUnlock()
+		return nil, nil, err
+	}
+	client, _ := c.applyRequestAuth(req)
+	c.mutex.RUnlock()
+
+	responseRaw, err := client.Do(req)
+	if err != nil {
+		return nil, nil, err
+	}
+	if debug {
+		fmt.Printf("Response: %v\n\n", responseRaw)
+	}
+	response := newResponse(responseRaw)
+	defer func() {
+		if closeErr := response.Body.Close(); closeErr != nil && err == nil {
+			err = closeErr
+		}
+	}()
+
+	data, err := statusCodeToErr(response)
+	if err != nil {
+		return data, response, err
+	}
+
+	data, err = io.ReadAll(response.Body)
+	if err != nil {
+		return nil, response, err
+	}
+	return data, response, nil
+}
+
+func (c *Client) getServerVersionForBootstrap(ctx context.Context) (string, *Response, error) {
+	v := struct {
+		Version string `json:"version"`
+	}{}
+	data, resp, err := c.getServerVersionResponse(ctx)
+	if err != nil {
+		return "", resp, err
+	}
+	if err := json.Unmarshal(data, &v); err != nil {
+		return "", resp, err
+	}
+	return v.Version, resp, nil
+}
+
+// ServerVersion returns the version of the server.
+func (c *MetaService) ServerVersion(ctx context.Context) (string, *Response, error) {
+	v := struct {
+		Version string `json:"version"`
+	}{}
+	resp, err := c.getParsedResponse(ctx, "GET", "/version", nil, nil, &v)
+	return v.Version, resp, err
+}
+
+// CheckServerVersionConstraint validates that the login's server satisfies a
+// given version constraint such as ">= 1.11.0+dev"
+func (c *Client) CheckServerVersionConstraint(ctx context.Context, constraint string) error {
+	if err := c.loadServerVersion(ctx); err != nil {
+		return err
+	}
+
+	check, err := version.NewConstraint(constraint)
+	if err != nil {
+		return err
+	}
+	if !check.Check(c.serverVersion) {
+		c.mutex.RLock()
+		url := c.url
+		c.mutex.RUnlock()
+		return fmt.Errorf("gitea server at %s does not satisfy version constraint %s", url, constraint)
+	}
+	return nil
+}
+
+// SetGiteaVersion configures the Client to assume the given version of the
+// Gitea server, instead of querying the server for it when initializing.
+// Use "" to skip all canonical ways in the SDK to check for versions
+func SetGiteaVersion(v string) ClientOption {
+	if v == "" {
+		return func(c *Client) error {
+			c.ignoreVersion = true
+			return nil
+		}
+	}
+	return func(c *Client) (err error) {
+		c.getVersionOnce.Do(func() {
+			c.serverVersion, err = version.NewVersion(v)
+		})
+		return err
+	}
+}
+
+// predefined versions only have to be parsed by library once
+var (
+	version1_11_0 = version.Must(version.NewVersion("1.11.0"))
+	version1_11_5 = version.Must(version.NewVersion("1.11.5"))
+	version1_12_0 = version.Must(version.NewVersion("1.12.0"))
+	version1_12_3 = version.Must(version.NewVersion("1.12.3"))
+	version1_13_0 = version.Must(version.NewVersion("1.13.0"))
+	version1_14_0 = version.Must(version.NewVersion("1.14.0"))
+	version1_15_0 = version.Must(version.NewVersion("1.15.0"))
+	version1_16_0 = version.Must(version.NewVersion("1.16.0"))
+	version1_17_0 = version.Must(version.NewVersion("1.17.0"))
+	version1_18_0 = version.Must(version.NewVersion("1.18.0"))
+	version1_21_0 = version.Must(version.NewVersion("1.21.0"))
+	version1_22_0 = version.Must(version.NewVersion("1.22.0"))
+	version1_23_0 = version.Must(version.NewVersion("1.23.0"))
+	version1_24_0 = version.Must(version.NewVersion("1.24.0"))
+	version1_25_0 = version.Must(version.NewVersion("1.25.0"))
+	version1_26_0 = version.Must(version.NewVersion("1.26.0"))
+)
+
+// ErrUnknownVersion is an unknown version from the API
+type ErrUnknownVersion struct {
+	raw string
+}
+
+// Error fulfills error
+func (e *ErrUnknownVersion) Error() string {
+	return fmt.Sprintf("unknown version: %s", e.raw)
+}
+
+func (*ErrUnknownVersion) Is(target error) bool {
+	_, ok := target.(*ErrUnknownVersion)
+	return ok
+}
+
+// checkServerVersionGreaterThanOrEqual is the canonical way in the SDK to check for versions for API compatibility reasons
+func (c *Client) checkServerVersionGreaterThanOrEqual(ctx context.Context, v *version.Version) error {
+	if c.ignoreVersion {
+		return nil
+	}
+	if err := c.loadServerVersion(ctx); err != nil {
+		return err
+	}
+
+	if !c.serverVersion.GreaterThanOrEqual(v) {
+		c.mutex.RLock()
+		url := c.url
+		c.mutex.RUnlock()
+		return fmt.Errorf("gitea server at %s is older than %s", url, v.Original())
+	}
+	return nil
+}
+
+// loadServerVersion init the serverVersion variable
+func (c *Client) loadServerVersion(ctx context.Context) (err error) {
+	c.mutex.RLock()
+	serverVersionLoaded := c.serverVersion != nil
+	c.mutex.RUnlock()
+	if serverVersionLoaded {
+		return nil
+	}
+
+	c.getVersionOnce.Do(func() {
+		c.initServices()
+		raw, _, err2 := c.getServerVersionForBootstrap(ctx)
+		if err2 != nil {
+			err = err2
+			return
+		}
+		if c.serverVersion, err = version.NewVersion(raw); err != nil {
+			if strings.TrimSpace(raw) != "" {
+				// Version was something, just not recognized
+				c.serverVersion = version1_11_0
+				err = &ErrUnknownVersion{raw: raw}
+			}
+			return
+		}
+	})
+	return err
+}

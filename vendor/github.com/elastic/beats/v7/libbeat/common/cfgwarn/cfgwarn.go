@@ -19,27 +19,30 @@ package cfgwarn
 
 import (
 	"fmt"
-
-	"go.uber.org/zap"
-
-	"github.com/elastic/beats/v7/libbeat/logp"
 )
 
-const selector = "cfgwarn"
-
-// Beta logs the usage of an beta feature.
-func Beta(format string, v ...interface{}) {
-	logp.NewLogger(selector, zap.AddCallerSkip(1)).Warnf("BETA: "+format, v...)
+// Beta returns a string suitable to log beta feature.
+func Beta(format string, v ...any) string {
+	return fmt.Sprintf("BETA: "+format, v...)
 }
 
-// Deprecate logs a deprecation message.
-// The version string contains the version when the future will be removed
-func Deprecate(version string, format string, v ...interface{}) {
-	postfix := fmt.Sprintf(" Will be removed in version: %s", version)
-	logp.NewLogger(selector, zap.AddCallerSkip(1)).Warnf("DEPRECATED: "+format+postfix, v...)
+// Deprecate returns a deprecation message.
+// The version string contains the version when the future will be removed.
+// If version is empty, the message  will not mention the removal of the feature.
+func Deprecate(version string, format string, v ...any) string {
+	var postfix string
+	if version != "" {
+		postfix = fmt.Sprintf(" Will be removed in version: %s", version)
+	}
+	return fmt.Sprintf("DEPRECATED: "+format+postfix, v...)
 }
 
-// Experimental logs the usage of an experimental feature.
-func Experimental(format string, v ...interface{}) {
-	logp.NewLogger(selector, zap.AddCallerSkip(1)).Warnf("EXPERIMENTAL: "+format, v...)
+// Experimental returns a "usage of an experimental feature" message.
+func Experimental(format string, v ...any) string {
+	return fmt.Sprintf("EXPERIMENTAL: "+format, v...)
+}
+
+// Preview returns a "usage of a preview feature" message.
+func Preview(format string, v ...any) string {
+	return fmt.Sprintf("PREVIEW: "+format, v...)
 }

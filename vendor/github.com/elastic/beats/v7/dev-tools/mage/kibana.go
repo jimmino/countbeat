@@ -18,11 +18,11 @@
 package mage
 
 import (
+	"errors"
+	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
-
-	"github.com/magefile/mage/sh"
-	"github.com/pkg/errors"
 )
 
 const kibanaBuildDir = "build/kibana"
@@ -42,7 +42,7 @@ func KibanaDashboards(moduleDirs ...string) error {
 	// X-Pack Beats only add dashboards with modules (this will require a
 	// change if we have X-Pack only Beats).
 	cp := &CopyTask{Source: OSSBeatDir("_meta/kibana"), Dest: kibanaBuildDir}
-	if err := cp.Execute(); err != nil && !os.IsNotExist(errors.Cause(err)) {
+	if err := cp.Execute(); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}
 
@@ -59,19 +59,6 @@ func KibanaDashboards(moduleDirs ...string) error {
 				return err
 			}
 		}
-	}
-
-	esBeatsDir, err := ElasticBeatsDir()
-	if err != nil {
-		return err
-	}
-
-	// Convert 7.x dashboards to strings.
-	err = sh.Run(pythonExe,
-		filepath.Join(esBeatsDir, "libbeat/scripts/unpack_dashboards.py"),
-		"--glob="+filepath.Join(kibanaBuildDir, "7/dashboard/*.json"))
-	if err != nil {
-		return err
 	}
 
 	return nil
@@ -93,10 +80,8 @@ func PackageKibanaDashboardsFromBuildDir() {
 				pkgArgs.Spec.ReplaceFile("kibana", kibanaDashboards)
 			case Deb, RPM:
 				pkgArgs.Spec.ReplaceFile("/usr/share/{{.BeatName}}/kibana", kibanaDashboards)
-			case DMG:
-				pkgArgs.Spec.ReplaceFile("/Library/Application Support/{{.BeatVendor}}/{{.BeatName}}/kibana", kibanaDashboards)
 			default:
-				panic(errors.Errorf("unhandled package type: %v", pkgType))
+				panic(fmt.Errorf("unhandled package type: %v", pkgType))
 			}
 			break
 		}

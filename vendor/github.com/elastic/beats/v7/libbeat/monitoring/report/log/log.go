@@ -18,14 +18,17 @@
 package log
 
 import (
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/elastic/beats/v7/libbeat/beat"
-	"github.com/elastic/beats/v7/libbeat/common"
-	"github.com/elastic/beats/v7/libbeat/logp"
-	"github.com/elastic/beats/v7/libbeat/monitoring"
+	"github.com/elastic/beats/v7/libbeat/beatmonitoring"
 	"github.com/elastic/beats/v7/libbeat/monitoring/report"
+	conf "github.com/elastic/elastic-agent-libs/config"
+	"github.com/elastic/elastic-agent-libs/logp"
+	"github.com/elastic/elastic-agent-libs/mapstr"
+	"github.com/elastic/elastic-agent-libs/monitoring"
 )
 
 // List of metrics that are gauges. This is used to identify metrics that should
@@ -35,96 +38,133 @@ import (
 // TODO: Replace this with a proper solution that uses the metric type from
 // where it is defined. See: https://github.com/elastic/beats/issues/5433
 var gauges = map[string]bool{
-	"libbeat.pipeline.events.active": true,
-	"libbeat.pipeline.clients":       true,
-	"libbeat.config.module.running":  true,
-	"registrar.states.current":       true,
-	"filebeat.harvester.running":     true,
-	"filebeat.harvester.open_files":  true,
-	"beat.memstats.memory_total":     true,
-	"beat.memstats.memory_alloc":     true,
-	"beat.memstats.gc_next":          true,
-	"beat.info.uptime.ms":            true,
-	"beat.cpu.user.ticks":            true,
-	"beat.cpu.user.time":             true,
-	"beat.cpu.system.ticks":          true,
-	"beat.cpu.system.time":           true,
-	"beat.cpu.total.value":           true,
-	"beat.cpu.total.ticks":           true,
-	"beat.cpu.total.time":            true,
-	"beat.handles.open":              true,
-	"beat.handles.limit.hard":        true,
-	"beat.handles.limit.soft":        true,
-	"beat.runtime.goroutines":        true,
-	"system.load.1":                  true,
-	"system.load.5":                  true,
-	"system.load.15":                 true,
-	"system.load.norm.1":             true,
-	"system.load.norm.5":             true,
-	"system.load.norm.15":            true,
+	"libbeat.output.events.active":         true,
+	"libbeat.pipeline.events.active":       true,
+	"libbeat.pipeline.clients":             true,
+	"libbeat.pipeline.queue.max_events":    true,
+	"libbeat.pipeline.queue.max_bytes":     true,
+	"libbeat.pipeline.queue.filled.events": true,
+	"libbeat.pipeline.queue.filled.bytes":  true,
+	"libbeat.pipeline.queue.filled.pct":    true,
+	"libbeat.config.module.running":        true,
+	"registrar.states.current":             true,
+	"filebeat.events.active":               true,
+	"filebeat.harvester.running":           true,
+	"filebeat.harvester.open_files":        true,
+	"beat.memstats.memory_total":           true,
+	"beat.memstats.memory_alloc":           true,
+	"beat.memstats.rss":                    true,
+	"beat.memstats.gc_next":                true,
+	"beat.info.uptime.ms":                  true,
+	"beat.cgroup.memory.mem.usage.bytes":   true,
+	"beat.cpu.user.ticks":                  true,
+	"beat.cpu.system.ticks":                true,
+	"beat.cpu.total.value":                 true,
+	"beat.cpu.total.ticks":                 true,
+	"beat.handles.open":                    true,
+	"beat.handles.limit.hard":              true,
+	"beat.handles.limit.soft":              true,
+	"beat.runtime.goroutines":              true,
+	"system.load.1":                        true,
+	"system.load.5":                        true,
+	"system.load.15":                       true,
+	"system.load.norm.1":                   true,
+	"system.load.norm.5":                   true,
+	"system.load.norm.15":                  true,
+
+	"filebeat.filestream.files_matched":          true,
+	"filebeat.filestream.files_unique":           true,
+	"filebeat.filestream.files_no_ingest_target": true,
+	"filebeat.filestream.files_ignored":          true,
+	"filebeat.filestream.files_empty":            true,
+}
+
+// IsGauge returns true when the given metric key name represents a gauge value.
+// Any metric name suffixed in '_gauge' or containing '.histogram.' is
+// treated as a gauge. Other metrics can specifically be marked as gauges
+// through the list maintained in this package.
+func IsGauge(key string) bool {
+	if strings.HasSuffix(key, "_gauge") || strings.Contains(key, ".histogram.") {
+		return true
+	}
+	_, found := gauges[key]
+	return found
 }
 
 // TODO: Change this when gauges are refactored, too.
 var strConsts = map[string]bool{
 	"beat.info.ephemeral_id": true,
+	"beat.info.version":      true,
 }
 
-var (
-	// StartTime is the time that the process was started.
-	StartTime = time.Now()
-)
-
-type reporter struct {
-	wg       sync.WaitGroup
-	done     chan struct{}
-	period   time.Duration
-	registry *monitoring.Registry
+type Reporter struct {
+	config
+	wg         sync.WaitGroup
+	done       chan struct{}
+	registries map[string]*monitoring.Registry
+	startTime  time.Time
 
 	// output
 	logger *logp.Logger
 }
 
-// MakeReporter returns a new Reporter that periodically reports metrics via
-// logp. If cfg is nil defaults will be used.
-func MakeReporter(beat beat.Info, cfg *common.Config) (report.Reporter, error) {
-	config := defaultConfig
+// MakeReporter returns a new Reporter that periodically reports
+// metrics via logp. If cfg is nil defaults will be used.  If pointers
+// to monitoring registries are nil, defaults will be used.
+func MakeReporter(beat beat.Info, cfg *conf.C, mon beatmonitoring.Monitoring) (report.Reporter, error) {
+	config := defaultConfig()
 	if cfg != nil {
 		if err := cfg.Unpack(&config); err != nil {
 			return nil, err
 		}
 	}
 
-	r := &reporter{
-		done:     make(chan struct{}),
-		period:   config.Period,
-		logger:   logp.NewLogger("monitoring"),
-		registry: monitoring.Default,
+	r := &Reporter{
+		config:     config,
+		done:       make(chan struct{}),
+		logger:     beat.Logger.Named("monitoring"),
+		startTime:  time.Now(),
+		registries: map[string]*monitoring.Registry{},
 	}
 
-	r.wg.Add(1)
-	go func() {
-		defer r.wg.Done()
+	// That 'stats' namespace is reported as 'metrics' in the Elasticsearch
+	// reporter so use the same name for consistency.
+	r.registries["metrics"] = mon.StatsRegistry()
+	r.registries["info"] = mon.InfoRegistry()
+	r.registries["state"] = mon.StateRegistry()
+	r.registries["dataset"] = mon.InputsRegistry()
+
+	r.wg.Go(func() {
 		r.snapshotLoop()
-	}()
+	})
 	return r, nil
 }
 
-func (r *reporter) Stop() {
+func (r *Reporter) Stop() {
 	close(r.done)
 	r.wg.Wait()
 }
 
-func (r *reporter) snapshotLoop() {
-	r.logger.Infof("Starting metrics logging every %v", r.period)
+func (r *Reporter) snapshotLoop() {
+	if r.Period == 0 {
+		r.logger.Infof("Skipping metrics logging")
+		return
+	}
+	r.logger.Infof("Starting metrics logging every %v", r.Period)
 	defer r.logger.Infof("Stopping metrics logging.")
 	defer func() {
-		r.logTotals(makeDeltaSnapshot(monitoring.MakeFlatSnapshot(), makeSnapshot(r.registry)))
+		snaps := map[string]monitoring.FlatSnapshot{}
+		for name, reg := range r.registries {
+			snap := makeSnapshot(reg)
+			snaps[name] = snap
+		}
+		r.logTotals(snaps)
 	}()
 
-	ticker := time.NewTicker(r.period)
+	ticker := time.NewTicker(r.Period)
 	defer ticker.Stop()
 
-	var last monitoring.FlatSnapshot
+	lastSnaps := map[string]monitoring.FlatSnapshot{}
 	for {
 		select {
 		case <-r.done:
@@ -132,31 +172,41 @@ func (r *reporter) snapshotLoop() {
 		case <-ticker.C:
 		}
 
-		cur := makeSnapshot(r.registry)
-		delta := makeDeltaSnapshot(last, cur)
-		last = cur
+		snaps := make(map[string]monitoring.FlatSnapshot, len(r.registries))
+		for name, reg := range r.registries {
+			snap := makeSnapshot(reg)
+			lastSnap := lastSnaps[name]
+			lastSnaps[name] = snap
+			delta := makeDeltaSnapshot(lastSnap, snap)
+			snaps[name] = delta
+		}
 
-		r.logSnapshot(delta)
+		r.logSnapshot(snaps)
 	}
 }
 
-func (r *reporter) logSnapshot(s monitoring.FlatSnapshot) {
-	if snapshotLen(s) > 0 {
-		r.logger.Infow("Non-zero metrics in the last "+r.period.String(), toKeyValuePairs(s)...)
+func (r *Reporter) logSnapshot(snaps map[string]monitoring.FlatSnapshot) {
+	var snapsLen int
+	for _, s := range snaps {
+		snapsLen += snapshotLen(s)
+	}
+
+	if snapsLen > 0 {
+		r.logger.Infow("Non-zero metrics in the last "+r.Period.String(), toKeyValuePairs(snaps)...)
 		return
 	}
 
-	r.logger.Infof("No non-zero metrics in the last %v", r.period)
+	r.logger.Infof("No non-zero metrics in the last %v", r.Period)
 }
 
-func (r *reporter) logTotals(s monitoring.FlatSnapshot) {
-	r.logger.Infow("Total non-zero metrics", toKeyValuePairs(s)...)
-	r.logger.Infof("Uptime: %v", time.Since(StartTime))
+func (r *Reporter) logTotals(snaps map[string]monitoring.FlatSnapshot) {
+	r.logger.Infow("Total metrics", toKeyValuePairs(snaps)...)
+	r.logger.Infof("Uptime: %v", time.Since(r.startTime))
 }
 
 func makeSnapshot(R *monitoring.Registry) monitoring.FlatSnapshot {
 	mode := monitoring.Full
-	return monitoring.CollectFlatSnapshot(R, mode, true)
+	return monitoring.CollectFlatSnapshot(R, mode, false)
 }
 
 func makeDeltaSnapshot(prev, cur monitoring.FlatSnapshot) monitoring.FlatSnapshot {
@@ -177,7 +227,7 @@ func makeDeltaSnapshot(prev, cur monitoring.FlatSnapshot) monitoring.FlatSnapsho
 	}
 
 	for k, i := range cur.Ints {
-		if _, found := gauges[k]; found {
+		if IsGauge(k) {
 			delta.Ints[k] = i
 		} else {
 			if p := prev.Ints[k]; p != i {
@@ -187,7 +237,7 @@ func makeDeltaSnapshot(prev, cur monitoring.FlatSnapshot) monitoring.FlatSnapsho
 	}
 
 	for k, f := range cur.Floats {
-		if _, found := gauges[k]; found {
+		if IsGauge(k) {
 			delta.Floats[k] = f
 		} else if p := prev.Floats[k]; p != f {
 			delta.Floats[k] = f - p
@@ -201,20 +251,27 @@ func snapshotLen(s monitoring.FlatSnapshot) int {
 	return len(s.Bools) + len(s.Floats) + len(s.Ints) + len(s.Strings)
 }
 
-func toKeyValuePairs(s monitoring.FlatSnapshot) []interface{} {
-	data := make(common.MapStr, snapshotLen(s))
-	for k, v := range s.Bools {
-		data.Put(k, v)
-	}
-	for k, v := range s.Floats {
-		data.Put(k, v)
-	}
-	for k, v := range s.Ints {
-		data.Put(k, v)
-	}
-	for k, v := range s.Strings {
-		data.Put(k, v)
+func toKeyValuePairs(snaps map[string]monitoring.FlatSnapshot) []any {
+	args := []any{logp.Namespace("monitoring")}
+
+	for name, snap := range snaps {
+		data := make(mapstr.M, snapshotLen(snap))
+		for k, v := range snap.Bools {
+			data.Put(k, v)
+		}
+		for k, v := range snap.Floats {
+			data.Put(k, v)
+		}
+		for k, v := range snap.Ints {
+			data.Put(k, v)
+		}
+		for k, v := range snap.Strings {
+			data.Put(k, v)
+		}
+		if len(data) > 0 {
+			args = append(args, logp.Reflect(name, data))
+		}
 	}
 
-	return []interface{}{logp.Namespace("monitoring"), logp.Reflect("metrics", data)}
+	return args
 }

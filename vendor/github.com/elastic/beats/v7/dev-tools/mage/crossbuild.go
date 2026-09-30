@@ -18,39 +18,66 @@
 package mage
 
 import (
+	"errors"
 	"fmt"
 	"go/build"
 	"log"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/magefile/mage/mg"
 	"github.com/magefile/mage/sh"
-	"github.com/pkg/errors"
 
 	"github.com/elastic/beats/v7/dev-tools/mage/gotool"
-	"github.com/elastic/beats/v7/libbeat/common/file"
+	"github.com/elastic/elastic-agent-libs/file"
 )
 
 const defaultCrossBuildTarget = "golangCrossBuild"
+
+type dockerVolumeMount struct {
+	hostPath      string
+	containerPath string
+	readOnly      bool
+}
 
 // Platforms contains the set of target platforms for cross-builds. It can be
 // modified at runtime by setting the PLATFORMS environment variable.
 // See NewPlatformList for details about platform filtering expressions.
 var Platforms = BuildPlatforms.Defaults()
 
+// ParsePackageTypes parses a comma-separated list of package types. Invalid
+// values are ignored.
+func ParsePackageTypes(packageTypes string) []PackageType {
+	var parsed []PackageType
+	for packageType := range strings.SplitSeq(packageTypes, ",") {
+		packageType = strings.TrimSpace(packageType)
+		if packageType == "" {
+			continue
+		}
+
+		var p PackageType
+		if err := p.UnmarshalText([]byte(packageType)); err != nil {
+			continue
+		}
+		parsed = append(parsed, p)
+	}
+	return parsed
+}
+
 func init() {
 	// Allow overriding via PLATFORMS.
 	if expression := os.Getenv("PLATFORMS"); len(expression) > 0 {
 		Platforms = NewPlatformList(expression)
 	}
+
 }
 
-// CrossBuildOption defines a option to the CrossBuild target.
+// CrossBuildOption defines an option to the CrossBuild target.
 type CrossBuildOption func(params *crossBuildParams)
 
 // ImageSelectorFunc returns the name of the builder image.
@@ -60,6 +87,13 @@ type ImageSelectorFunc func(platform string) (string, error)
 func ForPlatforms(expr string) func(params *crossBuildParams) {
 	return func(params *crossBuildParams) {
 		params.Platforms = params.Platforms.Filter(expr)
+	}
+}
+
+// WithPlatforms sets the exact platforms list to use for cross-building.
+func WithPlatforms(platforms BuildPlatformList) func(params *crossBuildParams) {
+	return func(params *crossBuildParams) {
+		params.Platforms = append(BuildPlatformList(nil), platforms...)
 	}
 }
 
@@ -114,14 +148,14 @@ type crossBuildParams struct {
 
 // CrossBuild executes a given build target once for each target platform.
 func CrossBuild(options ...CrossBuildOption) error {
-	params := crossBuildParams{Platforms: Platforms, Target: defaultCrossBuildTarget, ImageSelector: crossBuildImage}
-	for _, opt := range options {
-		opt(&params)
+	if FIPSBuild && !slices.Contains(FIPSConfig.Beats, BeatName) {
+		log.Printf("Skipping cross-build for beat %q because it's not included in the FIPS-enabled beat list %v", BeatName, FIPSConfig.Beats)
+		return nil
 	}
 
-	// Docker is required for this target.
-	if err := HaveDocker(); err != nil {
-		return err
+	params := crossBuildParams{Platforms: Platforms, Target: defaultCrossBuildTarget, ImageSelector: CrossBuildImage}
+	for _, opt := range options {
+		opt(&params)
 	}
 
 	if len(params.Platforms) == 0 {
@@ -129,26 +163,66 @@ func CrossBuild(options ...CrossBuildOption) error {
 		return nil
 	}
 
+	// AIX can't really be crossbuilt, due to cgo and various compiler shortcomings.
+	// If we have a singular AIX platform set, revert to a native build toolchain
+	if runtime.GOOS == "aix" {
+		for _, platform := range params.Platforms {
+			if platform.GOOS() == "aix" {
+				if len(params.Platforms) != 1 {
+					return errors.New("AIX cannot be crossbuilt with other platforms. Set PLATFORMS='aix/ppc64'")
+				} else {
+					// This is basically a short-out so we can attempt to build on AIX in a relatively generic way
+					log.Printf("Target is building for AIX, skipping normal crossbuild process")
+					args := DefaultBuildArgs()
+					args.OutputDir = filepath.Join("build", "golang-crossbuild")
+					args.Name += "-" + Platform.GOOS + "-" + Platform.Arch
+					return Build(args)
+				}
+			}
+		}
+		// If we're here, something isn't set.
+		return errors.New("cannot crossbuild on AIX, either run `mage build` or set PLATFORMS='aix/ppc64'")
+	}
+
+	// Docker is required for this target.
+	if err := HaveDocker(); err != nil {
+		return err
+	}
+
 	if CrossBuildMountModcache {
 		// Make sure the module dependencies are downloaded on the host,
 		// as they will be mounted into the container read-only.
 		mg.Deps(func() error { return gotool.Mod.Download() })
+		if FIPSBuild {
+			// GOFIPS140=v1.0.0 unpacks golang.org/fips140 from GOROOT/lib/fips140
+			// into the module cache on first use. Pre-populate it on the host (as
+			// the host user) before the container mounts the cache read-only.
+			// Any go command triggers fips140.Init(), so list -m is sufficient.
+			mg.Deps(func() error {
+				return sh.RunWith(FIPSConfig.Compile.Env, "go", "list", "-m")
+			})
+		}
 	}
 
-	// Build the magefile for Linux so we can run it inside the container.
+	// Build the magefile for Linux, so we can run it inside the container.
 	mg.Deps(buildMage)
 
 	log.Println("crossBuild: Platform list =", params.Platforms)
-	var deps []interface{}
+	var deps []any
 	for _, buildPlatform := range params.Platforms {
 		if !buildPlatform.Flags.CanCrossBuild() {
 			return fmt.Errorf("unsupported cross build platform %v", buildPlatform.Name)
 		}
+		if FIPSBuild && !slices.Contains(FIPSConfig.Compile.Platforms, buildPlatform.Name) {
+			fmt.Printf("Skipping crossbuild of %q for platform %q since it's not listed in FIPS supported platforms %v\n",
+				BeatName, buildPlatform.Name, FIPSConfig.Compile.Platforms)
+			continue
+		}
 		builder := GolangCrossBuilder{buildPlatform.Name, params.Target, params.InDir, params.ImageSelector}
 		if params.Serial {
 			if err := builder.Build(); err != nil {
-				return errors.Wrapf(err, "failed cross-building target=%v for platform=%v %v", params.ImageSelector,
-					params.Target, buildPlatform.Name)
+				return fmt.Errorf("failed cross-building target=%s for platform=%s: %w",
+					params.Target, buildPlatform.Name, err)
 			}
 		} else {
 			deps = append(deps, builder.Build)
@@ -157,6 +231,7 @@ func CrossBuild(options ...CrossBuildOption) error {
 
 	// Each build runs in parallel.
 	Parallel(deps...)
+
 	return nil
 }
 
@@ -169,32 +244,43 @@ func CrossBuildXPack(options ...CrossBuildOption) error {
 	return CrossBuild(o...)
 }
 
-// buildMage pre-compiles the magefile to a binary using the native GOOS/GOARCH
-// values for Docker. It has the benefit of speeding up the build because the
+// buildMage pre-compiles the magefile to a binary using the GOARCH parameter.
+// It has the benefit of speeding up the build because the
 // mage -compile is done only once rather than in each Docker container.
 func buildMage() error {
-	return sh.Run("mage", "-f", "-goos=linux", "-goarch=amd64",
-		"-compile", CreateDir(filepath.Join("build", "mage-linux-amd64")))
+	arch := runtime.GOARCH
+	return sh.RunWith(map[string]string{"CGO_ENABLED": "0"}, "mage", "-f", "-goos=linux", "-goarch="+arch,
+		"-compile", CreateDir(filepath.Join("build", "mage-linux-"+arch)))
 }
 
-func crossBuildImage(platform string) (string, error) {
+func CrossBuildImage(platform string) (string, error) {
 	tagSuffix := "main"
 
 	switch {
-	case strings.HasPrefix(platform, "darwin"):
-		tagSuffix = "darwin"
-	case strings.HasPrefix(platform, "linux/arm"):
-		tagSuffix = "arm"
+	case platform == "darwin/amd64":
+		tagSuffix = "darwin-debian11"
+	case platform == "darwin/arm64":
+		tagSuffix = "darwin-arm64-debian11"
+	case platform == "darwin/universal":
+		tagSuffix = "darwin-arm64-debian11"
+	case platform == "linux/arm64":
+		tagSuffix = "base-arm-debian11"
+	case platform == "linux/armv5":
+		tagSuffix = "armel"
+	case platform == "linux/armv6":
+		tagSuffix = "armel"
+	case platform == "linux/armv7":
+		tagSuffix = "armhf"
 	case strings.HasPrefix(platform, "linux/mips"):
-		tagSuffix = "mips"
+		tagSuffix = "mips-debian11"
 	case strings.HasPrefix(platform, "linux/ppc"):
-		tagSuffix = "ppc"
+		tagSuffix = "ppc-debian11"
 	case platform == "linux/s390x":
-		tagSuffix = "s390x"
+		tagSuffix = "s390x-debian12"
 	case strings.HasPrefix(platform, "linux"):
-		// Use an older version of libc to gain greater OS compatibility.
-		// Debian 7 uses glibc 2.13.
-		tagSuffix = "main-debian7"
+		tagSuffix = "main-debian11"
+	case platform == "windows/arm64":
+		tagSuffix = "windows-arm64-debian12"
 	}
 
 	goVersion, err := GoVersion()
@@ -220,7 +306,7 @@ func (b GolangCrossBuilder) Build() error {
 
 	repoInfo, err := GetProjectRepoInfo()
 	if err != nil {
-		return errors.Wrap(err, "failed to determine repo root and package sub dir")
+		return fmt.Errorf("failed to determine repo root and package sub dir: %w", err)
 	}
 
 	mountPoint := filepath.ToSlash(filepath.Join("/go", "src", repoInfo.CanonicalRootImportPath))
@@ -231,21 +317,31 @@ func (b GolangCrossBuilder) Build() error {
 	}
 	workDir := filepath.ToSlash(filepath.Join(mountPoint, cwd))
 
-	buildCmd, err := filepath.Rel(workDir, filepath.Join(mountPoint, repoInfo.SubDir, "build/mage-linux-amd64"))
+	builderArch := runtime.GOARCH
+	buildCmd, err := filepath.Rel(workDir, filepath.Join(mountPoint, repoInfo.SubDir, "build/mage-linux-"+builderArch))
 	if err != nil {
-		return errors.Wrap(err, "failed to determine mage-linux-amd64 relative path")
+		return fmt.Errorf("failed to determine mage-linux-"+builderArch+" relative path: %w", err)
 	}
 
 	dockerRun := sh.RunCmd("docker", "run")
 	image, err := b.ImageSelector(b.Platform)
 	if err != nil {
-		return errors.Wrap(err, "failed to determine golang-crossbuild image tag")
+		return fmt.Errorf("failed to determine golang-crossbuild image tag: %w", err)
 	}
 	verbose := ""
 	if mg.Verbose() {
 		verbose = "true"
 	}
 	var args []string
+	// There's a bug on certain debian versions:
+	// https://discuss.linuxcontainers.org/t/debian-jessie-containers-have-extremely-low-performance/1272
+	// basically, apt-get has a bug where will try to iterate through every possible FD as set by the NOFILE ulimit.
+	// On certain docker installs, docker will set the ulimit to a value > 10^9, which means apt-get will take >1 hour.
+	// This runs across all possible debian platforms, since there's no real harm in it.
+	if strings.Contains(image, "debian") {
+		args = append(args, "--ulimit", "nofile=262144:262144")
+	}
+
 	if runtime.GOOS != "windows" {
 		args = append(args,
 			"--env", "EXEC_UID="+strconv.Itoa(os.Getuid()),
@@ -255,28 +351,204 @@ func (b GolangCrossBuilder) Build() error {
 	if versionQualified {
 		args = append(args, "--env", "VERSION_QUALIFIER="+versionQualifier)
 	}
-	if UseVendor {
-		args = append(args, "--env", "GOFLAGS=-mod=vendor")
-	}
 	if CrossBuildMountModcache {
 		// Mount $GOPATH/pkg/mod into the container, read-only.
 		hostDir := filepath.Join(build.Default.GOPATH, "pkg", "mod")
 		args = append(args, "-v", hostDir+":/go/pkg/mod:ro")
 	}
 
+	if b.Platform == "darwin/amd64" {
+		fmt.Printf(">> %v: Forcing DEV=0 for %s: https://github.com/elastic/golang-crossbuild/issues/217\n", b.Target, b.Platform)
+		args = append(args, "--env", "DEV=0")
+	} else {
+		args = append(args, "--env", fmt.Sprintf("DEV=%v", DevBuild))
+	}
+
 	args = append(args,
 		"--rm",
+		"--env", "GOFLAGS=-mod=readonly",
 		"--env", "MAGEFILE_VERBOSE="+verbose,
 		"--env", "MAGEFILE_TIMEOUT="+EnvOr("MAGEFILE_TIMEOUT", ""),
 		"--env", fmt.Sprintf("SNAPSHOT=%v", Snapshot),
+		"--env", fmt.Sprintf("FIPS=%v", FIPSBuild),
 		"-v", repoInfo.RootDir+":"+mountPoint,
 		"-w", workDir,
+	)
+
+	// When building from a git worktree the .git entry in the repo root is
+	// a file (not a directory) that contains an absolute path to the real
+	// git metadata on the host.  Mount both the worktree-specific git dir
+	// and the shared common git dir at their original host paths so that
+	// git can follow the reference chain inside the container.
+	gitVolumes, err := gitWorktreeVolumes(repoInfo.RootDir)
+	if err != nil {
+		return fmt.Errorf("failed to determine git worktree volumes: %w", err)
+	}
+	args = append(args, gitVolumes...)
+
+	// Buildkite reference clones keep some objects in host-side alternates.
+	// Go's VCS stamping runs inside Docker, so those object dirs must be visible.
+	gitMounts, err := gitDockerVolumeMounts(repoInfo.RootDir, mountPoint)
+	if err != nil {
+		return err
+	}
+	for _, mount := range gitMounts {
+		args = append(args, "-v", mount.dockerArg())
+	}
+
+	args = append(args,
 		image,
+
+		// Arguments for docker crossbuild entrypoint. For details see
+		// https://github.com/elastic/golang-crossbuild/blob/main/go1.17/base/rootfs/entrypoint.go.
 		"--build-cmd", buildCmd+" "+b.Target,
-		"-p", b.Platform,
+		"--platforms", b.Platform,
 	)
 
 	return dockerRun(args...)
+}
+
+// gitWorktreeVolumes returns Docker volume flags (-v) needed to make git work
+// inside a container when the host repo is a git worktree.  In a worktree the
+// .git entry is a file pointing to the real git metadata elsewhere on the host.
+// We mount both the worktree-specific git dir and the shared common git dir at
+// their original absolute paths so the reference chain is preserved.
+//
+// Returns nil (no extra volumes) when the repo is not a worktree.
+func gitWorktreeVolumes(repoRoot string) ([]string, error) {
+	dotGit := filepath.Join(repoRoot, ".git")
+	info, err := os.Lstat(dotGit)
+	if err != nil {
+		return nil, err
+	}
+	if info.IsDir() {
+		// Regular repository, no extra mounts needed.
+		return nil, nil
+	}
+
+	// .git is a file -> we are in a worktree.
+	gitDir, err := sh.Output("git", "rev-parse", "--git-dir")
+	if err != nil {
+		return nil, fmt.Errorf("failed to determine git dir: %w", err)
+	}
+	gitCommonDir, err := sh.Output("git", "rev-parse", "--git-common-dir")
+	if err != nil {
+		return nil, fmt.Errorf("failed to determine git common dir: %w", err)
+	}
+
+	// Resolve to absolute paths so the mounts are unambiguous.
+	gitDir, err = filepath.Abs(gitDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve git dir absolute path: %w", err)
+	}
+	gitCommonDir, err = filepath.Abs(gitCommonDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve git common dir absolute path: %w", err)
+	}
+
+	var volumes []string
+	volumes = append(volumes, "-v", gitDir+":"+gitDir+":ro")
+	if gitCommonDir != gitDir {
+		volumes = append(volumes, "-v", gitCommonDir+":"+gitCommonDir+":ro")
+	}
+	return volumes, nil
+}
+
+func (m dockerVolumeMount) dockerArg() string {
+	arg := m.hostPath + ":" + m.containerPath
+	if m.readOnly {
+		arg += ":ro"
+	}
+	return arg
+}
+
+func gitDockerVolumeMounts(repoRoot, containerRepoRoot string) ([]dockerVolumeMount, error) {
+	objectsDir, err := gitPath(repoRoot, "objects")
+	if err != nil {
+		log.Printf("crossBuild: skipping git alternate mounts: %v", err)
+		return nil, nil
+	}
+
+	alternatesPath, err := gitPath(repoRoot, "objects/info/alternates")
+	if err != nil {
+		log.Printf("crossBuild: skipping git alternate mounts: %v", err)
+		return nil, nil
+	}
+
+	alternates, err := os.ReadFile(alternatesPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to read git alternates file %q: %w", alternatesPath, err)
+	}
+
+	containerObjectsDir := containerPathForHostPath(objectsDir, repoRoot, containerRepoRoot)
+	return gitAlternateObjectDirMounts(objectsDir, containerObjectsDir, alternates), nil
+}
+
+func gitPath(repoRoot, path string) (string, error) {
+	out, err := sh.Output("git", "-C", repoRoot, "rev-parse", "--git-path", path)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve git path %q for %q: %w", path, repoRoot, err)
+	}
+
+	resolved := strings.TrimSpace(out)
+	if resolved == "" {
+		return "", fmt.Errorf("git path %q for %q resolved to an empty path", path, repoRoot)
+	}
+	if !filepath.IsAbs(resolved) {
+		resolved = filepath.Join(repoRoot, resolved)
+	}
+	return filepath.Clean(resolved), nil
+}
+
+func gitAlternateObjectDirMounts(objectsDir, containerObjectsDir string, alternates []byte) []dockerVolumeMount {
+	var mounts []dockerVolumeMount
+	seen := map[string]struct{}{}
+
+	for line := range strings.SplitSeq(string(alternates), "\n") {
+		alternate := strings.TrimSpace(line)
+		if alternate == "" || strings.HasPrefix(alternate, "#") {
+			continue
+		}
+
+		hostPath := alternate
+		containerPath := alternate
+		if !filepath.IsAbs(alternate) {
+			hostPath = filepath.Join(objectsDir, alternate)
+			containerPath = filepath.Join(containerObjectsDir, filepath.ToSlash(alternate))
+		}
+
+		hostPath = filepath.Clean(hostPath)
+		containerPath = filepath.ToSlash(filepath.Clean(containerPath))
+		if _, found := seen[containerPath]; found {
+			continue
+		}
+
+		info, err := os.Stat(hostPath)
+		if err != nil || !info.IsDir() {
+			continue
+		}
+
+		seen[containerPath] = struct{}{}
+		mounts = append(mounts, dockerVolumeMount{
+			hostPath:      hostPath,
+			containerPath: containerPath,
+			readOnly:      true,
+		})
+	}
+
+	return mounts
+}
+
+func containerPathForHostPath(hostPath, hostRepoRoot, containerRepoRoot string) string {
+	rel, err := filepath.Rel(hostRepoRoot, hostPath)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return filepath.ToSlash(filepath.Clean(hostPath))
+	}
+
+	return filepath.ToSlash(filepath.Join(containerRepoRoot, rel))
 }
 
 // DockerChown chowns files generated during build. EXEC_UID and EXEC_GID must
@@ -296,7 +568,10 @@ func DockerChown(path string) {
 // chownPaths will chown the file and all of the dirs specified in the path.
 func chownPaths(uid, gid int, path string) error {
 	start := time.Now()
-	defer log.Printf("chown took: %v", time.Now().Sub(start))
+	numFixed := 0
+	defer func() {
+		log.Printf("chown took: %v, changed %d files", time.Since(start), numFixed)
+	}()
 
 	return filepath.Walk(path, func(name string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -315,10 +590,10 @@ func chownPaths(uid, gid int, path string) error {
 			return nil
 		}
 
-		log.Printf("chown file: %v", name)
-		if err := os.Chown(name, uid, gid); err != nil {
-			return errors.Wrapf(err, "failed to chown path=%v", name)
+		if err := os.Chown(name, uid, gid); err != nil { //nolint:gosec // paths are controlled build artifacts inside a Docker container, not user input
+			return fmt.Errorf("failed to chown path=%v: %w", name, err)
 		}
+		numFixed++
 		return nil
 	})
 }

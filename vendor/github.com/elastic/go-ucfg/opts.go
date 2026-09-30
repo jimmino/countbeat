@@ -25,6 +25,10 @@ import (
 	"github.com/elastic/go-ucfg/parse"
 )
 
+// Some sane value for the index fields such as input.0.foo
+// in order to protect against cases where user specifies input.9223372036854.foo for the key
+const defaultMaxIdx = 1024
+
 // Option type implementing additional options to be passed
 // to go-ucfg library functions.
 type Option func(*options)
@@ -32,12 +36,17 @@ type Option func(*options)
 type options struct {
 	tag          string
 	validatorTag string
+	noValidate   bool
 	pathSep      string
+	escapePath   bool
 	meta         *Meta
 	env          []*Config
 	resolvers    []func(name string) (string, parse.Config, error)
 	varexp       bool
 	noParse      bool
+
+	maxIdx        int64 // Max index field value allowed
+	enableNumKeys bool  // Enables numeric keys, example "123"
 
 	configValueHandling configHandling
 	fieldHandlingTree   *fieldHandlingTree
@@ -46,7 +55,10 @@ type options struct {
 	// Unpack/Pack/Get/...
 	parsed valueCache
 
-	activeFields *fieldSet
+	activeFields     *fieldSet
+	configuredFields *fieldSet
+
+	ignoreCommas bool
 }
 
 type valueCache map[string]spliceValue
@@ -75,6 +87,12 @@ func StructTag(tag string) Option {
 	}
 }
 
+var IgnoreCommas Option = doIgnoreCommas
+
+func doIgnoreCommas(o *options) {
+	o.ignoreCommas = true
+}
+
 // ValidatorTag option sets the struct tag name used to set validators
 // on struct fields in `Unpack`.
 // The default struct tag in `validate`.
@@ -84,11 +102,25 @@ func ValidatorTag(tag string) Option {
 	}
 }
 
+// NoValidate disables validation when unpacking.
+func NoValidate() Option {
+	return func(o *options) {
+		o.noValidate = true
+	}
+}
+
 // PathSep sets the path separator used to split up names into a tree like hierarchy.
 // If PathSep is not set, field names will not be split.
 func PathSep(sep string) Option {
 	return func(o *options) {
 		o.pathSep = sep
+	}
+}
+
+// EscapePath when set allows the user to escape the path using brackets.
+func EscapePath() Option {
+	return func(o *options) {
+		o.escapePath = true
 	}
 }
 
@@ -115,6 +147,24 @@ func Env(e *Config) Option {
 func Resolve(fn func(name string) (string, parse.Config, error)) Option {
 	return func(o *options) {
 		o.resolvers = append(o.resolvers, fn)
+	}
+}
+
+// MaxIdx overwrites max index field value allowed.
+// By default it is limited to defaultMaxIdx value.
+func MaxIdx(maxIdx int64) Option {
+	return func(o *options) {
+		o.maxIdx = maxIdx
+	}
+}
+
+// EnableNumKeys enables numeric keys, such as "1234" in the configuration.
+// The numeric key values are converted to array's index otherwise by default.
+// This feature is disabled by default for backwards compatibility.
+// This is useful when it's needed to support and preserve the configuration numeric string keys.
+func EnableNumKeys(enableNumKeys bool) Option {
+	return func(o *options) {
+		o.enableNumKeys = enableNumKeys
 	}
 }
 
@@ -150,6 +200,11 @@ var (
 	// replace old dictionaries and arrays while merging. Value merging can be
 	// overwritten in unpack by using struct tags.
 	ReplaceValues = makeOptValueHandling(cfgReplaceValue)
+
+	// ReplaceArrValues option configures merging and unpacking operations to
+	// replace old arrays while merging. Value merging can be overwritten in unpack
+	// by using struct tags.
+	ReplaceArrValues = makeOptValueHandling(cfgArrReplaceValue)
 
 	// AppendValues option configures all merging and unpacking operations to
 	// merge dictionaries and append arrays to existing arrays while merging.
@@ -231,6 +286,7 @@ func makeOptions(opts []Option) *options {
 		pathSep:      "", // no separator by default
 		parsed:       map[string]spliceValue{},
 		activeFields: newFieldSet(nil),
+		maxIdx:       defaultMaxIdx,
 	}
 	for _, opt := range opts {
 		opt(&o)

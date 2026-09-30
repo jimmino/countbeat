@@ -18,20 +18,23 @@
 package dissect
 
 import (
+	"errors"
 	"fmt"
-
-	"github.com/pkg/errors"
+	"maps"
 
 	"github.com/elastic/beats/v7/libbeat/beat"
-	"github.com/elastic/beats/v7/libbeat/common"
 	"github.com/elastic/beats/v7/libbeat/processors"
-	jsprocessor "github.com/elastic/beats/v7/libbeat/processors/script/javascript/module/processor"
+	jsprocessor "github.com/elastic/beats/v7/libbeat/processors/script/javascript/module/processor/registry"
+	cfg "github.com/elastic/elastic-agent-libs/config"
+	"github.com/elastic/elastic-agent-libs/logp"
+	"github.com/elastic/elastic-agent-libs/mapstr"
 )
 
 const flagParsingError = "dissect_parsing_error"
 
 type processor struct {
-	config config
+	config     config
+	prefixKeys map[string]string // pre-computed prefix+key for each dissect field
 }
 
 func init() {
@@ -40,20 +43,45 @@ func init() {
 }
 
 // NewProcessor constructs a new dissect processor.
-func NewProcessor(c *common.Config) (processors.Processor, error) {
+func NewProcessor(c *cfg.C, log *logp.Logger) (beat.Processor, error) {
 	config := defaultConfig
 	err := c.Unpack(&config)
 	if err != nil {
 		return nil, err
 	}
+	if config.TrimValues != trimModeNone {
+		config.Tokenizer.trimmer, err = newTrimmer(config.TrimChars,
+			config.TrimValues&trimModeLeft != 0,
+			config.TrimValues&trimModeRight != 0)
+		if err != nil {
+			return nil, err
+		}
+	}
 	p := &processor{config: config}
+
+	// Pre-compute prefixed target keys so mapper() doesn't
+	// allocate a new string per field per event.
+	if config.TargetPrefix != "" {
+		prefix := config.TargetPrefix + "."
+		p.prefixKeys = make(map[string]string, len(config.Tokenizer.parser.fields))
+		for _, f := range config.Tokenizer.parser.fields {
+			p.prefixKeys[f.Key()] = prefix + f.Key()
+		}
+	}
 
 	return p, nil
 }
 
 // Run takes the event and will apply the tokenizer on the configured field.
 func (p *processor) Run(event *beat.Event) (*beat.Event, error) {
-	v, err := event.GetValue(p.config.Field)
+	var (
+		m   Map
+		mc  MapConverted
+		v   any
+		err error
+	)
+
+	v, err = event.GetValue(p.config.Field)
 	if err != nil {
 		return event, err
 	}
@@ -63,49 +91,93 @@ func (p *processor) Run(event *beat.Event) (*beat.Event, error) {
 		return event, fmt.Errorf("field is not a string, value: `%v`, field: `%s`", v, p.config.Field)
 	}
 
-	m, err := p.config.Tokenizer.Dissect(s)
+	convertDataType := false
+	for _, f := range p.config.Tokenizer.parser.fields {
+		if f.DataType() != "" {
+			convertDataType = true
+		}
+	}
+
+	if convertDataType {
+		mc, err = p.config.Tokenizer.DissectConvert(s)
+	} else {
+		m, err = p.config.Tokenizer.Dissect(s)
+	}
 	if err != nil {
-		if err := common.AddTagsWithKey(
+		if err := mapstr.AddTagsWithKey(
 			event.Fields,
 			beat.FlagField,
 			[]string{flagParsingError},
 		); err != nil {
-			return event, errors.Wrap(err, "cannot add new flag the event")
+			return event, fmt.Errorf("cannot add new flag the event: %w", err)
 		}
-
+		if p.config.IgnoreFailure {
+			return event, nil
+		}
 		return event, err
 	}
 
-	event, err = p.mapper(event, mapToMapStr(m))
-	if err != nil {
-		return event, err
+	if convertDataType {
+		event, err = p.mapper(event, mapInterfaceToMapStr(mc))
+	} else {
+		event, err = p.mapFields(event, m)
 	}
 
+	return event, err
+}
+
+// prefixedKey returns the pre-computed prefix+key string when available,
+// falling back to runtime concatenation for dynamic keys (e.g. indirect fields).
+func (p *processor) prefixedKey(k string) string {
+	if p.prefixKeys != nil {
+		if pk, ok := p.prefixKeys[k]; ok {
+			return pk
+		}
+		// Dynamic key not in the pre-computed set — fall back to concatenation.
+		return p.config.TargetPrefix + "." + k
+	}
+	return k
+}
+
+func (p *processor) mapper(event *beat.Event, m mapstr.M) (*beat.Event, error) {
+	// Check all keys before writing any so we never need a clone for rollback.
+	if !p.config.OverwriteKeys {
+		for k := range m {
+			prefixKey := p.prefixedKey(k)
+			found, err := event.HasKey(prefixKey)
+			if found {
+				return event, fmt.Errorf("cannot override existing key with `%s`", prefixKey)
+			}
+			if err != nil && !errors.Is(err, mapstr.ErrKeyNotFound) {
+				return event, fmt.Errorf("cannot override existing key with `%s`: %w", prefixKey, err)
+			}
+		}
+	}
+	for k, v := range m {
+		_, _ = event.PutValue(p.prefixedKey(k), v)
+	}
 	return event, nil
 }
 
-func (p *processor) mapper(event *beat.Event, m common.MapStr) (*beat.Event, error) {
-	copy := event.Fields.Clone()
-
-	prefix := ""
-	if p.config.TargetPrefix != "" {
-		prefix = p.config.TargetPrefix + "."
-	}
-	var prefixKey string
-	for k, v := range m {
-		prefixKey = prefix + k
-		if _, err := event.GetValue(prefixKey); err == common.ErrKeyNotFound {
-			event.PutValue(prefixKey, v)
-		} else {
-			event.Fields = copy
-			// When the target key exists but is a string instead of a map.
-			if err != nil {
-				return event, errors.Wrapf(err, "cannot override existing key with `%s`", prefixKey)
+// mapFields is a typed variant of mapper for Map (map[string]string),
+// avoiding the intermediate map[string]interface{} allocation from mapToMapStr.
+func (p *processor) mapFields(event *beat.Event, m Map) (*beat.Event, error) {
+	// Check all keys before writing any so we never need a clone for rollback.
+	if !p.config.OverwriteKeys {
+		for k := range m {
+			prefixKey := p.prefixedKey(k)
+			found, err := event.HasKey(prefixKey)
+			if found {
+				return event, fmt.Errorf("cannot override existing key with `%s`", prefixKey)
 			}
-			return event, fmt.Errorf("cannot override existing key with `%s`", prefixKey)
+			if err != nil && !errors.Is(err, mapstr.ErrKeyNotFound) {
+				return event, fmt.Errorf("cannot override existing key with `%s`: %w", prefixKey, err)
+			}
 		}
 	}
-
+	for k, v := range m {
+		_, _ = event.PutValue(p.prefixedKey(k), v)
+	}
 	return event, nil
 }
 
@@ -115,10 +187,8 @@ func (p *processor) String() string {
 		",target_prefix=" + p.config.TargetPrefix
 }
 
-func mapToMapStr(m Map) common.MapStr {
-	newMap := make(common.MapStr, len(m))
-	for k, v := range m {
-		newMap[k] = v
-	}
+func mapInterfaceToMapStr(m MapConverted) mapstr.M {
+	newMap := make(mapstr.M, len(m))
+	maps.Copy(newMap, m)
 	return newMap
 }

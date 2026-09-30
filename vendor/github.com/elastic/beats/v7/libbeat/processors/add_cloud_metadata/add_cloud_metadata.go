@@ -18,17 +18,21 @@
 package add_cloud_metadata
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"time"
 
-	"github.com/pkg/errors"
+	"go.opentelemetry.io/collector/pdata/pcommon"
 
 	"github.com/elastic/beats/v7/libbeat/beat"
-	"github.com/elastic/beats/v7/libbeat/common"
-	"github.com/elastic/beats/v7/libbeat/logp"
+	"github.com/elastic/beats/v7/libbeat/otel/otelmap"
 	"github.com/elastic/beats/v7/libbeat/processors"
-	jsprocessor "github.com/elastic/beats/v7/libbeat/processors/script/javascript/module/processor"
+	jsprocessor "github.com/elastic/beats/v7/libbeat/processors/script/javascript/module/processor/registry"
+	cfg "github.com/elastic/elastic-agent-libs/config"
+	"github.com/elastic/elastic-agent-libs/logp"
+	"github.com/elastic/elastic-agent-libs/mapstr"
+	"github.com/elastic/elastic-agent-libs/transport/tlscommon"
 )
 
 const (
@@ -43,34 +47,54 @@ func init() {
 	jsprocessor.RegisterPlugin("AddCloudMetadata", New)
 }
 
+var _ processors.PdataProcessor = (*addCloudMetadata)(nil)
+
 type addCloudMetadata struct {
-	initOnce sync.Once
-	initData *initData
-	metadata common.MapStr
-	logger   *logp.Logger
+	baseCtx       context.Context
+	baseCtxCancel context.CancelFunc
+	initOnce      sync.Once
+	initData      *initData
+	initDone      chan struct{}
+	metadata      mapstr.M
+	logger        *logp.Logger
 }
 
 type initData struct {
 	fetchers  []metadataFetcher
 	timeout   time.Duration
+	tlsConfig *tlscommon.TLSConfig
 	overwrite bool
 }
 
 // New constructs a new add_cloud_metadata processor.
-func New(c *common.Config) (processors.Processor, error) {
+func New(c *cfg.C, log *logp.Logger) (beat.Processor, error) {
 	config := defaultConfig()
 	if err := c.Unpack(&config); err != nil {
-		return nil, errors.Wrap(err, "failed to unpack add_cloud_metadata config")
+		return nil, fmt.Errorf("failed to unpack add_cloud_metadata config: %w", err)
+	}
+
+	tlsConfig, err := tlscommon.LoadTLSConfig(config.TLS, log)
+	if err != nil {
+		return nil, fmt.Errorf("TLS configuration load: %w", err)
 	}
 
 	initProviders := selectProviders(config.Providers, cloudMetaProviders)
-	fetchers, err := setupFetchers(initProviders, c)
+	fetchers, err := setupFetchers(initProviders, c, log)
 	if err != nil {
 		return nil, err
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	p := &addCloudMetadata{
-		initData: &initData{fetchers, config.Timeout, config.Overwrite},
-		logger:   logp.NewLogger("add_cloud_metadata"),
+		initData: &initData{
+			fetchers:  fetchers,
+			timeout:   config.Timeout,
+			tlsConfig: tlsConfig,
+			overwrite: config.Overwrite,
+		},
+		initDone:      make(chan struct{}),
+		logger:        log.Named("add_cloud_metadata"),
+		baseCtx:       ctx,
+		baseCtxCancel: cancel,
 	}
 
 	go p.init()
@@ -83,8 +107,9 @@ func (r result) String() string {
 }
 
 func (p *addCloudMetadata) init() {
-	p.initOnce.Do(func() {
-		result := p.fetchMetadata()
+	p.initOnce.Do(func() { // fetch metadata only once
+		defer close(p.initDone) // signal that init() completed
+		result := p.fetchMetadata(p.baseCtx)
 		if result == nil {
 			p.logger.Info("add_cloud_metadata: hosting provider type not detected.")
 			return
@@ -95,7 +120,7 @@ func (p *addCloudMetadata) init() {
 	})
 }
 
-func (p *addCloudMetadata) getMeta() common.MapStr {
+func (p *addCloudMetadata) getMeta() mapstr.M {
 	p.init()
 	return p.metadata.Clone()
 }
@@ -106,20 +131,67 @@ func (p *addCloudMetadata) Run(event *beat.Event) (*beat.Event, error) {
 		return event, nil
 	}
 
-	// If cloud key exists in event already and overwrite flag is set to false, this processor will not overwrite the
-	// cloud fields. For example aws module writes cloud.instance.* to events already, with overwrite=false,
-	// add_cloud_metadata should not overwrite these fields with new values.
-	if !p.initData.overwrite {
-		cloudValue, _ := event.GetValue("cloud")
-		if cloudValue != nil {
-			return event, nil
-		}
+	err := p.addMeta(event, meta)
+	if err != nil {
+		return nil, err
 	}
-
-	_, err := event.PutValue("cloud", meta)
 	return event, err
 }
 
 func (p *addCloudMetadata) String() string {
-	return "add_cloud_metadata=" + p.getMeta().String()
+	metadataStr := "<uninitialized>"
+	select {
+	case <-p.initDone:
+		// init() completed
+		metadataStr = p.getMeta().String()
+	default:
+	}
+	return "add_cloud_metadata=" + metadataStr
+}
+
+func (p *addCloudMetadata) Close() error {
+	p.baseCtxCancel()
+	p.initOnce.Do(func() {})
+	return nil
+}
+
+// RunPdata enriches the given pcommon.Map directly with cloud metadata,
+// avoiding the round-trip conversion to/from mapstr.M used by the standard Run path.
+// It reads p.metadata without cloning: PutAtPath copies values into pdata so
+// there is no aliasing between the cached metadata and the log record.
+func (p *addCloudMetadata) RunPdata(body pcommon.Map) (bool, error) {
+	p.init()
+	if len(p.metadata) == 0 {
+		return false, nil
+	}
+	for key, metaVal := range p.metadata {
+		if !p.initData.overwrite {
+			if _, exists := otelmap.GetAtPath(key, body); exists {
+				continue
+			}
+		}
+		if err := otelmap.PutAtPath(key, metaVal, body); err != nil {
+			return false, err
+		}
+	}
+	return false, nil
+}
+
+func (p *addCloudMetadata) addMeta(event *beat.Event, meta mapstr.M) error {
+	for key, metaVal := range meta {
+		// If key exists in event already and overwrite flag is set to false, this processor will not overwrite the
+		// meta fields. For example aws module writes cloud.instance.* to events already, with overwrite=false,
+		// add_cloud_metadata should not overwrite these fields with new values.
+		if !p.initData.overwrite {
+			v, _ := event.GetValue(key)
+			if v != nil {
+				continue
+			}
+		}
+		_, err := event.PutValue(key, metaVal)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }

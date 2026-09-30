@@ -18,16 +18,19 @@
 package fileout
 
 import (
+	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/elastic/beats/v7/libbeat/beat"
-	"github.com/elastic/beats/v7/libbeat/common"
-	"github.com/elastic/beats/v7/libbeat/common/file"
-	"github.com/elastic/beats/v7/libbeat/logp"
 	"github.com/elastic/beats/v7/libbeat/outputs"
 	"github.com/elastic/beats/v7/libbeat/outputs/codec"
 	"github.com/elastic/beats/v7/libbeat/publisher"
+	c "github.com/elastic/elastic-agent-libs/config"
+	"github.com/elastic/elastic-agent-libs/file"
+	"github.com/elastic/elastic-agent-libs/logp"
 )
 
 func init() {
@@ -48,34 +51,35 @@ func makeFileout(
 	_ outputs.IndexManager,
 	beat beat.Info,
 	observer outputs.Observer,
-	cfg *common.Config,
+	cfg *c.C,
 ) (outputs.Group, error) {
-	config := defaultConfig
-	if err := cfg.Unpack(&config); err != nil {
+	foConfig, err := readConfig(cfg)
+	if err != nil {
 		return outputs.Fail(err)
 	}
 
-	// disable bulk support in publisher pipeline
-	cfg.SetInt("bulk_max_size", -1, -1)
-
 	fo := &fileOutput{
-		log:      logp.NewLogger("file"),
+		log:      beat.Logger.Named("file"),
 		beat:     beat,
 		observer: observer,
 	}
-	if err := fo.init(beat, config); err != nil {
+	if err = fo.init(beat, *foConfig); err != nil {
 		return outputs.Fail(err)
 	}
 
-	return outputs.Success(-1, 0, fo)
+	return outputs.Success(foConfig.Queue, -1, 0, nil, beat.Logger, beat.Paths, fo)
 }
 
-func (out *fileOutput) init(beat beat.Info, c config) error {
+func (out *fileOutput) init(beat beat.Info, c fileOutConfig) error {
 	var path string
+	configPath, runErr := c.Path.Run(time.Now().UTC())
+	if runErr != nil {
+		return runErr
+	}
 	if c.Filename != "" {
-		path = filepath.Join(c.Path, c.Filename)
+		path = filepath.Join(configPath, c.Filename)
 	} else {
-		path = filepath.Join(c.Path, out.beat.Beat)
+		path = filepath.Join(configPath, out.beat.Beat)
 	}
 
 	out.filePath = path
@@ -86,7 +90,8 @@ func (out *fileOutput) init(beat beat.Info, c config) error {
 		file.MaxSizeBytes(c.RotateEveryKb*1024),
 		file.MaxBackups(c.NumberOfFiles),
 		file.Permissions(os.FileMode(c.Permissions)),
-		file.WithLogger(logp.NewLogger("rotator").With(logp.Namespace("rotator"))),
+		file.RotateOnStartup(c.RotateOnStartup),
+		file.WithLogger(beat.Logger.Named("rotator").With(logp.Namespace("rotator"))),
 	)
 	if err != nil {
 		return err
@@ -109,9 +114,7 @@ func (out *fileOutput) Close() error {
 	return out.rotator.Close()
 }
 
-func (out *fileOutput) Publish(
-	batch publisher.Batch,
-) error {
+func (out *fileOutput) Publish(_ context.Context, batch publisher.Batch) error {
 	defer batch.ACK()
 
 	st := out.observer
@@ -119,6 +122,7 @@ func (out *fileOutput) Publish(
 	st.NewBatch(len(events))
 
 	dropped := 0
+
 	for i := range events {
 		event := &events[i]
 
@@ -129,12 +133,14 @@ func (out *fileOutput) Publish(
 			} else {
 				out.log.Warnf("Failed to serialize the event: %+v", err)
 			}
-			out.log.Debugf("Failed event: %v", event)
+			out.log.Debug("Failed event logged to event log file")
+			out.log.Debugw(fmt.Sprintf("Failed event: %v", event), logp.TypeKey, logp.EventType)
 
 			dropped++
 			continue
 		}
 
+		begin := time.Now()
 		if _, err = out.rotator.Write(append(serializedEvent, '\n')); err != nil {
 			st.WriteError(err)
 
@@ -149,10 +155,13 @@ func (out *fileOutput) Publish(
 		}
 
 		st.WriteBytes(len(serializedEvent) + 1)
+		took := time.Since(begin)
+		st.ReportLatency(took)
 	}
 
-	st.Dropped(dropped)
-	st.Acked(len(events) - dropped)
+	st.PermanentErrors(dropped)
+
+	st.AckedEvents(len(events) - dropped)
 
 	return nil
 }

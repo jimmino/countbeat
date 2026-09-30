@@ -19,15 +19,18 @@ package eslegclient
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
-	"io/ioutil"
+	"maps"
 	"net/http"
 	"strings"
 
-	"github.com/elastic/beats/v7/libbeat/common"
-	"github.com/elastic/beats/v7/libbeat/logp"
+	apmHttpV2 "go.elastic.co/apm/module/apmhttp/v2"
+	"go.elastic.co/apm/v2"
+
+	"github.com/elastic/elastic-agent-libs/logp"
 )
 
 var (
@@ -42,6 +45,10 @@ type BulkCreateAction struct {
 	Create BulkMeta `json:"create" struct:"create"`
 }
 
+type BulkDeleteAction struct {
+	Delete BulkMeta `json:"delete" struct:"delete"`
+}
+
 type BulkMeta struct {
 	Index    string `json:"_index" struct:"_index"`
 	DocType  string `json:"_type,omitempty" struct:"_type,omitempty"`
@@ -53,15 +60,18 @@ type bulkRequest struct {
 	requ *http.Request
 }
 
-// BulkResult contains the result of a bulk API request.
-type BulkResult json.RawMessage
+// BulkResponse contains the result of a bulk API request.
+type BulkResponse json.RawMessage
 
 // Bulk performs many index/delete operations in a single API call.
+// `header` is an additional set of custom HTTP headers that will be set to the HTTP request
 // Implements: http://www.elastic.co/guide/en/elasticsearch/reference/current/docs-bulk.html
 func (conn *Connection) Bulk(
+	ctx context.Context,
 	index, docType string,
-	params map[string]string, body []interface{},
-) (int, BulkResult, error) {
+	header http.Header,
+	params map[string]string, body []any,
+) (int, BulkResponse, error) {
 	if len(body) == 0 {
 		return 0, nil, nil
 	}
@@ -69,50 +79,24 @@ func (conn *Connection) Bulk(
 	enc := conn.Encoder
 	enc.Reset()
 	if err := bulkEncode(conn.log, enc, body); err != nil {
+		apm.CaptureError(ctx, err).Send()
 		return 0, nil, err
 	}
 
-	requ, err := newBulkRequest(conn.URL, index, docType, params, enc)
+	mergedParams := mergeParams(conn.Parameters, params)
+
+	requ, err := newBulkRequest(conn.URL, index, docType, mergedParams, enc)
 	if err != nil {
+		apm.CaptureError(ctx, err).Send()
 		return 0, nil, err
+	}
+	requ.requ = apmHttpV2.RequestWithContext(ctx, requ.requ)
+	// multiple values per header are not supported
+	for name := range header {
+		requ.requ.Header.Set(name, header.Get(name))
 	}
 
 	return conn.sendBulkRequest(requ)
-}
-
-// SendMonitoringBulk creates a HTTP request to the X-Pack Monitoring API containing a bunch of
-// operations and sends them to Elasticsearch. The request is retransmitted up to max_retries
-// before returning an error.
-func (conn *Connection) SendMonitoringBulk(
-	params map[string]string,
-	body []interface{},
-) (BulkResult, error) {
-	if len(body) == 0 {
-		return nil, nil
-	}
-
-	enc := conn.Encoder
-	enc.Reset()
-	if err := bulkEncode(conn.log, enc, body); err != nil {
-		return nil, err
-	}
-
-	if !conn.version.IsValid() {
-		if err := conn.Connect(); err != nil {
-			return nil, err
-		}
-	}
-
-	requ, err := newMonitoringBulkRequest(conn.GetVersion(), conn.URL, params, enc)
-	if err != nil {
-		return nil, err
-	}
-
-	_, result, err := conn.sendBulkRequest(requ)
-	if err != nil {
-		return nil, err
-	}
-	return result, nil
 }
 
 func newBulkRequest(
@@ -122,27 +106,6 @@ func newBulkRequest(
 	body BodyEncoder,
 ) (*bulkRequest, error) {
 	path, err := makePath(index, docType, "_bulk")
-	if err != nil {
-		return nil, err
-	}
-
-	return newBulkRequestWithPath(urlStr, path, params, body)
-}
-
-func newMonitoringBulkRequest(
-	esVersion common.Version,
-	urlStr string,
-	params map[string]string,
-	body BodyEncoder,
-) (*bulkRequest, error) {
-	var path string
-	var err error
-	if esVersion.Major < 7 {
-		path, err = makePath("_xpack", "monitoring", "_bulk")
-	} else {
-		path, err = makePath("_monitoring", "bulk", "")
-	}
-
 	if err != nil {
 		return nil, err
 	}
@@ -185,7 +148,7 @@ func (r *bulkRequest) reset(body BodyEncoder) {
 
 	rc, ok := bdy.(io.ReadCloser)
 	if !ok && body != nil {
-		rc = ioutil.NopCloser(bdy)
+		rc = io.NopCloser(bdy)
 	}
 
 	switch v := bdy.(type) {
@@ -203,17 +166,33 @@ func (r *bulkRequest) reset(body BodyEncoder) {
 	body.AddHeader(&r.requ.Header)
 }
 
-func (conn *Connection) sendBulkRequest(requ *bulkRequest) (int, BulkResult, error) {
+func (conn *Connection) sendBulkRequest(requ *bulkRequest) (int, BulkResponse, error) {
 	status, resp, err := conn.execHTTPRequest(requ.requ)
-	return status, BulkResult(resp), err
+	return status, BulkResponse(resp), err
 }
 
-func bulkEncode(log *logp.Logger, out BulkWriter, body []interface{}) error {
+func bulkEncode(log *logp.Logger, out BulkWriter, body []any) error {
 	for _, obj := range body {
 		if err := out.AddRaw(obj); err != nil {
-			log.Debugf("Failed to encode message: %s", err)
+			log.Debugf("Failed to encode message: %v %s", obj, err)
 			return err
 		}
 	}
 	return nil
+}
+
+func mergeParams(m1, m2 map[string]string) map[string]string {
+	if len(m1) == 0 {
+		return m2
+	}
+	if len(m2) == 0 {
+		return m1
+	}
+	merged := make(map[string]string, len(m1)+len(m2))
+
+	maps.Copy(merged, m1)
+
+	maps.Copy(merged, m2)
+
+	return merged
 }

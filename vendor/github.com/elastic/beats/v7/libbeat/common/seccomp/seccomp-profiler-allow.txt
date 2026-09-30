@@ -3,13 +3,14 @@ mprotect
 set_robust_list
 tgkill
 time
+rseq
 
 # cgo os/user
 access
 open
 stat
 
-# cgo tsg/gopacket
+# cgo google/gopacket
 poll
 fcntl64
 
@@ -25,3 +26,13 @@ readlink
 rename
 unlink
 wait4
+
+# Reexec
+execve
+
+# Jounrald input
+chroot
+dup3
+faccessat2
+prctl
+setrlimit

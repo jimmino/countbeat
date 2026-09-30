@@ -18,18 +18,19 @@
 package mage
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"io/ioutil"
-	"log"
 	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
+	"text/template"
 
 	"github.com/magefile/mage/mg"
 
-	"github.com/pkg/errors"
 	"gopkg.in/yaml.v2"
 )
 
@@ -64,47 +65,92 @@ func (t ConfigFileType) IsDocker() bool { return t&DockerConfigType > 0 }
 
 // ConfigFileParams defines the files that make up each config file.
 type ConfigFileParams struct {
-	ShortParts     []string // List of files or globs.
-	ShortDeps      []interface{}
-	ReferenceParts []string // List of files or globs.
-	ReferenceDeps  []interface{}
-	DockerParts    []string // List of files or globs.
-	DockerDeps     []interface{}
-	ExtraVars      map[string]interface{}
+	Templates                []string // List of files or globs to load.
+	ExtraVars                map[string]any
+	Short, Reference, Docker ConfigParams
 }
 
-// Empty checks if configuration files are set.
-func (c ConfigFileParams) Empty() bool {
-	return len(c.ShortParts) == len(c.ReferenceDeps) && len(c.ReferenceParts) == len(c.DockerParts) && len(c.DockerParts) == 0
+type ConfigParams struct {
+	Template string
+	Deps     []any
+}
+
+func DefaultConfigFileParams() ConfigFileParams {
+	return ConfigFileParams{
+		Templates: []string{LibbeatDir("_meta/config/*.tmpl")},
+		ExtraVars: map[string]any{},
+		Short: ConfigParams{
+			Template: LibbeatDir("_meta/config/default.short.yml.tmpl"),
+		},
+		Reference: ConfigParams{
+			Template: LibbeatDir("_meta/config/default.reference.yml.tmpl"),
+		},
+		Docker: ConfigParams{
+			Template: LibbeatDir("_meta/config/default.docker.yml.tmpl"),
+		},
+	}
 }
 
 // Config generates config files. Set DEV_OS and DEV_ARCH to change the target
 // host for the generated configs. Defaults to linux/amd64.
 func Config(types ConfigFileType, args ConfigFileParams, targetDir string) error {
-	if args.Empty() {
-		args = ConfigFileParams{
-			ShortParts: []string{
-				OSSBeatDir("_meta/beat.yml"),
-				LibbeatDir("_meta/config.yml.tmpl"),
-			},
-			ReferenceParts: []string{
-				OSSBeatDir("_meta/beat.reference.yml"),
-				LibbeatDir("_meta/config.reference.yml.tmpl"),
-			},
-			DockerParts: []string{
-				OSSBeatDir("_meta/beat.docker.yml"),
-				LibbeatDir("_meta/config.docker.yml"),
-			},
+	// Short
+	if types.IsShort() {
+		file := filepath.Join(targetDir, BeatName+".yml")
+		if err := makeConfigTemplate(file, 0600, args, ShortConfigType); err != nil {
+			return fmt.Errorf("failed making short config: %w", err)
 		}
 	}
 
-	if err := makeConfigTemplates(types, args); err != nil {
-		return errors.Wrap(err, "failed making config templates")
+	// Reference
+	if types.IsReference() {
+		file := filepath.Join(targetDir, BeatName+".reference.yml")
+		if err := makeConfigTemplate(file, 0644, args, ReferenceConfigType); err != nil {
+			return fmt.Errorf("failed making reference config: %w", err)
+		}
 	}
 
-	params := map[string]interface{}{
+	// Docker
+	if types.IsDocker() {
+		file := filepath.Join(targetDir, BeatName+".docker.yml")
+		if err := makeConfigTemplate(file, 0600, args, DockerConfigType); err != nil {
+			return fmt.Errorf("failed making docker config: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func makeConfigTemplate(destination string, mode os.FileMode, confParams ConfigFileParams, typ ConfigFileType) error {
+	// Determine what type to build and set some parameters.
+	var confFile ConfigParams
+	var tmplParams map[string]any
+	switch typ {
+	case ShortConfigType:
+		confFile = confParams.Short
+		tmplParams = map[string]any{}
+	case ReferenceConfigType:
+		confFile = confParams.Reference
+		tmplParams = map[string]any{"Reference": true}
+	case DockerConfigType:
+		confFile = confParams.Docker
+		tmplParams = map[string]any{"Docker": true}
+	default:
+		panic(fmt.Errorf("Invalid config file type: %v", typ))
+	}
+
+	// Build the dependencies.
+	mg.SerialDeps(confFile.Deps...)
+
+	// Set variables that are available in templates.
+	// Rather than adding more "ExcludeX"/"UseX" options consider overwriting
+	// one of the libbeat templates in your project by adding a file with the
+	// same name to your _meta/config directory.
+	params := map[string]any{
 		"GOOS":                           EnvOr("DEV_OS", "linux"),
 		"GOARCH":                         EnvOr("DEV_ARCH", "amd64"),
+		"CI":                             EnvOr("CI", ""),
+		"BeatLicense":                    BeatLicense,
 		"Reference":                      false,
 		"Docker":                         false,
 		"ExcludeConsole":                 false,
@@ -117,88 +163,83 @@ func Config(types ConfigFileType, args ConfigFileParams, targetDir string) error
 		"UseKubernetesMetadataProcessor": false,
 		"ExcludeDashboards":              false,
 	}
-	for k, v := range args.ExtraVars {
-		params[k] = v
+	params = joinMaps(params, confParams.ExtraVars, tmplParams)
+	tmpl := template.New("config").Option("missingkey=error")
+	funcs := joinMaps(FuncMap, template.FuncMap{
+		"header":    header,
+		"subheader": subheader,
+		"indent":    indent,
+		// include is necessary because you cannot pipe 'template' to a function
+		// since 'template' is an action. This allows you to include a
+		// template and indent it (e.g. {{ include "x.tmpl" . | indent 4 }}).
+		"include": func(name string, data any) (string, error) {
+			buf := bytes.NewBuffer(nil)
+			if err := tmpl.ExecuteTemplate(buf, name, data); err != nil {
+				return "", err
+			}
+			return buf.String(), nil
+		},
+	})
+	tmpl = tmpl.Funcs(funcs)
+
+	if params["GOOS"] == "aix" {
+		// Force the removal for docker and kubernetes parts for AIX.
+		params["UseDockerMetadataProcessor"] = false
+		params["UseKubernetesMetadataProcessor"] = false
 	}
 
-	// Short
-	if types.IsShort() {
-		file := filepath.Join(targetDir, BeatName+".yml")
-		fmt.Printf(">> Building %v for %v/%v\n", file, params["GOOS"], params["GOARCH"])
-		if err := ExpandFile(shortTemplate, file, params); err != nil {
-			return errors.Wrapf(err, "failed building %v", file)
-		}
-	}
-
-	// Reference
-	if types.IsReference() {
-		file := filepath.Join(targetDir, BeatName+".reference.yml")
-		params["Reference"] = true
-		fmt.Printf(">> Building %v for %v/%v\n", file, params["GOOS"], params["GOARCH"])
-		if err := ExpandFile(referenceTemplate, file, params); err != nil {
-			return errors.Wrapf(err, "failed building %v", file)
-		}
-	}
-
-	// Docker
-	if types.IsDocker() {
-		file := filepath.Join(targetDir, BeatName+".docker.yml")
-		params["Reference"] = false
-		params["Docker"] = true
-		fmt.Printf(">> Building %v for %v/%v\n", file, params["GOOS"], params["GOARCH"])
-		if err := ExpandFile(dockerTemplate, file, params); err != nil {
-			return errors.Wrapf(err, "failed building %v", file)
-		}
-	}
-
-	return nil
-}
-
-func makeConfigTemplates(types ConfigFileType, args ConfigFileParams) error {
+	fmt.Printf(">> Building %v for %v/%v\n", destination, params["GOOS"], params["GOARCH"])
 	var err error
-
-	if types.IsShort() {
-		mg.SerialDeps(args.ShortDeps...)
-		if err = makeConfigTemplate(shortTemplate, 0600, args.ShortParts...); err != nil {
-			return err
+	for _, templateGlob := range confParams.Templates {
+		if tmpl, err = tmpl.ParseGlob(templateGlob); err != nil {
+			return fmt.Errorf("failed to parse config templates in %q: %w", templateGlob, err)
 		}
 	}
 
-	if types.IsReference() {
-		mg.SerialDeps(args.ReferenceDeps...)
-		if err = makeConfigTemplate(referenceTemplate, 0644, args.ReferenceParts...); err != nil {
-			return err
-		}
+	data, err := os.ReadFile(confFile.Template)
+	if err != nil {
+		return fmt.Errorf("failed to read config template %q: %w", confFile.Template, err)
 	}
 
-	if types.IsDocker() {
-		mg.SerialDeps(args.DockerDeps...)
-		if err = makeConfigTemplate(dockerTemplate, 0600, args.DockerParts...); err != nil {
-			return err
-		}
+	tmpl, err = tmpl.Parse(string(data))
+	if err != nil {
+		return fmt.Errorf("failed to parse template: %w", err)
+	}
+
+	out, err := os.OpenFile(CreateDir(destination), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, mode)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	if err = tmpl.Execute(out, EnvMap(params)); err != nil {
+		return fmt.Errorf("failed building %v: %w", destination, err)
 	}
 
 	return nil
 }
 
-func makeConfigTemplate(destination string, mode os.FileMode, parts ...string) error {
-	configFiles, err := FindFiles(parts...)
-	if err != nil {
-		return errors.Wrap(err, "failed to find config templates")
-	}
+func header(title string) string {
+	return makeHeading(title, "=")
+}
 
-	if IsUpToDate(destination, configFiles...) {
-		return nil
-	}
+func subheader(title string) string {
+	return makeHeading(title, "-")
+}
 
-	log.Println(">> Building", destination)
-	if err = FileConcat(destination, mode, configFiles...); err != nil {
-		return err
-	}
-	if err = FindReplace(destination, regexp.MustCompile("beatname"), "{{.BeatName}}"); err != nil {
-		return err
-	}
-	return FindReplace(destination, regexp.MustCompile("beat-index-prefix"), "{{.BeatIndexPrefix}}")
+var nonWhitespaceRegex = regexp.MustCompile(`(?m)(^.*\S.*$)`)
+
+// indent pads all non-whitespace lines with the number of spaces specified.
+func indent(spaces int, content string) string {
+	pad := strings.Repeat(" ", spaces)
+	return nonWhitespaceRegex.ReplaceAllString(content, pad+"$1")
+}
+
+func makeHeading(title, separator string) string {
+	const line = 80
+	leftEquals := (line - len("# ") - len(title) - 2*len(" ")) / 2
+	rightEquals := leftEquals + len(title)%2
+	return "# " + strings.Repeat(separator, leftEquals) + " " + title + " " + strings.Repeat(separator, rightEquals)
 }
 
 const moduleConfigTemplate = `
@@ -224,7 +265,7 @@ type moduleFieldsYmlData []struct {
 }
 
 func readModuleFieldsYml(path string) (title string, useShort bool, err error) {
-	data, err := ioutil.ReadFile(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return "", false, err
 	}
@@ -286,7 +327,7 @@ func GenerateModuleReferenceConfig(out string, moduleDirs ...string) error {
 
 			var data []byte
 			for _, f := range files {
-				data, err = ioutil.ReadFile(f)
+				data, err = os.ReadFile(f)
 				if err != nil {
 					if os.IsNotExist(err) {
 						continue
@@ -320,9 +361,9 @@ func GenerateModuleReferenceConfig(out string, moduleDirs ...string) error {
 		return moduleConfigs[i].ID < moduleConfigs[j].ID
 	})
 
-	config := MustExpand(moduleConfigTemplate, map[string]interface{}{
+	config := MustExpand(moduleConfigTemplate, map[string]any{
 		"Modules": moduleConfigs,
 	})
 
-	return ioutil.WriteFile(createDir(out), []byte(config), 0644)
+	return os.WriteFile(createDir(out), []byte(config), 0644)
 }

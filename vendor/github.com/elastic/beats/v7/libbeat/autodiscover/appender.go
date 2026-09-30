@@ -21,8 +21,9 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/elastic/beats/v7/libbeat/common"
-	"github.com/elastic/beats/v7/libbeat/common/bus"
+	"github.com/elastic/beats/v7/pkg/autodiscover/bus"
+	"github.com/elastic/elastic-agent-libs/config"
+	"github.com/elastic/elastic-agent-libs/logp"
 )
 
 // Appender provides an interface by which extra configuration can be added into configs
@@ -35,7 +36,7 @@ type Appender interface {
 type Appenders []Appender
 
 // AppenderBuilder is a func used to generate a Appender object
-type AppenderBuilder func(*common.Config) (Appender, error)
+type AppenderBuilder func(c *config.C, logger *logp.Logger) (Appender, error)
 
 // AddBuilder registers a new AppenderBuilder
 func (r *registry) AddAppender(name string, appender AppenderBuilder) error {
@@ -70,7 +71,7 @@ func (r *registry) GetAppender(name string) AppenderBuilder {
 }
 
 // BuildAppender reads provider configuration and instantiate one
-func (r *registry) BuildAppender(c *common.Config) (Appender, error) {
+func (r *registry) BuildAppender(c *config.C) (Appender, error) {
 	var config AppenderConfig
 	err := c.Unpack(&config)
 	if err != nil {
@@ -82,7 +83,7 @@ func (r *registry) BuildAppender(c *common.Config) (Appender, error) {
 		return nil, fmt.Errorf("unknown autodiscover appender %s", config.Type)
 	}
 
-	return appender(c)
+	return appender(c, r.logger)
 }
 
 // Append uses all initialized appenders to modify generated bus.Events.
@@ -93,7 +94,7 @@ func (a Appenders) Append(event bus.Event) {
 }
 
 // NewAppenders instances and returns the given list of appenders.
-func NewAppenders(aConfigs []*common.Config) (Appenders, error) {
+func NewAppenders(aConfigs []*config.C) (Appenders, error) {
 	var appenders Appenders
 	for _, acfg := range aConfigs {
 		appender, err := Registry.BuildAppender(acfg)

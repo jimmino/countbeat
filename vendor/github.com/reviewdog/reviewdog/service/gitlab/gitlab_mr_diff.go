@@ -3,42 +3,34 @@ package gitlab
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 
-	"github.com/xanzy/go-gitlab"
+	gitlab "gitlab.com/gitlab-org/api/client-go/v3"
 
 	"github.com/reviewdog/reviewdog"
-	"github.com/reviewdog/reviewdog/service/serviceutil"
 )
 
-var _ reviewdog.DiffService = &GitLabMergeRequestDiff{}
+var _ reviewdog.DiffService = &MergeRequestDiff{}
 
-// GitLabMergeRequestDiff is a diff service for GitLab MergeRequest.
-type GitLabMergeRequestDiff struct {
+// MergeRequestDiff is a diff service for GitLab MergeRequest.
+type MergeRequestDiff struct {
 	cli      *gitlab.Client
 	pr       int
 	sha      string
 	projects string
-
-	// wd is working directory relative to root of repository.
-	wd string
 }
 
-// NewGitLabMergeRequestDiff returns a new GitLabMergeRequestDiff service.
+// NewGitLabMergeRequestDiff returns a new MergeRequestDiff service.
 // itLabMergeRequestDiff service needs git command in $PATH.
-func NewGitLabMergeRequestDiff(cli *gitlab.Client, owner, repo string, pr int, sha string) (*GitLabMergeRequestDiff, error) {
-	workDir, err := serviceutil.GitRelWorkdir()
-	if err != nil {
-		return nil, fmt.Errorf("GitLabMergeRequestCommitCommenter needs 'git' command: %v", err)
-	}
-	return &GitLabMergeRequestDiff{
+func NewGitLabMergeRequestDiff(cli *gitlab.Client, owner, repo string, pr int, sha string) *MergeRequestDiff {
+	return &MergeRequestDiff{
 		cli:      cli,
 		pr:       pr,
 		sha:      sha,
 		projects: owner + "/" + repo,
-		wd:       workDir,
-	}, nil
+	}
 }
 
 // Diff returns a diff of MergeRequest. It runs `git diff` locally instead of
@@ -46,8 +38,8 @@ func NewGitLabMergeRequestDiff(cli *gitlab.Client, owner, repo string, pr int, s
 // comment API in a sense that diff of diff_url is equivalent to
 // `git diff --no-renames`, we want diff which is equivalent to
 // `git diff --find-renames`.
-func (g *GitLabMergeRequestDiff) Diff(ctx context.Context) ([]byte, error) {
-	mr, _, err := g.cli.MergeRequests.GetMergeRequest(g.projects, g.pr, nil)
+func (g *MergeRequestDiff) Diff(ctx context.Context) ([]byte, error) {
+	mr, _, err := g.cli.MergeRequests.GetMergeRequest(g.projects, int64(g.pr), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -58,21 +50,23 @@ func (g *GitLabMergeRequestDiff) Diff(ctx context.Context) ([]byte, error) {
 	return g.gitDiff(ctx, g.sha, targetBranch.Commit.ID)
 }
 
-func (g *GitLabMergeRequestDiff) gitDiff(_ context.Context, baseSha, targetSha string) ([]byte, error) {
-	b, err := exec.Command("git", "merge-base", targetSha, baseSha).Output()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get merge-base commit: %v", err)
+func (g *MergeRequestDiff) gitDiff(_ context.Context, baseSha, targetSha string) ([]byte, error) {
+	mergeBase := os.Getenv("CI_MERGE_REQUEST_DIFF_BASE_SHA")
+	if mergeBase == "" {
+		b, err := exec.Command("git", "merge-base", targetSha, baseSha).Output()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get merge-base commit: %w", err)
+		}
+		mergeBase = strings.Trim(string(b), "\n")
 	}
-	mergeBase := strings.Trim(string(b), "\n")
-	relArg := fmt.Sprintf("--relative=%s", g.wd)
-	bytes, err := exec.Command("git", "diff", relArg, "--find-renames", mergeBase, baseSha).Output()
+	bytes, err := exec.Command("git", "diff", "--find-renames", mergeBase, baseSha).Output()
 	if err != nil {
-		return nil, fmt.Errorf("failed to run git diff: %v", err)
+		return nil, fmt.Errorf("failed to run git diff: %w", err)
 	}
 	return bytes, nil
 }
 
 // Strip returns 1 as a strip of git diff.
-func (g *GitLabMergeRequestDiff) Strip() int {
+func (g *MergeRequestDiff) Strip() int {
 	return 1
 }

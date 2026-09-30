@@ -33,17 +33,17 @@ into metricbeat events. For example, given this input object:
 
 And the requirement to transform it into this one:
 
-	common.MapStr{
+	mapstr.M{
 		"test_string":         "hello",
 		"test_int":            int64(42),
 		"test_int_from_float": int64(42),
 		"test_int_from_int64": int64(42),
 		"test_bool":           true,
 		"test_time":           common.Time(ts),
-		"test_obj_1": common.MapStr{
+		"test_obj_1": mapstr.M{
 			"test": "hello from top level",
 		},
-		"test_obj_2": common.MapStr{
+		"test_obj_2": mapstr.M{
 			"test": "hello, object",
 		},
 	}
@@ -72,14 +72,14 @@ package mapstriface
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
-	"github.com/joeshaw/multierror"
-
 	"github.com/elastic/beats/v7/libbeat/common"
 	"github.com/elastic/beats/v7/libbeat/common/schema"
-	"github.com/elastic/beats/v7/libbeat/logp"
+	"github.com/elastic/elastic-agent-libs/logp"
+	"github.com/elastic/elastic-agent-libs/mapstr"
 )
 
 type ConvMap struct {
@@ -90,31 +90,33 @@ type ConvMap struct {
 }
 
 // Map drills down in the data dictionary by using the key
-func (convMap ConvMap) Map(key string, event common.MapStr, data map[string]interface{}) multierror.Errors {
-	d, err := common.MapStr(data).GetValue(convMap.Key)
+func (convMap ConvMap) Map(key string, event mapstr.M, data map[string]any) []error {
+	d, err := mapstr.M(data).GetValue(convMap.Key)
 	if err != nil {
 		err := schema.NewKeyNotFoundError(convMap.Key)
 		err.Optional = convMap.Optional
 		err.Required = convMap.Required
-		return multierror.Errors{err}
+		return []error{err}
 	}
-	subData, ok := d.(map[string]interface{})
-	if !ok {
+	switch subData := d.(type) {
+	case map[string]any, mapstr.M:
+		subEvent := mapstr.M{}
+		convertedSubData, _ := subData.(map[string]any)
+		_, errs := convMap.Schema.ApplyTo(subEvent, convertedSubData)
+		for _, err := range errs {
+			var keyErr schema.KeyError
+			if errors.As(err, &keyErr) {
+				keyErr.SetKey(convMap.Key + "." + keyErr.Key())
+			}
+		}
+		event[key] = subEvent
+		return errs
+	default:
 		msg := fmt.Sprintf("expected dictionary, found %T", subData)
 		err := schema.NewWrongFormatError(convMap.Key, msg)
-		logp.Err(err.Error())
-		return multierror.Errors{err}
+		logp.Err("%s", err.Error())
+		return []error{err}
 	}
-
-	subEvent := common.MapStr{}
-	_, errors := convMap.Schema.ApplyTo(subEvent, subData)
-	for _, err := range errors {
-		if err, ok := err.(schema.KeyError); ok {
-			err.SetKey(convMap.Key + "." + err.Key())
-		}
-	}
-	event[key] = subEvent
-	return errors
 }
 
 func (convMap ConvMap) HasKey(key string) bool {
@@ -129,16 +131,16 @@ func Dict(key string, s schema.Schema, opts ...DictSchemaOption) ConvMap {
 	return dictSetOptions(ConvMap{Key: key, Schema: s}, opts)
 }
 
-func toStrFromNum(key string, data map[string]interface{}) (interface{}, error) {
-	emptyIface, err := common.MapStr(data).GetValue(key)
+func toStrFromNum(key string, data map[string]any) (any, error) {
+	emptyIface, err := mapstr.M(data).GetValue(key)
 	if err != nil {
 		return "", schema.NewKeyNotFoundError(key)
 	}
-	switch emptyIface.(type) {
+	switch val := emptyIface.(type) {
 	case int, int32, int64, uint, uint32, uint64, float32, float64:
 		return fmt.Sprintf("%v", emptyIface), nil
 	case json.Number:
-		return string(emptyIface.(json.Number)), nil
+		return string(val), nil
 	default:
 		msg := fmt.Sprintf("expected number, found %T", emptyIface)
 		return "", schema.NewWrongFormatError(key, msg)
@@ -150,8 +152,8 @@ func StrFromNum(key string, opts ...schema.SchemaOption) schema.Conv {
 	return schema.SetOptions(schema.Conv{Key: key, Func: toStrFromNum}, opts)
 }
 
-func toStr(key string, data map[string]interface{}) (interface{}, error) {
-	emptyIface, err := common.MapStr(data).GetValue(key)
+func toStr(key string, data map[string]any) (any, error) {
+	emptyIface, err := mapstr.M(data).GetValue(key)
 	if err != nil {
 		return "", schema.NewKeyNotFoundError(key)
 	}
@@ -168,8 +170,8 @@ func Str(key string, opts ...schema.SchemaOption) schema.Conv {
 	return schema.SetOptions(schema.Conv{Key: key, Func: toStr}, opts)
 }
 
-func toIfc(key string, data map[string]interface{}) (interface{}, error) {
-	intf, err := common.MapStr(data).GetValue(key)
+func toIfc(key string, data map[string]any) (any, error) {
+	intf, err := mapstr.M(data).GetValue(key)
 	if err != nil {
 		e := schema.NewKeyNotFoundError(key)
 		e.Err = err
@@ -183,8 +185,8 @@ func Ifc(key string, opts ...schema.SchemaOption) schema.Conv {
 	return schema.SetOptions(schema.Conv{Key: key, Func: toIfc}, opts)
 }
 
-func toBool(key string, data map[string]interface{}) (interface{}, error) {
-	emptyIface, err := common.MapStr(data).GetValue(key)
+func toBool(key string, data map[string]any) (any, error) {
+	emptyIface, err := mapstr.M(data).GetValue(key)
 	if err != nil {
 		return false, schema.NewKeyNotFoundError(key)
 	}
@@ -201,29 +203,28 @@ func Bool(key string, opts ...schema.SchemaOption) schema.Conv {
 	return schema.SetOptions(schema.Conv{Key: key, Func: toBool}, opts)
 }
 
-func toInteger(key string, data map[string]interface{}) (interface{}, error) {
-	emptyIface, err := common.MapStr(data).GetValue(key)
+func toInteger(key string, data map[string]any) (any, error) {
+	emptyIface, err := mapstr.M(data).GetValue(key)
 	if err != nil {
 		return 0, schema.NewKeyNotFoundError(key)
 	}
-	switch emptyIface.(type) {
-	case int64:
-		return emptyIface.(int64), nil
+	switch val := emptyIface.(type) {
+	case int64, uint64:
+		return val, nil
 	case int:
-		return int64(emptyIface.(int)), nil
+		return int64(val), nil
 	case float64:
-		return int64(emptyIface.(float64)), nil
+		return int64(val), nil
 	case json.Number:
-		num := emptyIface.(json.Number)
-		i64, err := num.Int64()
+		i64, err := val.Int64()
 		if err == nil {
 			return i64, nil
 		}
-		f64, err := num.Float64()
+		f64, err := val.Float64()
 		if err == nil {
 			return int64(f64), nil
 		}
-		msg := fmt.Sprintf("expected integer, found json.Number (%v) that cannot be converted", num)
+		msg := fmt.Sprintf("expected integer, found json.Number (%v) that cannot be converted", val)
 		return 0, schema.NewWrongFormatError(key, msg)
 	default:
 		msg := fmt.Sprintf("expected integer, found %T", emptyIface)
@@ -237,29 +238,28 @@ func Float(key string, opts ...schema.SchemaOption) schema.Conv {
 	return schema.SetOptions(schema.Conv{Key: key, Func: toFloat}, opts)
 }
 
-func toFloat(key string, data map[string]interface{}) (interface{}, error) {
-	emptyIface, err := common.MapStr(data).GetValue(key)
+func toFloat(key string, data map[string]any) (any, error) {
+	emptyIface, err := mapstr.M(data).GetValue(key)
 	if err != nil {
 		return 0.0, schema.NewKeyNotFoundError(key)
 	}
-	switch emptyIface.(type) {
+	switch val := emptyIface.(type) {
 	case float64:
-		return emptyIface.(float64), nil
+		return val, nil
 	case int:
-		return float64(emptyIface.(int)), nil
+		return float64(val), nil
 	case int64:
-		return float64(emptyIface.(int64)), nil
+		return float64(val), nil
 	case json.Number:
-		num := emptyIface.(json.Number)
-		i64, err := num.Float64()
+		i64, err := val.Float64()
 		if err == nil {
 			return i64, nil
 		}
-		f64, err := num.Float64()
+		f64, err := val.Float64()
 		if err == nil {
 			return f64, nil
 		}
-		msg := fmt.Sprintf("expected float, found json.Number (%v) that cannot be converted", num)
+		msg := fmt.Sprintf("expected float, found json.Number (%v) that cannot be converted", val)
 		return 0.0, schema.NewWrongFormatError(key, msg)
 	default:
 		msg := fmt.Sprintf("expected float, found %T", emptyIface)
@@ -268,28 +268,22 @@ func toFloat(key string, data map[string]interface{}) (interface{}, error) {
 }
 
 // Int creates a Conv object for converting integers. Acceptable input
-// types are int64, int, and float64.
+// types are int64, uint64, int, and float64.
 func Int(key string, opts ...schema.SchemaOption) schema.Conv {
 	return schema.SetOptions(schema.Conv{Key: key, Func: toInteger}, opts)
 }
 
-func toTime(key string, data map[string]interface{}) (interface{}, error) {
-	emptyIface, err := common.MapStr(data).GetValue(key)
+func toTime(key string, data map[string]any) (any, error) {
+	emptyIface, err := mapstr.M(data).GetValue(key)
 	if err != nil {
 		return common.Time(time.Unix(0, 0)), schema.NewKeyNotFoundError(key)
 	}
 
-	switch emptyIface.(type) {
+	switch val := emptyIface.(type) {
 	case time.Time:
-		ts, ok := emptyIface.(time.Time)
-		if ok {
-			return common.Time(ts), nil
-		}
+		return common.Time(val), nil
 	case common.Time:
-		ts, ok := emptyIface.(common.Time)
-		if ok {
-			return ts, nil
-		}
+		return val, nil
 	}
 
 	msg := fmt.Sprintf("expected date, found %T", emptyIface)

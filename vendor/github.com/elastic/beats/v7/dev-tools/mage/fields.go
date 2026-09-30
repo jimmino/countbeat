@@ -18,9 +18,8 @@
 package mage
 
 import (
+	"fmt"
 	"path/filepath"
-
-	"github.com/pkg/errors"
 
 	"github.com/magefile/mage/sh"
 )
@@ -45,6 +44,7 @@ type IncludeListOptions struct {
 	Outfile          string
 	BuildTags        string
 	Pkg              string
+	SkipInitModule   bool
 }
 
 // DefaultIncludeListOptions initializes IncludeListOptions struct with default values
@@ -56,6 +56,7 @@ func DefaultIncludeListOptions() IncludeListOptions {
 		Outfile:          "include/list.go",
 		BuildTags:        "",
 		Pkg:              "include",
+		SkipInitModule:   false,
 	}
 }
 
@@ -101,16 +102,13 @@ func generateFieldsYAML(baseDir, output string, moduleDirs ...string) error {
 		return err
 	}
 
-	cmd := []string{"run"}
-	if UseVendor {
-		cmd = append(cmd, "-mod", "vendor")
-	}
-	cmd = append(cmd,
+	cmd := []string{"run",
+		"-mod=readonly",
 		filepath.Join(beatsDir, globalFieldsCmdPath),
 		"-es_beats_path", beatsDir,
 		"-beat_path", baseDir,
 		"-out", CreateDir(output),
-	)
+	}
 	globalFieldsCmd := sh.RunCmd("go", cmd...)
 
 	return globalFieldsCmd(moduleDirs...)
@@ -119,6 +117,11 @@ func generateFieldsYAML(baseDir, output string, moduleDirs ...string) error {
 // GenerateAllInOneFieldsGo generates an all-in-one fields.go file.
 func GenerateAllInOneFieldsGo() error {
 	return GenerateFieldsGo("fields.yml", "include/fields.go")
+}
+
+// GenerateMetricbeatAllInOneFieldsGo generates an all-in-one fields.go file for metricbeat.
+func GenerateMetricbeatAllInOneFieldsGo() error {
+	return GenerateFieldsGo("fields.yml", "include/fields/fields.go")
 }
 
 // GenerateFieldsGo generates a .go file containing the fields.yml data.
@@ -130,18 +133,15 @@ func GenerateFieldsGo(fieldsYML, out string) error {
 		return err
 	}
 
-	cmd := []string{"run"}
-	if UseVendor {
-		cmd = append(cmd, "-mod", "vendor")
-	}
-	cmd = append(cmd,
+	cmd := []string{"run",
+		"-mod=readonly",
 		filepath.Join(beatsDir, assetCmdPath),
 		"-pkg", "include",
 		"-in", fieldsYML,
 		"-out", CreateDir(out),
 		"-license", toLibbeatLicenseName(BeatLicense),
 		BeatName,
-	)
+	}
 	assetCmd := sh.RunCmd("go", cmd...)
 
 	return assetCmd()
@@ -162,16 +162,12 @@ func GenerateModuleFieldsGo(moduleDir string) error {
 		moduleDir = CWD(moduleDir)
 	}
 
-	cmd := []string{"run"}
-	if UseVendor {
-		cmd = append(cmd, "-mod", "vendor")
-	}
-	cmd = append(cmd,
+	cmd := []string{"run",
 		filepath.Join(beatsDir, moduleFieldsCmdPath),
 		"-beat", BeatName,
 		"-license", toLibbeatLicenseName(BeatLicense),
 		moduleDir,
-	)
+	}
 	moduleFieldsCmd := sh.RunCmd("go", cmd...)
 
 	return moduleFieldsCmd()
@@ -194,16 +190,15 @@ func GenerateIncludeListGo(options IncludeListOptions) error {
 		return err
 	}
 
-	cmd := []string{"run"}
-	if UseVendor {
-		cmd = append(cmd, "-mod", "vendor")
-	}
-	cmd = append(cmd,
+	cmd := []string{"run",
 		filepath.Join(beatsDir, moduleIncludeListCmdPath),
 		"-license", toLibbeatLicenseName(BeatLicense),
 		"-out", options.Outfile, "-buildTags", options.BuildTags,
 		"-pkg", options.Pkg,
-	)
+	}
+	if options.SkipInitModule {
+		cmd = append(cmd, "-skip-init-module")
+	}
 
 	includeListCmd := sh.RunCmd("go", cmd...)
 
@@ -238,6 +233,6 @@ func toLibbeatLicenseName(name string) string {
 	case "Elastic License":
 		return "Elastic"
 	default:
-		panic(errors.Errorf("invalid license name '%v'", name))
+		panic(fmt.Errorf("invalid license name '%v'", name))
 	}
 }

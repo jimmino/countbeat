@@ -6,7 +6,7 @@ import (
 	"os"
 )
 
-// https://help.github.com/en/articles/virtual-environments-for-github-actions#default-environment-variables
+// https://docs.github.com/en/actions/reference/environment-variables#default-environment-variables
 type GitHubEvent struct {
 	PullRequest GitHubPullRequest `json:"pull_request"`
 	Repository  struct {
@@ -22,17 +22,25 @@ type GitHubEvent struct {
 	HeadCommit struct {
 		ID string `json:"id"`
 	} `json:"head_commit"`
+	ActionName string `json:"-"` // this is defined as env GITHUB_EVENT_NAME
+}
+
+type GitHubRepo struct {
+	Owner struct {
+		ID int64 `json:"id"`
+	}
 }
 
 type GitHubPullRequest struct {
 	Number int `json:"number"`
 	Head   struct {
-		Sha  string `json:"sha"`
-		Ref  string `json:"ref"`
-		Repo struct {
-			Fork bool `json:"fork"`
-		} `json:"repo"`
+		Sha  string     `json:"sha"`
+		Ref  string     `json:"ref"`
+		Repo GitHubRepo `json:"repo"`
 	} `json:"head"`
+	Base struct {
+		Repo GitHubRepo `json:"repo"`
+	} `json:"base"`
 }
 
 // LoadGitHubEvent loads GitHubEvent if it's running in GitHub Actions.
@@ -54,6 +62,7 @@ func loadGitHubEventFromPath(eventPath string) (*GitHubEvent, error) {
 	if err := json.NewDecoder(f).Decode(&event); err != nil {
 		return nil, err
 	}
+	event.ActionName = os.Getenv("GITHUB_EVENT_NAME")
 	return &event, nil
 }
 
@@ -86,11 +95,28 @@ func getBuildInfoFromGitHubActionEventPath(eventPath string) (*BuildInfo, bool, 
 	if info.SHA == "" {
 		info.SHA = event.HeadCommit.ID
 	}
+	if info.SHA == "" {
+		info.SHA = os.Getenv("GITHUB_SHA")
+	}
 	return info, info.PullRequest != 0, nil
 }
 
 // IsInGitHubAction returns true if reviewdog is running in GitHub Actions.
 func IsInGitHubAction() bool {
-	// https://help.github.com/en/articles/virtual-environments-for-github-actions#default-environment-variables
-	return os.Getenv("GITHUB_ACTION") != ""
+	// https://docs.github.com/en/actions/learn-github-actions/variables#default-environment-variables
+	// > Always set to true when GitHub Actions is running the workflow.
+	// > You can use this variable to differentiate when tests are being run locally or by GitHub Actions.
+	return os.Getenv("GITHUB_ACTIONS") != ""
+}
+
+// HasReadOnlyPermissionGitHubToken returns true if reviewdog is running in GitHub
+// Actions and running for PullRequests from forked repository with read-only token.
+// https://docs.github.com/en/actions/reference/events-that-trigger-workflows#pull_request_target
+func HasReadOnlyPermissionGitHubToken() bool {
+	event, err := LoadGitHubEvent()
+	if err != nil {
+		return false
+	}
+	isForkedRepo := event.PullRequest.Head.Repo.Owner.ID != event.PullRequest.Base.Repo.Owner.ID
+	return isForkedRepo && event.ActionName != "pull_request_target"
 }

@@ -17,15 +17,34 @@
 
 package dissect
 
+import (
+	"fmt"
+	"strings"
+)
+
+type trimMode byte
+
+const (
+	trimModeNone trimMode = iota
+	trimModeRight
+	trimModeLeft
+	trimModeAll = trimModeRight | trimModeLeft
+)
+
 type config struct {
-	Tokenizer    *tokenizer `config:"tokenizer" validate:"required"`
-	Field        string     `config:"field"`
-	TargetPrefix string     `config:"target_prefix"`
+	Tokenizer     *tokenizer `config:"tokenizer" validate:"required"`
+	Field         string     `config:"field"`
+	TargetPrefix  string     `config:"target_prefix"`
+	IgnoreFailure bool       `config:"ignore_failure"`
+	OverwriteKeys bool       `config:"overwrite_keys"`
+	TrimValues    trimMode   `config:"trim_values"`
+	TrimChars     string     `config:"trim_chars"`
 }
 
 var defaultConfig = config{
 	Field:        "message",
 	TargetPrefix: "dissect",
+	TrimChars:    " ",
 }
 
 // tokenizer add validation at the unpack level for this specific field.
@@ -38,5 +57,22 @@ func (t *tokenizer) Unpack(v string) error {
 		return err
 	}
 	*t = *d
+	return nil
+}
+
+// Unpack the trim mode from a string.
+func (tm *trimMode) Unpack(v string) error {
+	switch strings.ToLower(v) {
+	case "", "none":
+		*tm = trimModeNone
+	case "left":
+		*tm = trimModeLeft
+	case "right":
+		*tm = trimModeRight
+	case "all", "both":
+		*tm = trimModeAll
+	default:
+		return fmt.Errorf("unsupported value %s. Must be one of [none, left, right, all]", v)
+	}
 	return nil
 }

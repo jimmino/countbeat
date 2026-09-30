@@ -11,14 +11,14 @@ import (
 )
 
 const (
-	tokenDiffGit        = "diff --git" // diff --git a/sample.old.txt b/sample.new.txt
-	tokenOldFile        = "---"        // --- sample.old.txt	2016-10-13 05:09:35.820791185 +0900
-	tokenNewFile        = "+++"        // +++ sample.new.txt	2016-10-13 05:15:26.839245048 +0900
-	tokenStartHunk      = "@@"         // @@ -1,3 +1,4 @@
-	tokenUnchangedLine  = " "          //  unchanged, contextual line
-	tokenAddedLine      = "+"          // +added line
-	tokenDeletedLine    = "-"          // -deleted line
-	tokenNoNewlineAtEOF = `\`          // \ No newline at end of file
+	tokenDiff           = "diff" // diff --git a/sample.old.txt b/sample.new.txt
+	tokenOldFile        = "---"  // --- sample.old.txt	2016-10-13 05:09:35.820791185 +0900
+	tokenNewFile        = "+++"  // +++ sample.new.txt	2016-10-13 05:15:26.839245048 +0900
+	tokenStartHunk      = "@@"   // @@ -1,3 +1,4 @@
+	tokenUnchangedLine  = " "    //  unchanged, contextual line
+	tokenAddedLine      = "+"    // +added line
+	tokenDeletedLine    = "-"    // -deleted line
+	tokenNoNewlineAtEOF = `\`    // \ No newline at end of file
 )
 
 var (
@@ -50,13 +50,31 @@ func (p *multiFileParser) Parse() ([]*FileDiff, error) {
 	var fds []*FileDiff
 	fp := &fileParser{r: p.r}
 	for {
+		skipBlankLines(p.r)
 		fd, err := fp.Parse()
-		if err != nil || fd == nil {
+		if err != nil {
+			return nil, err
+		}
+		if fd == nil {
 			break
 		}
 		fds = append(fds, fd)
 	}
 	return fds, nil
+}
+
+// skipBlankLines consumes blank lines that sit between file diffs. They carry no
+// diff content and show up whenever diffs are concatenated or pasted.
+func skipBlankLines(r *bufio.Reader) {
+	for {
+		b, err := r.Peek(1)
+		if err != nil || (b[0] != '\n' && b[0] != '\r') {
+			return
+		}
+		if _, err := readline(r); err != nil {
+			return
+		}
+	}
 }
 
 // ParseFile parses a file unified diff.
@@ -103,11 +121,11 @@ func (p *fileParser) parseHunks() ([]*Hunk, error) {
 		return nil, ErrNoHunks
 	}
 	if !bytes.HasPrefix(b, []byte(tokenStartHunk)) {
-		b, err := p.r.Peek(len(tokenDiffGit))
+		b, err := p.r.Peek(len(tokenDiff))
 		if err != nil {
 			return nil, ErrNoHunks
 		}
-		if bytes.HasPrefix(b, []byte(tokenDiffGit)) {
+		if bytes.HasPrefix(b, []byte(tokenDiff)) {
 			// git diff may contain a file diff with empty hunks.
 			// e.g. delete an empty file.
 			return []*Hunk{}, nil
@@ -211,17 +229,17 @@ LOOP:
 
 func parseExtendedHeader(r *bufio.Reader) []string {
 	var es []string
-	b, err := r.Peek(len(tokenDiffGit))
+	b, err := r.Peek(len(tokenDiff))
 	if err != nil {
 		return nil
 	}
-	// if starts with 'diff --git', parse extended header
-	if bytes.HasPrefix(b, []byte(tokenDiffGit)) {
+	// if starts with 'diff', parse extended header
+	if bytes.HasPrefix(b, []byte(tokenDiff)) {
 		diffgitline, _ := readline(r) // ignore err because we know it can read something
 		es = append(es, diffgitline)
 		for {
-			b, err := r.Peek(len(tokenDiffGit))
-			if err != nil || bytes.HasPrefix(b, []byte(tokenOldFile)) || bytes.HasPrefix(b, []byte(tokenDiffGit)) {
+			b, err := r.Peek(len(tokenDiff))
+			if err != nil || bytes.HasPrefix(b, []byte(tokenOldFile)) || bytes.HasPrefix(b, []byte(tokenDiff)) {
 				break
 			}
 			line, _ := readline(r)
@@ -251,9 +269,11 @@ func (p *hunkParser) Parse() (*Hunk, error) {
 		StartLineNew:  hr.lnew,
 		LineLengthNew: hr.snew,
 		Section:       hr.section,
+		EOFNewline:    LineUnchanged,
 	}
 	lold := hr.lold
 	lnew := hr.lnew
+	prevLineType := LineUnchanged
 endhunk:
 	for !p.done(lold, lnew, hr) {
 		b, err := p.r.Peek(1)
@@ -261,11 +281,16 @@ endhunk:
 			break
 		}
 		token := string(b)
+		if token == "\n" || token == "\r" && hasPrefix(p.r, "\r\n") {
+			// Stripping trailing whitespace turns an empty context line into an
+			// empty line. Treat it as context so the rest of the hunk survives.
+			token = tokenUnchangedLine
+		}
 		switch token {
 		case tokenUnchangedLine, tokenAddedLine, tokenDeletedLine:
 			p.lnumdiff++
 			l, _ := readline(p.r)
-			line := &Line{Content: l[len(token):]} // trim first token
+			line := &Line{Content: strings.TrimPrefix(l, token)}
 			switch token {
 			case tokenUnchangedLine:
 				line.Type = LineUnchanged
@@ -274,20 +299,37 @@ endhunk:
 				line.LnumNew = lnew
 				lold++
 				lnew++
+				prevLineType = LineUnchanged
 			case tokenAddedLine:
 				line.Type = LineAdded
 				line.LnumDiff = p.lnumdiff
 				line.LnumNew = lnew
 				lnew++
+				prevLineType = LineAdded
 			case tokenDeletedLine:
 				line.Type = LineDeleted
 				line.LnumDiff = p.lnumdiff
 				line.LnumOld = lold
 				lold++
+				prevLineType = LineDeleted
 			}
 			hunk.Lines = append(hunk.Lines, line)
 		case tokenNoNewlineAtEOF:
-			// skip \ No newline at end of file. just consume line
+			switch prevLineType {
+			case LineUnchanged:
+				hunk.EOFNewline = LineUnchanged
+			case LineAdded:
+				// special case - if there's no newline in both files,
+				// it will already have been reported as part of the old file
+				if hunk.EOFNewline == LineAdded {
+					hunk.EOFNewline = LineUnchanged
+				} else {
+					hunk.EOFNewline = LineDeleted
+				}
+			case LineDeleted:
+				hunk.EOFNewline = LineAdded
+			}
+			// skip the rest of the line
 			readline(p.r)
 		default:
 			break endhunk
@@ -295,6 +337,11 @@ endhunk:
 	}
 	p.lnumdiff++ // count up by an additional hunk
 	return hunk, nil
+}
+
+func hasPrefix(r *bufio.Reader, prefix string) bool {
+	b, err := r.Peek(len(prefix))
+	return err == nil && bytes.Equal(b, []byte(prefix))
 }
 
 func (p *hunkParser) done(lold, lnew int, hr *hunkrange) bool {
@@ -364,16 +411,24 @@ func parseLS(ls string) (l, s int, err error) {
 	return l, s, nil
 }
 
-// readline reads lines from bufio.Reader with size limit. It consumes
-// remaining content even if the line size reaches size limit.
+// readline reads a whole line.
 func readline(r *bufio.Reader) (string, error) {
 	line, isPrefix, err := r.ReadLine()
 	if err != nil {
 		return "", err
 	}
-	// consume all remaining line content
-	for isPrefix {
-		_, isPrefix, _ = r.ReadLine()
+	// append all remaining line content
+	if isPrefix {
+		l := make([]byte, len(line))
+		copy(l, line)
+		for isPrefix {
+			line, isPrefix, err = r.ReadLine()
+			if err != nil {
+				return "", err
+			}
+			l = append(l, line...)
+		}
+		line = l
 	}
 	return string(line), nil
 }

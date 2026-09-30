@@ -1,0 +1,4 @@
+- Prefer placing integration tests under `tests/` so they stay separate from unit tests without needing an extra `go.mod`.
+- Avoid dot imports like `. "gitea.dev/sdk"`; prefer normal imports of `"gitea.dev/sdk"` without an alias when the package name already matches.
+- In Go imports, keep standard library imports first, then a blank line, then `"gitea.dev/sdk"`.
+- Keep lint commands aligned with the common Gitea style: provide `make fmt`, `make fmt-check`, and `make lint`, with `lint` built around `golangci-lint`.

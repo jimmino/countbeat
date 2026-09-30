@@ -18,13 +18,13 @@
 package outputs
 
 import (
+	"context"
 	"errors"
 	"fmt"
-	"math/rand"
 	"strings"
 
 	"github.com/elastic/beats/v7/libbeat/publisher"
-	"github.com/elastic/beats/v7/libbeat/testing"
+	"github.com/elastic/elastic-agent-libs/testing"
 )
 
 type failoverClient struct {
@@ -41,7 +41,7 @@ var (
 
 // NewFailoverClient combines a set of NetworkClients into one NetworkClient instances,
 // with at most one active client. If the active client fails, another client
-// will be used.
+// will be used. The client will be chosen in deterministic, round-robin order.
 func NewFailoverClient(clients []NetworkClient) NetworkClient {
 	if len(clients) == 1 {
 		return clients[0]
@@ -53,7 +53,7 @@ func NewFailoverClient(clients []NetworkClient) NetworkClient {
 	}
 }
 
-func (f *failoverClient) Connect() error {
+func (f *failoverClient) Connect(ctx context.Context) error {
 	var (
 		next   int
 		active = f.active
@@ -68,20 +68,12 @@ func (f *failoverClient) Connect() error {
 	case l == 2 && 0 <= active && active <= 1:
 		next = 1 - active
 	default:
-		for {
-			// Connect to random server to potentially spread the
-			// load when large number of beats with same set of sinks
-			// are started up at about the same time.
-			next = rand.Int() % l
-			if next != active {
-				break
-			}
-		}
+		next = (active + 1) % l
 	}
 
 	client := f.clients[next]
 	f.active = next
-	return client.Connect()
+	return client.Connect(ctx)
 }
 
 func (f *failoverClient) Close() error {
@@ -91,12 +83,12 @@ func (f *failoverClient) Close() error {
 	return f.clients[f.active].Close()
 }
 
-func (f *failoverClient) Publish(batch publisher.Batch) error {
+func (f *failoverClient) Publish(ctx context.Context, batch publisher.Batch) error {
 	if f.active < 0 {
 		batch.Retry()
 		return errNoActiveConnection
 	}
-	return f.clients[f.active].Publish(batch)
+	return f.clients[f.active].Publish(ctx, batch)
 }
 
 func (f *failoverClient) Test(d testing.Driver) {

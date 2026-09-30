@@ -1,7 +1,10 @@
+// Package sh provides helpers for running shell commands.
 package sh
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -16,19 +19,19 @@ import (
 // useful for creating command aliases to make your scripts easier to read, like
 // this:
 //
-//  // in a helper file somewhere
-//  var g0 = sh.RunCmd("go")  // go is a keyword :(
+//	// in a helper file somewhere
+//	var g0 = sh.RunCmd("go")  // go is a keyword :(
 //
-//  // somewhere in your main code
-//	if err := g0("install", "github.com/gohugo/hugo"); err != nil {
-//		return err
-//  }
+//	// somewhere in your main code
+//		if err := g0("install", "github.com/gohugo/hugo"); err != nil {
+//			return err
+//	}
 //
 // Args passed to command get baked in as args to the command when you run it.
 // Any args passed in when you run the returned function will be appended to the
 // original args.  For example, this is equivalent to the above:
 //
-//  var goInstall = sh.RunCmd("go", "install") goInstall("github.com/gohugo/hugo")
+//	var goInstall = sh.RunCmd("go", "install") goInstall("github.com/gohugo/hugo")
 //
 // RunCmd uses Exec underneath, so see those docs for more details.
 func RunCmd(cmd string, args ...string) func(args ...string) error {
@@ -69,6 +72,12 @@ func RunWith(env map[string]string, cmd string, args ...string) error {
 	return err
 }
 
+// RunWithV is like RunWith, but always sends the command's stdout to os.Stdout.
+func RunWithV(env map[string]string, cmd string, args ...string) error {
+	_, err := Exec(env, os.Stdout, os.Stderr, cmd, args...)
+	return err
+}
+
 // Output runs the command and returns the text from stdout.
 func Output(cmd string, args ...string) (string, error) {
 	buf := &bytes.Buffer{}
@@ -83,14 +92,14 @@ func OutputWith(env map[string]string, cmd string, args ...string) (string, erro
 	return strings.TrimSuffix(buf.String(), "\n"), err
 }
 
-// Exec executes the command, piping its stderr to mage's stderr and
-// piping its stdout to the given writer. If the command fails, it will return
-// an error that, if returned from a target or mg.Deps call, will cause mage to
-// exit with the same code as the command failed with.  Env is a list of
-// environment variables to set when running the command, these override the
-// current environment variables set (which are also passed to the command). cmd
-// and args may include references to environment variables in $FOO format, in
-// which case these will be expanded before the command is run.
+// Exec executes the command, piping its stdout and stderr to the given
+// writers. If the command fails, it will return an error that, if returned
+// from a target or mg.Deps call, will cause mage to exit with the same code as
+// the command failed with. Env is a list of environment variables to set when
+// running the command, these override the current environment variables set
+// (which are also passed to the command). cmd and args may include references
+// to environment variables in $FOO format, in which case these will be
+// expanded before the command is run.
 //
 // Ran reports if the command ran (rather than was not found or not executable).
 // Code reports the exit code the command returned if it ran. If err == nil, ran
@@ -107,18 +116,18 @@ func Exec(env map[string]string, stdout, stderr io.Writer, cmd string, args ...s
 	for i := range args {
 		args[i] = os.Expand(args[i], expand)
 	}
-	ran, code, err := run(env, stdout, stderr, cmd, args...)
+	ran, code, err := doRun(env, stdout, stderr, cmd, args...)
 	if err == nil {
 		return true, nil
 	}
 	if ran {
 		return ran, mg.Fatalf(code, `running "%s %s" failed with exit code %d`, cmd, strings.Join(args, " "), code)
 	}
-	return ran, fmt.Errorf(`failed to run "%s %s: %v"`, cmd, strings.Join(args, " "), err)
+	return ran, fmt.Errorf(`failed to run "%s %s: %w"`, cmd, strings.Join(args, " "), err)
 }
 
-func run(env map[string]string, stdout, stderr io.Writer, cmd string, args ...string) (ran bool, code int, err error) {
-	c := exec.Command(cmd, args...)
+func doRun(env map[string]string, stdout, stderr io.Writer, cmd string, args ...string) (ran bool, code int, err error) {
+	c := exec.CommandContext(context.Background(), cmd, args...)
 	c.Env = os.Environ()
 	for k, v := range env {
 		c.Env = append(c.Env, k+"="+v)
@@ -126,7 +135,15 @@ func run(env map[string]string, stdout, stderr io.Writer, cmd string, args ...st
 	c.Stderr = stderr
 	c.Stdout = stdout
 	c.Stdin = os.Stdin
-	log.Println("exec:", cmd, strings.Join(args, " "))
+
+	var quoted []string
+	for i := range args {
+		quoted = append(quoted, fmt.Sprintf("%q", args[i]))
+	}
+	// To protect against logging from doing exec in global variables
+	if mg.Verbose() {
+		log.Println("exec:", cmd, strings.Join(quoted, " "))
+	}
 	err = c.Run()
 	return CmdRan(err), ExitStatus(err), err
 }
@@ -141,8 +158,8 @@ func CmdRan(err error) bool {
 	if err == nil {
 		return true
 	}
-	ee, ok := err.(*exec.ExitError)
-	if ok {
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
 		return ee.Exited()
 	}
 	return false
@@ -162,7 +179,8 @@ func ExitStatus(err error) int {
 	if e, ok := err.(exitStatus); ok {
 		return e.ExitStatus()
 	}
-	if e, ok := err.(*exec.ExitError); ok {
+	var e *exec.ExitError
+	if errors.As(err, &e) {
 		if ex, ok := e.Sys().(exitStatus); ok {
 			return ex.ExitStatus()
 		}

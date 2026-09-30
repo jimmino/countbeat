@@ -20,15 +20,16 @@ package mage
 import (
 	"bytes"
 	"compress/gzip"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/magefile/mage/sh"
-	"github.com/pkg/errors"
 )
 
 type dockerBuilder struct {
@@ -58,7 +59,7 @@ func newDockerBuilder(spec PackageSpec) (*dockerBuilder, error) {
 
 func (b *dockerBuilder) Build() error {
 	if err := os.RemoveAll(b.buildDir); err != nil {
-		return errors.Wrapf(err, "failed to clean existing build directory %s", b.buildDir)
+		return fmt.Errorf("failed to clean existing build directory %s: %w", b.buildDir, err)
 	}
 
 	if err := b.copyFiles(); err != nil {
@@ -66,16 +67,24 @@ func (b *dockerBuilder) Build() error {
 	}
 
 	if err := b.prepareBuild(); err != nil {
-		return errors.Wrap(err, "failed to prepare build")
+		return fmt.Errorf("failed to prepare build: %w", err)
 	}
 
 	tag, err := b.dockerBuild()
+	tries := 3
+	for err != nil && tries != 0 {
+		fmt.Println(">> Building docker images again (after 10 s)")
+		// This sleep is to avoid hitting the docker build issues when resources are not available.
+		time.Sleep(time.Second * 10)
+		tag, err = b.dockerBuild()
+		tries -= 1
+	}
 	if err != nil {
-		return errors.Wrap(err, "failed to build docker")
+		return fmt.Errorf("failed to build docker: %w", err)
 	}
 
 	if err := b.dockerSave(tag); err != nil {
-		return errors.Wrap(err, "failed to save docker as artifact")
+		return fmt.Errorf("failed to save docker as artifact: %w", err)
 	}
 
 	return nil
@@ -102,7 +111,10 @@ func (b *dockerBuilder) copyFiles() error {
 	for _, f := range b.Files {
 		target := filepath.Join(b.beatDir, f.Target)
 		if err := Copy(f.Source, target); err != nil {
-			return errors.Wrapf(err, "failed to copy from %s to %s", f.Source, target)
+			if f.SkipOnMissing && errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return fmt.Errorf("failed to copy from %s to %s: %w", f.Source, target, err)
 		}
 	}
 	return nil
@@ -115,7 +127,7 @@ func (b *dockerBuilder) prepareBuild() error {
 	}
 	templatesDir := filepath.Join(elasticBeatsDir, "dev-tools/packaging/templates/docker")
 
-	data := map[string]interface{}{
+	data := map[string]any{
 		"ExposePorts": b.exposePorts(),
 		"ModulesDirs": b.modulesDirs(),
 	}
@@ -129,7 +141,7 @@ func (b *dockerBuilder) prepareBuild() error {
 
 			err = b.ExpandFile(path, target, data)
 			if err != nil {
-				return errors.Wrapf(err, "expanding template '%s' to '%s'", path, target)
+				return fmt.Errorf("expanding template '%s' to '%s': %w", path, target, err)
 			}
 		}
 		return nil
@@ -147,20 +159,15 @@ func isDockerFile(path string) bool {
 	return strings.HasPrefix(path, "Dockerfile") || strings.HasPrefix(path, "docker-entrypoint")
 }
 
-func (b *dockerBuilder) expandDockerfile(templatesDir string, data map[string]interface{}) error {
-	// has specific dockerfile
-	dockerfile := fmt.Sprintf("Dockerfile.%s.tmpl", b.imageName)
-	_, err := os.Stat(filepath.Join(templatesDir, dockerfile))
-	if err != nil {
-		// specific missing fallback to generic
-		dockerfile = "Dockerfile.tmpl"
+func (b *dockerBuilder) expandDockerfile(templatesDir string, data map[string]any) error {
+	dockerfile := "Dockerfile.tmpl"
+	if f, found := b.ExtraVars["dockerfile"]; found {
+		dockerfile = f
 	}
 
-	entrypoint := fmt.Sprintf("docker-entrypoint.%s.tmpl", b.imageName)
-	_, err = os.Stat(filepath.Join(templatesDir, entrypoint))
-	if err != nil {
-		// specific missing fallback to generic
-		entrypoint = "docker-entrypoint.tmpl"
+	entrypoint := "docker-entrypoint.tmpl"
+	if e, found := b.ExtraVars["docker_entrypoint"]; found {
+		entrypoint = e
 	}
 
 	type fileExpansion struct {
@@ -173,9 +180,9 @@ func (b *dockerBuilder) expandDockerfile(templatesDir string, data map[string]in
 			".tmpl",
 		)
 		path := filepath.Join(templatesDir, file.source)
-		err = b.ExpandFile(path, target, data)
+		err := b.ExpandFile(path, target, data)
 		if err != nil {
-			return errors.Wrapf(err, "expanding template '%s' to '%s'", path, target)
+			return fmt.Errorf("expanding template '%s' to '%s': %w", path, target, err)
 		}
 	}
 
@@ -187,6 +194,9 @@ func (b *dockerBuilder) dockerBuild() (string, error) {
 	if b.Snapshot {
 		tag = tag + "-SNAPSHOT"
 	}
+	if b.FIPS {
+		tag = tag + "-fips"
+	}
 	if repository, _ := b.ExtraVars["repository"]; repository != "" {
 		tag = fmt.Sprintf("%s/%s", repository, tag)
 	}
@@ -194,10 +204,16 @@ func (b *dockerBuilder) dockerBuild() (string, error) {
 }
 
 func (b *dockerBuilder) dockerSave(tag string) error {
+	if _, err := os.Stat(distributionsDir); os.IsNotExist(err) {
+		err := os.MkdirAll(distributionsDir, 0750)
+		if err != nil {
+			return fmt.Errorf("cannot create folder for docker artifacts: %+v", err)
+		}
+	}
 	// Save the container as artifact
 	outputFile := b.OutputFile
 	if outputFile == "" {
-		outputTar, err := b.Expand(defaultBinaryName+".docker.tar.gz", map[string]interface{}{
+		outputTar, err := b.Expand(defaultBinaryName+".docker.tar.gz", map[string]any{
 			"Name": b.imageName,
 		})
 		if err != nil {
@@ -238,9 +254,13 @@ func (b *dockerBuilder) dockerSave(tag string) error {
 
 	if err = cmd.Wait(); err != nil {
 		if errmsg := strings.TrimSpace(stderr.String()); errmsg != "" {
-			err = errors.Wrap(errors.New(errmsg), err.Error())
+			err = fmt.Errorf(err.Error()+": %w", errors.New(errmsg))
 		}
 		return err
 	}
-	return errors.Wrap(CreateSHA512File(outputFile), "failed to create .sha512 file")
+
+	if err = CreateSHA512File(outputFile); err != nil {
+		return fmt.Errorf("failed to create .sha512 file: %w", err)
+	}
+	return nil
 }

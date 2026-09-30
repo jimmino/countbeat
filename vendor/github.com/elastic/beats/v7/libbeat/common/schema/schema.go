@@ -18,15 +18,14 @@
 package schema
 
 import (
-	"github.com/joeshaw/multierror"
+	"errors"
 
-	"github.com/elastic/beats/v7/libbeat/logp"
-
-	"github.com/elastic/beats/v7/libbeat/common"
+	"github.com/elastic/elastic-agent-libs/logp"
+	"github.com/elastic/elastic-agent-libs/mapstr"
 )
 
 // Schema describes how a map[string]interface{} object can be parsed and converted into
-// an event. The conversions can be described using an (optionally nested) common.MapStr
+// an event. The conversions can be described using an (optionally nested) mapstr.M
 // that contains Conv objects.
 type Schema map[string]Mapper
 
@@ -34,7 +33,7 @@ type Schema map[string]Mapper
 type Mapper interface {
 	// Map applies the Mapper conversion on the data and adds the result
 	// to the event on the key.
-	Map(key string, event common.MapStr, data map[string]interface{}) multierror.Errors
+	Map(key string, event mapstr.M, data map[string]any) []error
 
 	HasKey(key string) bool
 }
@@ -49,22 +48,23 @@ type Conv struct {
 }
 
 // Converter function type
-type Converter func(key string, data map[string]interface{}) (interface{}, error)
+type Converter func(key string, data map[string]any) (any, error)
 
 // Map applies the conversion on the data and adds the result
 // to the event on the key.
-func (conv Conv) Map(key string, event common.MapStr, data map[string]interface{}) multierror.Errors {
+func (conv Conv) Map(key string, event mapstr.M, data map[string]any) []error {
 	value, err := conv.Func(conv.Key, data)
 	if err != nil {
-		if err, keyNotFound := err.(*KeyNotFoundError); keyNotFound {
-			err.Optional = conv.Optional
-			err.Required = conv.Required
+		var keyErr *KeyNotFoundError
+		if errors.As(err, &keyErr) {
+			keyErr.Optional = conv.Optional
+			keyErr.Required = conv.Required
 		}
 		if conv.IgnoreAllErrors {
 			logp.Debug("schema", "ignoring error for key %q: %s", key, err)
 			return nil
 		}
-		return multierror.Errors{err}
+		return []error{err}
 	}
 	event[key] = value
 	return nil
@@ -78,8 +78,8 @@ func (conv Conv) HasKey(key string) bool {
 type Object map[string]Mapper
 
 // Map applies the schema for an object
-func (o Object) Map(key string, event common.MapStr, data map[string]interface{}) multierror.Errors {
-	subEvent := common.MapStr{}
+func (o Object) Map(key string, event mapstr.M, data map[string]any) []error {
+	subEvent := mapstr.M{}
 	errs := applySchemaToEvent(subEvent, data, o)
 	event[key] = subEvent
 	return errs
@@ -91,7 +91,7 @@ func (o Object) HasKey(key string) bool {
 
 // ApplyTo adds the fields extracted from data, converted using the schema, to the
 // event map.
-func (s Schema) ApplyTo(event common.MapStr, data map[string]interface{}, opts ...ApplyOption) (common.MapStr, multierror.Errors) {
+func (s Schema) ApplyTo(event mapstr.M, data map[string]any, opts ...ApplyOption) (mapstr.M, []error) {
 	if len(opts) == 0 {
 		opts = DefaultApplyOptions
 	}
@@ -103,9 +103,9 @@ func (s Schema) ApplyTo(event common.MapStr, data map[string]interface{}, opts .
 }
 
 // Apply converts the fields extracted from data, using the schema, into a new map and reports back the errors.
-func (s Schema) Apply(data map[string]interface{}, opts ...ApplyOption) (common.MapStr, error) {
-	event, errors := s.ApplyTo(common.MapStr{}, data, opts...)
-	return event, errors.Err()
+func (s Schema) Apply(data map[string]any, opts ...ApplyOption) (mapstr.M, error) {
+	event, errs := s.ApplyTo(mapstr.M{}, data, opts...)
+	return event, errors.Join(errs...)
 }
 
 // HasKey checks if the key is part of the schema
@@ -122,11 +122,12 @@ func hasKey(key string, mappers map[string]Mapper) bool {
 	return false
 }
 
-func applySchemaToEvent(event common.MapStr, data map[string]interface{}, conversions map[string]Mapper) multierror.Errors {
-	var errs multierror.Errors
+func applySchemaToEvent(event mapstr.M, data map[string]any, conversions map[string]Mapper) []error {
+	var errs []error
 	for key, mapper := range conversions {
-		errors := mapper.Map(key, event, data)
-		errs = append(errs, errors...)
+		if err := mapper.Map(key, event, data); err != nil {
+			errs = append(errs, err...)
+		}
 	}
 	return errs
 }

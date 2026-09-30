@@ -23,16 +23,16 @@ import (
 	"fmt"
 	"hash"
 	"hash/fnv"
-	"math/rand"
+	"math/rand/v2"
 	"strconv"
 
-	"github.com/Shopify/sarama"
-
-	"github.com/elastic/beats/v7/libbeat/common"
-	"github.com/elastic/beats/v7/libbeat/logp"
+	"github.com/elastic/elastic-agent-libs/config"
+	"github.com/elastic/elastic-agent-libs/logp"
+	"github.com/elastic/elastic-agent-libs/mapstr"
+	"github.com/elastic/sarama"
 )
 
-type partitionBuilder func(*logp.Logger, *common.Config) (func() partitioner, error)
+type partitionBuilder func(*logp.Logger, *config.C) (func() partitioner, error)
 
 type partitioner func(*message, int32) (int32, error)
 
@@ -46,7 +46,7 @@ type messagePartitioner struct {
 
 func makePartitioner(
 	log *logp.Logger,
-	partition map[string]*common.Config,
+	partition map[string]*config.C,
 ) (sarama.PartitionerConstructor, error) {
 	mkStrategy, reachable, err := initPartitionStrategy(log, partition)
 	if err != nil {
@@ -69,7 +69,7 @@ var partitioners = map[string]partitionBuilder{
 
 func initPartitionStrategy(
 	log *logp.Logger,
-	partition map[string]*common.Config,
+	partition map[string]*config.C,
 ) (func() partitioner, bool, error) {
 	if len(partition) == 0 {
 		// default use `hash` partitioner + all partitions (block if unreachable)
@@ -77,12 +77,12 @@ func initPartitionStrategy(
 	}
 
 	if len(partition) > 1 {
-		return nil, false, errors.New("Too many partitioners")
+		return nil, false, errors.New("too many partitioners")
 	}
 
 	// extract partitioner from config
 	var name string
-	var config *common.Config
+	var config *config.C
 	for n, c := range partition {
 		name, config = n, c
 	}
@@ -116,7 +116,11 @@ func (p *messagePartitioner) Partition(
 	libMsg *sarama.ProducerMessage,
 	numPartitions int32,
 ) (int32, error) {
-	msg := libMsg.Metadata.(*message)
+	msg, ok := libMsg.Metadata.(*message)
+	if !ok {
+		return 0, fmt.Errorf("failed to assert libMsg.Metadata to *message")
+	}
+
 	if numPartitions == p.partitions { // if reachable is false, this is always true
 		if 0 <= msg.partition && msg.partition < numPartitions {
 			return msg.partition, nil
@@ -125,20 +129,20 @@ func (p *messagePartitioner) Partition(
 
 	partition, err := p.p(msg, numPartitions)
 	if err != nil {
-		return 0, nil
+		return 0, nil //nolint:nilerr //ignoring this error
 	}
 
 	msg.partition = partition
 
 	if _, err := msg.data.Cache.Put("partition", partition); err != nil {
-		return 0, fmt.Errorf("setting kafka partition in publisher event failed: %v", err)
+		return 0, fmt.Errorf("setting kafka partition in publisher event failed: %w", err)
 	}
 
 	p.partitions = numPartitions
 	return msg.partition, nil
 }
 
-func cfgRandomPartitioner(_ *logp.Logger, config *common.Config) (func() partitioner, error) {
+func cfgRandomPartitioner(_ *logp.Logger, config *config.C) (func() partitioner, error) {
 	cfg := struct {
 		GroupEvents int `config:"group_events" validate:"min=1"`
 	}{
@@ -149,7 +153,6 @@ func cfgRandomPartitioner(_ *logp.Logger, config *common.Config) (func() partiti
 	}
 
 	return func() partitioner {
-		generator := rand.New(rand.NewSource(rand.Int63()))
 		N := cfg.GroupEvents
 		count := cfg.GroupEvents
 		partition := int32(0)
@@ -157,7 +160,7 @@ func cfgRandomPartitioner(_ *logp.Logger, config *common.Config) (func() partiti
 		return func(_ *message, numPartitions int32) (int32, error) {
 			if N == count {
 				count = 0
-				partition = int32(generator.Intn(int(numPartitions)))
+				partition = rand.Int32N(numPartitions)
 			}
 			count++
 			return partition, nil
@@ -165,7 +168,7 @@ func cfgRandomPartitioner(_ *logp.Logger, config *common.Config) (func() partiti
 	}, nil
 }
 
-func cfgRoundRobinPartitioner(_ *logp.Logger, config *common.Config) (func() partitioner, error) {
+func cfgRoundRobinPartitioner(_ *logp.Logger, config *config.C) (func() partitioner, error) {
 	cfg := struct {
 		GroupEvents int `config:"group_events" validate:"min=1"`
 	}{
@@ -178,7 +181,7 @@ func cfgRoundRobinPartitioner(_ *logp.Logger, config *common.Config) (func() par
 	return func() partitioner {
 		N := cfg.GroupEvents
 		count := N
-		partition := rand.Int31()
+		partition := rand.Int32()
 
 		return func(_ *message, numPartitions int32) (int32, error) {
 			if N == count {
@@ -193,7 +196,7 @@ func cfgRoundRobinPartitioner(_ *logp.Logger, config *common.Config) (func() par
 	}, nil
 }
 
-func cfgHashPartitioner(log *logp.Logger, config *common.Config) (func() partitioner, error) {
+func cfgHashPartitioner(log *logp.Logger, config *config.C) (func() partitioner, error) {
 	cfg := struct {
 		Hash   []string `config:"hash"`
 		Random bool     `config:"random"`
@@ -214,12 +217,11 @@ func cfgHashPartitioner(log *logp.Logger, config *common.Config) (func() partiti
 }
 
 func makeHashPartitioner() partitioner {
-	generator := rand.New(rand.NewSource(rand.Int63()))
 	hasher := fnv.New32a()
 
 	return func(msg *message, numPartitions int32) (int32, error) {
 		if msg.key == nil {
-			return int32(generator.Intn(int(numPartitions))), nil
+			return rand.Int32N(numPartitions), nil
 		}
 
 		hash := msg.hash
@@ -233,12 +235,11 @@ func makeHashPartitioner() partitioner {
 		}
 
 		// create positive hash value
-		return hash2Partition(hash, numPartitions)
+		return Hash2Partition(hash, numPartitions), nil
 	}
 }
 
 func makeFieldsHashPartitioner(log *logp.Logger, fields []string, dropFail bool) partitioner {
-	generator := rand.New(rand.NewSource(rand.Int63()))
 	hasher := fnv.New32a()
 
 	return func(msg *message, numPartitions int32) (int32, error) {
@@ -248,7 +249,7 @@ func makeFieldsHashPartitioner(log *logp.Logger, fields []string, dropFail bool)
 
 			var err error
 			for _, field := range fields {
-				err = hashFieldValue(hasher, msg.data.Content.Fields, field)
+				err = HashFieldValue(hasher, msg.data.Content.Fields, field)
 				if err != nil {
 					break
 				}
@@ -260,26 +261,23 @@ func makeFieldsHashPartitioner(log *logp.Logger, fields []string, dropFail bool)
 					return -1, err
 				}
 
-				msg.hash = generator.Uint32()
+				msg.hash = rand.Uint32()
 			} else {
 				msg.hash = hasher.Sum32()
 			}
 			hash = msg.hash
 		}
 
-		return hash2Partition(hash, numPartitions)
+		return Hash2Partition(hash, numPartitions), nil
 	}
 }
 
-func hash2Partition(hash uint32, numPartitions int32) (int32, error) {
-	p := int32(hash)
-	if p < 0 {
-		p = -p
-	}
-	return p % numPartitions, nil
+func Hash2Partition(hash uint32, numPartitions int32) int32 {
+	p := int32(hash) & 0x7FFFFFFF //nolint:gosec // Conversion from int to int32 is safe here.
+	return p % numPartitions
 }
 
-func hashFieldValue(h hash.Hash32, event common.MapStr, field string) error {
+func HashFieldValue(h hash.Hash32, event mapstr.M, field string) error {
 	type stringer interface {
 		String() string
 	}

@@ -21,7 +21,7 @@ import (
 	"fmt"
 	"regexp"
 
-	"github.com/elastic/beats/v7/libbeat/common"
+	"github.com/elastic/elastic-agent-libs/mapstr"
 )
 
 // GeoConfig contains geo configuration data.
@@ -29,14 +29,15 @@ type GeoConfig struct {
 	Name           string `config:"name"`
 	Location       string `config:"location"`
 	ContinentName  string `config:"continent_name"`
+	CountryName    string `config:"country_name"`
 	CountryISOCode string `config:"country_iso_code"`
 	RegionName     string `config:"region_name"`
 	RegionISOCode  string `config:"region_iso_code"`
 	CityName       string `config:"city_name"`
 }
 
-// GeoConfigToMap converts `geo` sections to a `common.MapStr`.
-func GeoConfigToMap(config GeoConfig) (common.MapStr, error) {
+// GeoConfigToMap converts `geo` sections to a `mapstr.M`.
+func GeoConfigToMap(config GeoConfig) (mapstr.M, error) {
 	if len(config.Location) > 0 {
 		// Regexp matching a number with an optional decimal component
 		// Valid numbers: '123', '123.23', etc.
@@ -55,10 +56,11 @@ func GeoConfigToMap(config GeoConfig) (common.MapStr, error) {
 		}
 	}
 
-	geoFields := common.MapStr{
+	geoFields := mapstr.M{
 		"name":             config.Name,
 		"location":         config.Location,
 		"continent_name":   config.ContinentName,
+		"country_name":     config.CountryName,
 		"country_iso_code": config.CountryISOCode,
 		"region_name":      config.RegionName,
 		"region_iso_code":  config.RegionISOCode,

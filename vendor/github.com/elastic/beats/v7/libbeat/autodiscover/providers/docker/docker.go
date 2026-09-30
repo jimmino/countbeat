@@ -15,29 +15,36 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// +build linux darwin windows
+//go:build linux || darwin || windows
 
 package docker
 
 import (
+	"errors"
 	"fmt"
+	"strconv"
+	"sync"
 	"time"
 
-	"github.com/gofrs/uuid"
-	"github.com/pkg/errors"
+	"github.com/gofrs/uuid/v5"
 
 	"github.com/elastic/beats/v7/libbeat/autodiscover"
-	"github.com/elastic/beats/v7/libbeat/autodiscover/builder"
 	"github.com/elastic/beats/v7/libbeat/autodiscover/template"
 	"github.com/elastic/beats/v7/libbeat/common"
-	"github.com/elastic/beats/v7/libbeat/common/bus"
-	"github.com/elastic/beats/v7/libbeat/common/docker"
-	"github.com/elastic/beats/v7/libbeat/common/safemapstr"
-	"github.com/elastic/beats/v7/libbeat/logp"
+
+	"github.com/elastic/beats/v7/pkg/autodiscover/bus"
+	"github.com/elastic/beats/v7/pkg/autodiscover/docker"
+	"github.com/elastic/beats/v7/pkg/autodiscover/utils"
+	"github.com/elastic/elastic-agent-libs/config"
+	"github.com/elastic/elastic-agent-libs/keystore"
+	"github.com/elastic/elastic-agent-libs/logp"
+	"github.com/elastic/elastic-agent-libs/mapstr"
+	"github.com/elastic/elastic-agent-libs/paths"
+	"github.com/elastic/elastic-agent-libs/safemapstr"
 )
 
 func init() {
-	autodiscover.Registry.AddProvider("docker", AutodiscoverBuilder)
+	_ = autodiscover.Registry.AddProvider("docker", AutodiscoverBuilder)
 }
 
 // Provider implements autodiscover provider for docker containers
@@ -49,20 +56,29 @@ type Provider struct {
 	appenders     autodiscover.Appenders
 	watcher       docker.Watcher
 	templates     template.Mapper
-	stop          chan interface{}
+	stop          chan any
 	startListener bus.Listener
 	stopListener  bus.Listener
 	stoppers      map[string]*time.Timer
 	stopTrigger   chan *dockerContainerMetadata
 	logger        *logp.Logger
+	stopWg        sync.WaitGroup
 }
 
 // AutodiscoverBuilder builds and returns an autodiscover provider
-func AutodiscoverBuilder(bus bus.Bus, uuid uuid.UUID, c *common.Config) (autodiscover.Provider, error) {
-	logger := logp.NewLogger("docker")
+func AutodiscoverBuilder(
+	beatName string,
+	bus bus.Bus,
+	uuid uuid.UUID,
+	c *config.C,
+	keystore keystore.Keystore,
+	logger *logp.Logger,
+	path *paths.Path,
+) (autodiscover.Provider, error) {
+	logger = logger.Named("docker")
 
 	errWrap := func(err error) error {
-		return errors.Wrap(err, "error setting up docker autodiscover provider")
+		return fmt.Errorf("error setting up docker autodiscover provider: %w", err)
 	}
 
 	config := defaultConfig()
@@ -76,15 +92,15 @@ func AutodiscoverBuilder(bus bus.Bus, uuid uuid.UUID, c *common.Config) (autodis
 		return nil, errWrap(err)
 	}
 
-	mapper, err := template.NewConfigMapper(config.Templates)
+	mapper, err := template.NewConfigMapper(config.Templates, keystore, nil, logger)
 	if err != nil {
 		return nil, errWrap(err)
 	}
-	if len(mapper) == 0 && !config.Hints.Enabled() {
+	if len(mapper.ConditionMaps) == 0 && !config.Hints.Enabled() {
 		return nil, errWrap(fmt.Errorf("no configs or hints defined for autodiscover provider"))
 	}
 
-	builders, err := autodiscover.NewBuilders(config.Builders, config.Hints)
+	builders, err := autodiscover.NewBuilders(logger, config.Builders, config.Hints, nil, path)
 	if err != nil {
 		return nil, errWrap(err)
 	}
@@ -109,23 +125,25 @@ func AutodiscoverBuilder(bus bus.Bus, uuid uuid.UUID, c *common.Config) (autodis
 		appenders:     appenders,
 		templates:     mapper,
 		watcher:       watcher,
-		stop:          make(chan interface{}),
+		stop:          make(chan any),
 		startListener: start,
 		stopListener:  stop,
 		stoppers:      make(map[string]*time.Timer),
 		stopTrigger:   make(chan *dockerContainerMetadata),
 		logger:        logger,
+		stopWg:        sync.WaitGroup{},
 	}, nil
 }
 
 // Start the autodiscover process
 func (d *Provider) Start() {
-	go func() {
+	d.stopWg.Go(func() {
 		for {
 			select {
 			case <-d.stop:
 				d.startListener.Stop()
 				d.stopListener.Stop()
+				d.watcher.Stop()
 
 				// Stop all timers before closing the channel
 				for _, stopper := range d.stoppers {
@@ -144,7 +162,7 @@ func (d *Provider) Start() {
 				d.stopContainer(target.container, target.metadata)
 			}
 		}
-	}()
+	})
 }
 
 type dockerContainerMetadata struct {
@@ -154,63 +172,72 @@ type dockerContainerMetadata struct {
 
 type dockerMetadata struct {
 	// Old selectors [Deprecated]
-	Docker common.MapStr
+	Docker mapstr.M
 
 	// New ECS-based selectors
-	Container common.MapStr
+	Container mapstr.M
 
 	// Metadata used to enrich events, like ECS-based selectors but can
 	// have modifications like dedotting
-	Metadata common.MapStr
+	Metadata mapstr.M
 }
 
 func (d *Provider) generateMetaDocker(event bus.Event) (*docker.Container, *dockerMetadata) {
 	container, ok := event["container"].(*docker.Container)
 	if !ok {
-		d.logger.Error(errors.New("Couldn't get a container from watcher event"))
+		d.logger.Error(errors.New("couldn't get a container from watcher event"))
 		return nil, nil
 	}
 
 	// Don't dedot selectors, dedot only metadata used for events enrichment
-	labelMap := common.MapStr{}
-	metaLabelMap := common.MapStr{}
+	labelMap := mapstr.M{}
+	metaLabelMap := mapstr.M{}
 	for k, v := range container.Labels {
-		safemapstr.Put(labelMap, k, v)
+		err := safemapstr.Put(labelMap, k, v)
+		if err != nil {
+			d.logger.Debugf("error adding k:v (%v:%v): %v", k, v, err)
+		}
 		if d.config.Dedot {
 			label := common.DeDot(k)
-			metaLabelMap.Put(label, v)
+			_, err := metaLabelMap.Put(label, v)
+			if err != nil {
+				d.logger.Debugf("error adding value (%v): %v", v, err)
+			}
 		} else {
-			safemapstr.Put(metaLabelMap, k, v)
+			err := safemapstr.Put(metaLabelMap, k, v)
+			if err != nil {
+				d.logger.Debugf("error adding k:v (%v:%v): %v", k, v, err)
+			}
 		}
 	}
 
 	meta := &dockerMetadata{
-		Docker: common.MapStr{
-			"container": common.MapStr{
+		Docker: mapstr.M{
+			"container": mapstr.M{
 				"id":     container.ID,
 				"name":   container.Name,
 				"image":  container.Image,
 				"labels": labelMap,
 			},
 		},
-		Container: common.MapStr{
+		Container: mapstr.M{
 			"id":   container.ID,
 			"name": container.Name,
-			"image": common.MapStr{
+			"image": mapstr.M{
 				"name": container.Image,
 			},
 			"labels": labelMap,
 		},
-		Metadata: common.MapStr{
-			"container": common.MapStr{
+		Metadata: mapstr.M{
+			"container": mapstr.M{
 				"id":   container.ID,
 				"name": container.Name,
-				"image": common.MapStr{
+				"image": mapstr.M{
 					"name": container.Image,
 				},
 			},
-			"docker": common.MapStr{
-				"container": common.MapStr{
+			"docker": mapstr.M{
+				"container": mapstr.M{
 					"labels": metaLabelMap,
 				},
 			},
@@ -257,19 +284,19 @@ func (d *Provider) scheduleStopContainer(event bus.Event) {
 }
 
 func (d *Provider) stopContainer(container *docker.Container, meta *dockerMetadata) {
-	if _, ok := d.stoppers[container.ID]; ok {
-		delete(d.stoppers, container.ID)
-	}
+	delete(d.stoppers, container.ID)
 
 	d.emitContainer(container, meta, "stop")
 }
 
 func (d *Provider) emitContainer(container *docker.Container, meta *dockerMetadata, flag string) {
 	var host string
+	var ports mapstr.M
 	if len(container.IPAddresses) > 0 {
 		host = container.IPAddresses[0]
 	}
 
+	events := make([]bus.Event, 0)
 	// Without this check there would be overlapping configurations with and without ports.
 	if len(container.Ports) == 0 {
 		event := bus.Event{
@@ -282,10 +309,15 @@ func (d *Provider) emitContainer(container *docker.Container, meta *dockerMetada
 			"meta":      meta.Metadata,
 		}
 
-		d.publish(event)
+		events = append(events, event)
+	} else {
+		ports = mapstr.M{}
+		for _, port := range container.Ports {
+			ports[strconv.FormatUint(uint64(port.PrivatePort), 10)] = port.PublicPort
+		}
 	}
-
 	// Emit container container and port information
+
 	for _, port := range container.Ports {
 		event := bus.Event{
 			"provider":  d.uuid,
@@ -293,29 +325,44 @@ func (d *Provider) emitContainer(container *docker.Container, meta *dockerMetada
 			flag:        true,
 			"host":      host,
 			"port":      port.PrivatePort,
+			"ports":     ports,
 			"docker":    meta.Docker,
 			"container": meta.Container,
 			"meta":      meta.Metadata,
 		}
-
-		d.publish(event)
+		events = append(events, event)
 	}
+	d.publish(events)
 }
 
-func (d *Provider) publish(event bus.Event) {
-	// Try to match a config
-	if config := d.templates.GetConfig(event); config != nil {
-		event["config"] = config
-	} else {
-		// If no template matches, try builders:
-		if config := d.builders.GetConfig(d.generateHints(event)); config != nil {
-			event["config"] = config
+func (d *Provider) publish(events []bus.Event) {
+	if len(events) == 0 {
+		return
+	}
+
+	configs := make([]*config.C, 0)
+	for _, event := range events {
+		// Try to match a config
+		if config := d.templates.GetConfig(event); config != nil {
+			configs = append(configs, config...)
+		} else {
+			// If there isn't a default template then attempt to use builders
+			e := d.generateHints(event)
+			if config := d.builders.GetConfig(e); config != nil {
+				configs = append(configs, config...)
+			}
 		}
 	}
 
+	// Since all the events belong to the same event ID pick on and add in all the configs
+	event := bus.Event(mapstr.M(events[0]).Clone())
+	// Remove the port to avoid ambiguity during debugging
+	delete(event, "port")
+	delete(event, "ports")
+	event["config"] = configs
+
 	// Call all appenders to append any extra configuration
 	d.appenders.Append(event)
-
 	d.bus.Publish(event)
 }
 
@@ -323,11 +370,14 @@ func (d *Provider) generateHints(event bus.Event) bus.Event {
 	// Try to build a config with enabled builders. Send a provider agnostic payload.
 	// Builders are Beat specific.
 	e := bus.Event{}
-	var dockerMeta common.MapStr
+	var dockerMeta mapstr.M
+	var ok bool
 
-	if rawDocker, err := common.MapStr(event).GetValue("docker.container"); err == nil {
-		dockerMeta = rawDocker.(common.MapStr)
-		e["container"] = dockerMeta
+	if rawDocker, err := mapstr.M(event).GetValue("docker.container"); err == nil {
+		dockerMeta, ok = rawDocker.(mapstr.M)
+		if ok {
+			e["container"] = dockerMeta
+		}
 	}
 
 	if host, ok := event["host"]; ok {
@@ -336,8 +386,15 @@ func (d *Provider) generateHints(event bus.Event) bus.Event {
 	if port, ok := event["port"]; ok {
 		e["port"] = port
 	}
+	if ports, ok := event["ports"]; ok {
+		e["ports"] = ports
+	}
 	if labels, err := dockerMeta.GetValue("labels"); err == nil {
-		hints := builder.GenerateHints(labels.(common.MapStr), "", d.config.Prefix)
+		hints, incorrecthints := utils.GenerateHints(labels.(mapstr.M), "", d.config.Prefix, true, AllSupportedHints) //nolint:errcheck // preserve existing behaviour
+		// We check whether the provided annotation follows the supported format and vocabulary. The check happens for annotations that have prefix co.elastic
+		for _, value := range incorrecthints {
+			d.logger.Debugf("provided hint: %s/%s is not in the supported list", d.config.Prefix, value)
+		}
 		e["hints"] = hints
 	}
 	return e
@@ -346,6 +403,7 @@ func (d *Provider) generateHints(event bus.Event) bus.Event {
 // Stop the autodiscover process
 func (d *Provider) Stop() {
 	close(d.stop)
+	d.stopWg.Wait()
 }
 
 func (d *Provider) String() string {

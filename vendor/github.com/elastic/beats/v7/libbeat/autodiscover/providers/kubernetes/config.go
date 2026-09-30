@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// +build linux darwin windows
+//go:build linux || darwin || windows
 
 package kubernetes
 
@@ -23,43 +23,64 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/elastic/beats/v7/libbeat/common/kubernetes/metadata"
-
 	"github.com/elastic/beats/v7/libbeat/autodiscover/template"
-	"github.com/elastic/beats/v7/libbeat/common"
-	"github.com/elastic/beats/v7/libbeat/common/cfgwarn"
-	"github.com/elastic/beats/v7/libbeat/logp"
+	"github.com/elastic/beats/v7/pkg/autodiscover/kubernetes"
+	"github.com/elastic/beats/v7/pkg/autodiscover/kubernetes/metadata"
+	"github.com/elastic/elastic-agent-libs/config"
+	"github.com/elastic/elastic-agent-libs/logp"
 )
+
+// AllSupportedHints includes the set of all supported hints for both logs and metrics autodiscovery
+var AllSupportedHints = []string{"enabled", "module", "metricsets", "hosts", "period", "timeout", "metrics_path", "username", "password", "stream", "processors", "multiline", "json", "disable", "ssl", "metrics_filters", "raw", "include_lines", "exclude_lines", "fileset", "pipeline", "raw"}
 
 // Config for kubernetes autodiscover provider
 type Config struct {
-	KubeConfig     string        `config:"kube_config"`
+	KubeConfig        string                       `config:"kube_config"`
+	KubeClientOptions kubernetes.KubeClientOptions `config:"kube_client_options"`
+	KubeAdm           bool                         `config:"use_kubeadm"`
+
 	Namespace      string        `config:"namespace"`
 	SyncPeriod     time.Duration `config:"sync_period"`
 	CleanupTimeout time.Duration `config:"cleanup_timeout" validate:"positive"`
 
 	// Needed when resource is a pod
-	HostDeprecated string `config:"host"`
-	Node           string `config:"node"`
+	Node string `config:"node"`
 	// Scope can be either node or cluster.
 	Scope    string `config:"scope"`
 	Resource string `config:"resource"`
 
+	// Unique identifies if this provider enables its templates only when it is elected as leader in a k8s cluster
+	Unique      bool   `config:"unique"`
+	LeaderLease string `config:"leader_lease"`
+	//Parameters to configure election process
+	LeaseDuration time.Duration `config:"leader_leaseduration"`
+	RenewDeadline time.Duration `config:"leader_renewdeadline"`
+	RetryPeriod   time.Duration `config:"leader_retryperiod"`
+
 	Prefix    string                  `config:"prefix"`
-	Hints     *common.Config          `config:"hints"`
-	Builders  []*common.Config        `config:"builders"`
-	Appenders []*common.Config        `config:"appenders"`
+	Hints     *config.C               `config:"hints"`
+	Builders  []*config.C             `config:"builders"`
+	Appenders []*config.C             `config:"appenders"`
 	Templates template.MapperSettings `config:"templates"`
 
 	AddResourceMetadata *metadata.AddResourceMetadataConfig `config:"add_resource_metadata"`
 }
 
+// DefaultCleanupTimeout Public variable, so specific beats (as Filebeat) can set a different cleanup timeout if they need it.
+var DefaultCleanupTimeout time.Duration = 0
+
 func defaultConfig() *Config {
 	return &Config{
-		SyncPeriod:     10 * time.Minute,
-		Resource:       "pod",
-		CleanupTimeout: 60 * time.Second,
-		Prefix:         "co.elastic",
+		SyncPeriod:          10 * time.Minute,
+		KubeAdm:             true,
+		Resource:            "pod",
+		CleanupTimeout:      DefaultCleanupTimeout,
+		Prefix:              "co.elastic",
+		Unique:              false,
+		AddResourceMetadata: metadata.GetDefaultResourceMetadataConfig(),
+		LeaseDuration:       15 * time.Second,
+		RenewDeadline:       10 * time.Second,
+		RetryPeriod:         2 * time.Second,
 	}
 }
 
@@ -74,12 +95,6 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("no configs or hints defined for autodiscover provider")
 	}
 
-	// Check if host is being defined and change it to node instead.
-	if c.Node == "" && c.HostDeprecated != "" {
-		c.Node = c.HostDeprecated
-		cfgwarn.Deprecate("8.0", "`host` will be deprecated, use `node` instead")
-	}
-
 	// Check if resource is either node or pod. If yes then default the scope to "node" if not provided.
 	// Default the scope to "cluster" for everything else.
 	switch c.Resource {
@@ -90,7 +105,7 @@ func (c *Config) Validate() error {
 
 	default:
 		if c.Scope == "node" {
-			logp.L().Warnf("can not set scope to `node` when using resource %s. resetting scope to `cluster`", c.Resource)
+			logp.L().Warnf("can not set scope to `node` when using resource %s. resetting scope to `cluster`", c.Resource) //nolint:forbidigo // validation fallback logging
 		}
 		c.Scope = "cluster"
 	}
@@ -100,4 +115,11 @@ func (c *Config) Validate() error {
 	}
 
 	return nil
+}
+
+// checkUnsupportedParams checks if unsupported/deprecated/discouraged parameters are set and logs a warning
+func (c Config) checkUnsupportedParams(logger *logp.Logger) {
+	if c.Unique && c.Scope != "cluster" {
+		logger.Warn("can only set `unique` when scope is `cluster`")
+	}
 }

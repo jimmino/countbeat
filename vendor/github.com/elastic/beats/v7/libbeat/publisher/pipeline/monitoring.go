@@ -17,84 +17,101 @@
 
 package pipeline
 
-import "github.com/elastic/beats/v7/libbeat/monitoring"
+import (
+	"github.com/elastic/elastic-agent-libs/monitoring"
+)
 
 type observer interface {
 	pipelineObserver
 	clientObserver
-	queueObserver
-	outputObserver
+	retryObserver
 
 	cleanup()
 }
 
 type pipelineObserver interface {
+	// A new client connected to the pipeline via (*Pipeline).ConnectWith.
 	clientConnected()
-	clientClosing()
+	// An open pipeline client received a Close() call.
 	clientClosed()
 }
 
 type clientObserver interface {
+	// The client received a Publish call
 	newEvent()
+	// An event was filtered by processors before being published
 	filteredEvent()
+	// An event was published to the queue
 	publishedEvent()
+	// An event was rejected by the queue
 	failedPublishEvent()
+	eventsACKed(count int)
 }
 
-type queueObserver interface {
-	queueACKed(n int)
-}
-
-type outputObserver interface {
-	updateOutputGroup()
-	eventsFailed(int)
+type retryObserver interface {
+	// Events encountered too many errors and were permanently dropped.
 	eventsDropped(int)
+	// Events were sent back to an output worker after an earlier failure.
 	eventsRetry(int)
-	outBatchSend(int)
-	outBatchACKed(int)
 }
 
-// metricsObserver is used by many component in the publisher pipeline, to report
-// internal events. The oberserver can call registered global event handlers or
+// metricsObserver is used by many components in the publisher pipeline, to report
+// internal events. The observer can call registered global event handlers or
 // updated shared counters/metrics for reporting.
 // All events required for reporting events/metrics on the pipeline-global level
 // are defined by observer. The components are only allowed to serve localized
 // event-handlers only (e.g. the client centric events callbacks)
 type metricsObserver struct {
 	metrics *monitoring.Registry
+	vars    metricsObserverVars
+}
 
+type metricsObserverVars struct {
 	// clients metrics
 	clients *monitoring.Uint
 
-	// events publish/dropped stats
-	events, filtered, published, failed *monitoring.Uint
-	dropped, retry                      *monitoring.Uint // (retryer) drop/retry counters
-	activeEvents                        *monitoring.Uint
+	// eventsTotal publish/dropped stats
+	eventsTotal, eventsFiltered, eventsPublished, eventsFailed *monitoring.Uint
 
-	// queue metrics
-	ackedQueue *monitoring.Uint
+	eventsDropped, eventsRetry *monitoring.Uint // (retryer) drop/retry counters
+	activeEvents               *monitoring.Uint
 }
 
 func newMetricsObserver(metrics *monitoring.Registry) *metricsObserver {
-	reg := metrics.GetRegistry("pipeline")
-	if reg == nil {
-		reg = metrics.NewRegistry("pipeline")
-	}
+	reg := metrics.GetOrCreateRegistry("pipeline")
 
 	return &metricsObserver{
 		metrics: metrics,
-		clients: monitoring.NewUint(reg, "clients"),
+		vars: metricsObserverVars{
+			// (Gauge) clients measures the number of open pipeline clients.
+			clients: monitoring.NewUint(reg, "clients"),
 
-		events:    monitoring.NewUint(reg, "events.total"),
-		filtered:  monitoring.NewUint(reg, "events.filtered"),
-		published: monitoring.NewUint(reg, "events.published"),
-		failed:    monitoring.NewUint(reg, "events.failed"),
-		dropped:   monitoring.NewUint(reg, "events.dropped"),
-		retry:     monitoring.NewUint(reg, "events.retry"),
+			// events.total counts all created events.
+			eventsTotal: monitoring.NewUint(reg, "events.total"),
 
-		ackedQueue: monitoring.NewUint(reg, "queue.acked"),
+			// (Gauge) events.active measures events that have been created, but have
+			// not yet been failed, filtered, or acked/dropped.
+			activeEvents: monitoring.NewUint(reg, "events.active"),
 
-		activeEvents: monitoring.NewUint(reg, "events.active"),
+			// events.filtered counts events that were filtered by processors before
+			// being sent to the queue.
+			eventsFiltered: monitoring.NewUint(reg, "events.filtered"),
+
+			// events.failed counts events that were rejected by the queue, or that
+			// were sent via an already-closed pipeline client.
+			eventsFailed: monitoring.NewUint(reg, "events.failed"),
+
+			// events.published counts events that were accepted by the queue.
+			eventsPublished: monitoring.NewUint(reg, "events.published"),
+
+			// events.retry counts events that an output worker sent back to be
+			// retried.
+			eventsRetry: monitoring.NewUint(reg, "events.retry"),
+
+			// events.dropped counts events that were dropped because errors from
+			// the output workers exceeded the configured maximum retry count.
+			eventsDropped: monitoring.NewUint(reg, "events.dropped"),
+		},
 	}
 }
 
@@ -109,13 +126,10 @@ func (o *metricsObserver) cleanup() {
 //
 
 // (pipeline) pipeline did finish creating a new client instance
-func (o *metricsObserver) clientConnected() { o.clients.Inc() }
-
-// (client) close being called on client
-func (o *metricsObserver) clientClosing() {}
+func (o *metricsObserver) clientConnected() { o.vars.clients.Inc() }
 
 // (client) client finished processing close
-func (o *metricsObserver) clientClosed() { o.clients.Dec() }
+func (o *metricsObserver) clientClosed() { o.vars.clients.Dec() }
 
 //
 // client publish events
@@ -123,62 +137,45 @@ func (o *metricsObserver) clientClosed() { o.clients.Dec() }
 
 // (client) client is trying to publish a new event
 func (o *metricsObserver) newEvent() {
-	o.events.Inc()
-	o.activeEvents.Inc()
+	o.vars.eventsTotal.Inc()
+	o.vars.activeEvents.Inc()
 }
 
 // (client) event is filtered out (on purpose or failed)
 func (o *metricsObserver) filteredEvent() {
-	o.filtered.Inc()
-	o.activeEvents.Dec()
+	o.vars.eventsFiltered.Inc()
+	o.vars.activeEvents.Dec()
 }
 
 // (client) managed to push an event into the publisher pipeline
 func (o *metricsObserver) publishedEvent() {
-	o.published.Inc()
+	o.vars.eventsPublished.Inc()
+}
+
+// (client) number of ACKed events from this client
+func (o *metricsObserver) eventsACKed(n int) {
+	o.vars.activeEvents.Sub(uint64(n))
 }
 
 // (client) client closing down or DropIfFull is set
 func (o *metricsObserver) failedPublishEvent() {
-	o.failed.Inc()
-	o.activeEvents.Dec()
-}
-
-//
-// queue events
-//
-
-// (queue) number of events ACKed by the queue/broker in use
-func (o *metricsObserver) queueACKed(n int) {
-	o.ackedQueue.Add(uint64(n))
-	o.activeEvents.Sub(uint64(n))
+	o.vars.eventsFailed.Inc()
+	o.vars.activeEvents.Dec()
 }
 
 //
 // pipeline output events
 //
 
-// (controller) new output group is about to be loaded
-func (o *metricsObserver) updateOutputGroup() {}
-
-// (retryer) new failed batch has been received
-func (o *metricsObserver) eventsFailed(int) {}
-
 // (retryer) number of events dropped by retryer
 func (o *metricsObserver) eventsDropped(n int) {
-	o.dropped.Add(uint64(n))
+	o.vars.eventsDropped.Add(uint64(n))
 }
 
 // (retryer) number of events pushed to the output worker queue
 func (o *metricsObserver) eventsRetry(n int) {
-	o.retry.Add(uint64(n))
+	o.vars.eventsRetry.Add(uint64(n))
 }
-
-// (output) number of events to be forwarded to the output client
-func (o *metricsObserver) outBatchSend(int) {}
-
-// (output) number of events acked by the output batch
-func (o *metricsObserver) outBatchACKed(int) {}
 
 type emptyObserver struct{}
 
@@ -186,16 +183,11 @@ var nilObserver observer = (*emptyObserver)(nil)
 
 func (*emptyObserver) cleanup()            {}
 func (*emptyObserver) clientConnected()    {}
-func (*emptyObserver) clientClosing()      {}
 func (*emptyObserver) clientClosed()       {}
 func (*emptyObserver) newEvent()           {}
 func (*emptyObserver) filteredEvent()      {}
 func (*emptyObserver) publishedEvent()     {}
 func (*emptyObserver) failedPublishEvent() {}
-func (*emptyObserver) queueACKed(n int)    {}
-func (*emptyObserver) updateOutputGroup()  {}
-func (*emptyObserver) eventsFailed(int)    {}
+func (*emptyObserver) eventsACKed(n int)   {}
 func (*emptyObserver) eventsDropped(int)   {}
 func (*emptyObserver) eventsRetry(int)     {}
-func (*emptyObserver) outBatchSend(int)    {}
-func (*emptyObserver) outBatchACKed(int)   {}

@@ -18,13 +18,23 @@
 package beat
 
 import (
-	"github.com/elastic/beats/v7/libbeat/common"
+	"time"
+
+	"github.com/elastic/beats/v7/libbeat/api"
+	"github.com/elastic/beats/v7/libbeat/beatmonitoring"
+	"github.com/elastic/beats/v7/libbeat/common/reload"
+	"github.com/elastic/beats/v7/libbeat/features"
+	"github.com/elastic/beats/v7/libbeat/instrumentation"
 	"github.com/elastic/beats/v7/libbeat/management"
+	"github.com/elastic/beats/v7/libbeat/version"
+	"github.com/elastic/elastic-agent-libs/config"
+	"github.com/elastic/elastic-agent-libs/keystore"
+	"github.com/elastic/elastic-agent-libs/useragent"
 )
 
 // Creator initializes and configures a new Beater instance used to execute
 // the beat's run-loop.
-type Creator func(*Beat, *common.Config) (Beater, error)
+type Creator func(*Beat, *config.C) (Beater, error)
 
 // Beater is the interface that must be implemented by every Beat. A Beater
 // provides the main Run-loop and a Stop method to break the Run-loop.
@@ -37,6 +47,14 @@ type Creator func(*Beat, *common.Config) (Beater, error)
 // The Stop() method is invoked the first time (and only the first time) a
 // shutdown signal is received. The Stop()-method normally will stop the Run()-loop,
 // such that the beat can gracefully shutdown.
+//
+// Shutdown ownership: the Beater owns shutdown sequencing. On Stop, the Beater
+// is responsible for closing the inputs/clients it connected to the publisher
+// pipeline before Run returns, so that final events can be published and their
+// acknowledgments finalized. The framework disconnects the publisher pipeline
+// only after Run returns; a Beater must not assume the pipeline is still
+// connected once it has been told to stop. See
+// https://github.com/elastic/beats/issues/49794.
 type Beater interface {
 	// The main event loop. This method should block until signalled to stop by an
 	// invocation of the Stop() method.
@@ -53,6 +71,8 @@ type Beat struct {
 	Info      Info     // beat metadata.
 	Publisher Pipeline // Publisher pipeline
 
+	Monitoring beatmonitoring.Monitoring
+
 	InSetupCmd bool // this is set to true when the `setup` command is called
 
 	OverwritePipelinesCallback OverwritePipelinesCallback // ingest pipeline loader callback
@@ -61,19 +81,88 @@ type Beat struct {
 	//      pipeline and ML jobs.
 	Config *BeatConfig // Common Beat configuration data.
 
-	BeatConfig *common.Config // The beat's own configuration section
+	// OutputConfigReloader may be set by a Creator to watch for output config changes.
+	//
+	// This reloader is called in addition to libbeat's internal output reloader, which
+	// is responsible for reconfiguring Publisher.
+	OutputConfigReloader reload.Reloadable
+
+	BeatConfig *config.C // The beat's own configuration section
 
 	Fields []byte // Data from fields.yml
 
-	ConfigManager management.ConfigManager // config manager
+	Manager management.Manager // manager
+
+	Keystore keystore.Keystore
+
+	Instrumentation instrumentation.Instrumentation // instrumentation holds an APM agent for capturing and reporting traces
+
+	API      *api.Server      // API server. This is nil unless the http endpoint is enabled.
+	Registry *reload.Registry // input, & output registry for configuration manager, should be instantiated in NewBeat
+
+	// ShutdownTimeout, when set by a Creator, tells the framework how long the
+	// Beater may take to drain in-flight events (and persist their cursors)
+	// during shutdown before the publisher pipeline is force-disconnected. The
+	// framework's shutdown watchdog waits at least this long (plus a fixed grace
+	// margin) for beater.Run to return before forcing a disconnect, so a
+	// configured shutdown_timeout is not cut short. Zero means use the default
+	// grace period. See https://github.com/elastic/beats/issues/49794.
+	ShutdownTimeout time.Duration
+}
+
+func (beat *Beat) userAgentMode() useragent.AgentManagementMode {
+	if beat.Manager == nil {
+		return useragent.AgentManagementModeUnknown
+	}
+	if !beat.Manager.Enabled() {
+		return useragent.AgentManagementModeStandalone
+	}
+
+	info := beat.Manager.AgentInfo()
+	switch info.ManagedMode {
+	case management.AgentManagedMode_MANAGED:
+		return useragent.AgentManagementModeManaged
+	case management.AgentManagedMode_STANDALONE:
+		return useragent.AgentManagementModeUnmanaged
+	}
+	// this is probably not reachable
+	return useragent.AgentManagementModeUnknown
+}
+
+func (beat *Beat) userAgentUnprivilegedMode() useragent.AgentUnprivilegedMode {
+	if beat.Manager == nil || !beat.Manager.Enabled() {
+		return useragent.AgentUnprivilegedModeUnknown
+	}
+	if beat.Manager.AgentInfo().Unprivileged {
+		return useragent.AgentUnprivilegedModeUnprivileged
+	}
+	return useragent.AgentUnprivilegedModePrivileged
+}
+
+// GenerateUserAgent populates the UserAgent field on the beat.Info struct
+func (beat *Beat) GenerateUserAgent() {
+	userAgentProduct := "Libbeat"
+	if beat.Info.Beat != "" {
+		userAgentProduct = beat.Info.Beat
+	}
+
+	mode := beat.userAgentMode()
+	unprivileged := beat.userAgentUnprivilegedMode()
+
+	var uaOpts []string
+	if features.IsElasticsearchStateStoreEnabled() {
+		uaOpts = append(uaOpts, "agentless")
+	}
+	beat.Info.UserAgent = useragent.UserAgentWithBeatTelemetry(userAgentProduct, version.GetDefaultVersion(),
+		mode, unprivileged, beat.Info.FIPSDistribution, uaOpts...)
 }
 
 // BeatConfig struct contains the basic configuration of every beat
 type BeatConfig struct {
 	// output/publishing related configurations
-	Output common.ConfigNamespace `config:"output"`
+	Output config.Namespace `config:"output"`
 }
 
 // OverwritePipelinesCallback can be used by the Beat to register Ingest pipeline loader
 // for the enabled modules.
-type OverwritePipelinesCallback func(*common.Config) error
+type OverwritePipelinesCallback func(*config.C) error

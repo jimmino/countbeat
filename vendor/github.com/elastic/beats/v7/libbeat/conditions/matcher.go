@@ -21,30 +21,32 @@ import (
 	"fmt"
 
 	"github.com/elastic/beats/v7/libbeat/common/match"
-	"github.com/elastic/beats/v7/libbeat/logp"
+	"github.com/elastic/elastic-agent-libs/logp"
 )
 
 type matcherMap map[string]match.Matcher
-type rawMap map[string]interface{}
+type rawMap map[string]any
 
 // Matcher is a Condition that works with beat's internal notion of a string matcher.
 type Matcher struct {
 	name     string
 	matchers matcherMap
 	raw      rawMap
+	logger   *logp.Logger
 }
 
 // NewMatcherCondition builds a new Matcher with the given human name using the provided config fields.
 // The compiler function will take those fields and compile them.
 func NewMatcherCondition(
 	name string,
-	fields map[string]interface{},
+	fields map[string]any,
 	compile func(string) (match.Matcher, error),
+	logger *logp.Logger,
 ) (condition Matcher, err error) {
 	condition.name = name
-	condition.raw = fields
 	condition.matchers = matcherMap{}
 	condition.raw = rawMap{}
+	condition.logger = logger
 
 	if len(fields) == 0 {
 		return condition, nil
@@ -86,14 +88,14 @@ func (c Matcher) Check(event ValuesMap) bool {
 				return false
 			}
 
-		case []interface{}, []string:
+		case []any, []string:
 			if !matcher.MatchAnyString(v) {
 				return false
 			}
 		default:
 			str, err := ExtractString(value)
 			if err != nil {
-				logp.L().Named(logName).Warnf("unexpected type %T in %v condition as it accepts only strings.", value, c.name)
+				c.logger.Named(logName).Debugf("unexpected type %T in %v condition as it accepts only strings; value=%#v", value, c.name, value)
 				return false
 			}
 

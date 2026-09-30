@@ -18,50 +18,46 @@
 package outputs
 
 import (
+	"context"
 	"errors"
 	"time"
 
 	"github.com/elastic/beats/v7/libbeat/common/backoff"
 	"github.com/elastic/beats/v7/libbeat/publisher"
-	"github.com/elastic/beats/v7/libbeat/testing"
+	"github.com/elastic/elastic-agent-libs/testing"
 )
 
 type backoffClient struct {
-	client NetworkClient
-
-	done    chan struct{}
-	backoff backoff.Backoff
+	client         NetworkClient
+	connectBackoff backoff.Backoff
+	publishBackoff backoff.Backoff
 }
 
 // WithBackoff wraps a NetworkClient, adding exponential backoff support to a network client if connection/publishing failed.
 func WithBackoff(client NetworkClient, init, max time.Duration) NetworkClient {
-	done := make(chan struct{})
-	backoff := backoff.NewEqualJitterBackoff(done, init, max)
 	return &backoffClient{
-		client:  client,
-		done:    done,
-		backoff: backoff,
+		client:         client,
+		connectBackoff: backoff.NewEqualJitterBackoff(init, max),
+		publishBackoff: backoff.NewEqualJitterBackoff(init, max),
 	}
 }
 
-func (b *backoffClient) Connect() error {
-	err := b.client.Connect()
-	backoff.WaitOnError(b.backoff, err)
+func (b *backoffClient) Connect(ctx context.Context) error {
+	err := b.client.Connect(ctx)
+	backoff.WaitOnError(ctx, b.connectBackoff, err)
 	return err
 }
 
 func (b *backoffClient) Close() error {
-	err := b.client.Close()
-	close(b.done)
-	return err
+	return b.client.Close()
 }
 
-func (b *backoffClient) Publish(batch publisher.Batch) error {
-	err := b.client.Publish(batch)
+func (b *backoffClient) Publish(ctx context.Context, batch publisher.Batch) error {
+	err := b.client.Publish(ctx, batch)
 	if err != nil {
 		b.client.Close()
 	}
-	backoff.WaitOnError(b.backoff, err)
+	backoff.WaitOnError(ctx, b.publishBackoff, err)
 	return err
 }
 

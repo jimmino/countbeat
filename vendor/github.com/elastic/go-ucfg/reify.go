@@ -33,55 +33,55 @@ import (
 // value implements the Unpacker interface. Otherwise, Unpack tries to convert
 // the internal value into the target type:
 //
-//  # Primitive types
+//	# Primitive types
 //
-//  bool: requires setting of type bool or string which parses into a
-//     boolean value (true, false, on, off)
-//  int(8, 16, 32, 64): requires any number type convertible to int or a string
-//      parsing to int. Fails if the target value would overflow.
-//  uint(8, 16, 32, 64): requires any number type convertible to int or a string
-//       parsing to int. Fails if the target value is negative or would overflow.
-//  float(32, 64): requires any number type convertible to float or a string
-//       parsing to float. Fails if the target value is negative or would overflow.
-//  string: requires any primitive value which is serialized into a string.
+//	bool: requires setting of type bool or string which parses into a
+//	   boolean value (true, false, on, off)
+//	int(8, 16, 32, 64): requires any number type convertible to int or a string
+//	    parsing to int. Fails if the target value would overflow.
+//	uint(8, 16, 32, 64): requires any number type convertible to int or a string
+//	     parsing to int. Fails if the target value is negative or would overflow.
+//	float(32, 64): requires any number type convertible to float or a string
+//	     parsing to float. Fails if the target value is negative or would overflow.
+//	string: requires any primitive value which is serialized into a string.
 //
-//  # Special types:
+//	# Special types:
 //
-//  time.Duration: requires a number setting converted to seconds or a string
-//       parsed into time.Duration via time.ParseDuration.
-//  *regexp.Regexp: requires a string being compiled into a regular expression
-//       using regexp.Compile.
-//  *Config: requires a Config object to be stored by pointer into the target
-//       value. Can be used to capture a sub-Config without interpreting
-//       the settings yet.
+//	time.Duration: requires a number setting converted to seconds or a string
+//	     parsed into time.Duration via time.ParseDuration.
+//	*regexp.Regexp: requires a string being compiled into a regular expression
+//	     using regexp.Compile.
+//	*Config: requires a Config object to be stored by pointer into the target
+//	     value. Can be used to capture a sub-Config without interpreting
+//	     the settings yet.
 //
-//   # Arrays/Slices:
+//	 # Arrays/Slices:
 //
-//  Requires a Config object with indexed entries. Named entries will not be
-//  unpacked into the Array/Slice. Primitive values will be handled like arrays
-//  of length 1.
+//	Requires a Config object with indexed entries. Named entries will not be
+//	unpacked into the Array/Slice. Primitive values will be handled like arrays
+//	of length 1.
 //
-//  # Map
+//	# Map
 //
-//  Requires a Config object with all named top-level entries being unpacked into
-//  the map.
+//	Requires a Config object with all named top-level entries being unpacked into
+//	the map.
 //
-//  # Struct
+//	# Struct
 //
-//  Requires a Config object. All named values in the Config object will be unpacked
-//  into the struct its fields, if the name is available in the struct.
-//  A field its name is set using the `config` struct tag (configured by StructTag)
-//  If tag is missing or no field name is configured in the tag, the field name
-//  itself will be used.
-//  If the tag sets the `,ignore` flag, the field will not be overwritten.
-//  If the tag sets the `,inline` or `,squash` flag, Unpack will apply the current
-//  configuration namespace to the fields.
-//  If the tag option `replace` is configured, arrays and *ucfg.Config
-//  convertible fields are replaced by the new values.
-//  If the tag options `append` or `prepend` is used, arrays will be merged by
-//  appending/prepending the new array contents.
-//  The struct tag options `replace`, `append`, and `prepend` overwrites the
-//  global value merging strategy (e.g. ReplaceValues, AppendValues, ...) for all sub-fields.
+//	Requires a Config object. All named values in the Config object will be unpacked
+//	into the struct its fields, if the name is available in the struct.
+//	A field its name is set using the `config` struct tag (configured by StructTag)
+//	If tag is missing or no field name is configured in the tag, the field name
+//	itself will be used.
+//	If the tag sets the `,ignore` flag, the field will not be overwritten.
+//	If the tag sets the `,inline` or `,squash` flag, Unpack will apply the current
+//	configuration namespace to the fields.
+//	If the tag option `replace` is configured, arrays and *ucfg.Config
+//	convertible fields are replaced by the new values.
+//	If the tag options `append` or `prepend` is used, arrays will be merged by
+//	appending/prepending the new array contents.
+//	The struct tag options `replace`, `append`, and `prepend` overwrites the
+//	global value merging strategy (e.g. ReplaceValues, AppendValues, ...) for all sub-fields.
 //
 // When unpacking into a map, primitive, or struct Unpack will call InitDefaults if
 // the type implements the Initializer interface. The Initializer interface is not supported
@@ -109,13 +109,13 @@ import (
 // Struct field validators are set using the `validate` tag (configurable by
 // ValidatorTag). Default validators options are:
 //
-//  required: check value is set and not empty
-//  nonzero: check numeric value != 0 or string/slice not being empty
-//  positive: check numeric value >= 0
-//  min=<value>: check numeric value >= <value>. If target type is time.Duration,
-//       <value> can be a duration.
-//  max=<value>: check numeric value <= <value>. If target type is time.Duration,
-//     <value> can be a duration.
+//	required: check value is set and not empty
+//	nonzero: check numeric value != 0 or string/slice not being empty
+//	positive: check numeric value >= 0
+//	min=<value>: check numeric value >= <value>. If target type is time.Duration,
+//	     <value> can be a duration.
+//	max=<value>: check numeric value <= <value>. If target type is time.Duration,
+//	   <value> can be a duration.
 //
 // If a config value is not the convertible to the target type, or overflows the
 // target type, Unpack will abort immediately and return the appropriate error.
@@ -126,14 +126,14 @@ import (
 // When unpacking into an interface{} value, Unpack will store a value of one of
 // these types in the value:
 //
-//   bool for boolean values
-//   int64 for signed integer values
-//   uint64 for unsigned integer values
-//   float64 for floating point values
-//   string for string values
-//   []interface{} for list-only Config objects
-//   map[string]interface{} for Config objects
-//   nil for pointers if key has a nil value
+//	bool for boolean values
+//	int64 for signed integer values
+//	uint64 for unsigned integer values
+//	float64 for floating point values
+//	string for string values
+//	[]interface{} for list-only Config objects
+//	map[string]interface{} for Config objects
+//	nil for pointers if key has a nil value
 func (c *Config) Unpack(to interface{}, options ...Option) error {
 	opts := makeOptions(options)
 
@@ -147,12 +147,17 @@ func (c *Config) Unpack(to interface{}, options ...Option) error {
 	vTo := reflect.ValueOf(to)
 
 	k := vTo.Kind()
-	isValid := to != nil && (k == reflect.Ptr || k == reflect.Map)
+	isValid := k == reflect.Ptr || k == reflect.Map
 	if !isValid {
 		return raisePointerRequired(vTo)
 	}
 
 	return reifyInto(opts, vTo, c)
+}
+
+// UnpackWithoutOptions method calls the Unpack method without any options provided.
+func (c *Config) UnpackWithoutOptions(to interface{}) error {
+	return c.Unpack(to)
 }
 
 func reifyInto(opts *options, to reflect.Value, from *Config) Error {
@@ -198,13 +203,18 @@ func reifyMap(opts *options, to reflect.Value, from *Config, validators []valida
 
 	fields := from.fields.dict()
 	if len(fields) == 0 {
-		if err := tryRecursiveValidate(to, opts, validators); err != nil {
-			return raiseValidation(from.ctx, from.metadata, "", err)
+		if !opts.noValidate {
+			if err := tryRecursiveValidate(to, opts, validators); err != nil {
+				return raiseValidation(from.ctx, from.metadata, "", err)
+			}
 		}
 		return nil
 	}
 
 	for k, value := range fields {
+		if opts.configuredFields != nil && opts.configuredFields.Has(k) {
+			continue
+		}
 		opts.activeFields = newFieldSet(parentFields)
 		key := reflect.ValueOf(k)
 
@@ -221,14 +231,18 @@ func reifyMap(opts *options, to reflect.Value, from *Config, validators []valida
 		if err != nil {
 			return err
 		}
-		to.SetMapIndex(key, v)
+		if v.IsValid() {
+			to.SetMapIndex(key, v)
+		}
 	}
 
-	if err := runValidators(to.Interface(), validators); err != nil {
-		return raiseValidation(from.ctx, from.metadata, "", err)
-	}
-	if err := tryValidate(to); err != nil {
-		return raiseValidation(from.ctx, from.metadata, "", err)
+	if !opts.noValidate {
+		if err := runValidators(to.Interface(), validators); err != nil {
+			return raiseValidation(from.ctx, from.metadata, "", err)
+		}
+		if err := tryValidate(to); err != nil {
+			return raiseValidation(from.ctx, from.metadata, "", err)
+		}
 	}
 
 	return nil
@@ -253,6 +267,26 @@ func reifyStruct(opts *options, orig reflect.Value, cfg *Config) Error {
 	} else {
 		tryInitDefaults(to)
 		numField := to.NumField()
+
+		// Pre-scan struct fields to collect names of all non-inline fields.
+		// These names are excluded from inline maps so that keys already
+		// handled by a named field are not duplicated into an inline map.
+		parentConfigured := opts.configuredFields
+		configured := newFieldSet(parentConfigured)
+		for i := 0; i < numField; i++ {
+			stField := to.Type().Field(i)
+			if !stField.IsExported() {
+				continue
+			}
+			name, tagOpts := parseTags(stField.Tag.Get(opts.tag))
+			if tagOpts.ignore || tagOpts.squash {
+				continue
+			}
+			configured.Add(fieldName(name, stField.Name))
+		}
+		opts.configuredFields = configured
+		defer func() { opts.configuredFields = parentConfigured }()
+
 		for i := 0; i < numField; i++ {
 			fInfo, skip, err := accessField(to, i, opts)
 			if err != nil {
@@ -281,16 +315,25 @@ func reifyStruct(opts *options, orig reflect.Value, cfg *Config) Error {
 					return raiseInlineNeedsObject(cfg, fInfo.name, fInfo.value.Type())
 				}
 			} else {
+				// Non-inline fields live in their own config namespace, so
+				// configuredFields from the parent struct must not filter
+				// keys inside nested maps.
+				savedConfigured := fInfo.options.configuredFields
+				fInfo.options.configuredFields = nil
 				fopts := fieldOptions{opts: fInfo.options, tag: fInfo.tagOptions, validators: fInfo.validatorTags}
-				if err := reifyGetField(cfg, fopts, fInfo.name, fInfo.value, fInfo.ftype); err != nil {
+				err := reifyGetField(cfg, fopts, fInfo.name, fInfo.value, fInfo.ftype)
+				fInfo.options.configuredFields = savedConfigured
+				if err != nil {
 					return err
 				}
 			}
 		}
 	}
 
-	if err := tryValidate(to); err != nil {
-		return raiseValidation(cfg.ctx, cfg.metadata, "", err)
+	if !opts.noValidate {
+		if err := tryValidate(to); err != nil {
+			return raiseValidation(cfg.ctx, cfg.metadata, "", err)
+		}
 	}
 
 	orig.Set(pointerize(orig.Type(), to.Type(), to))
@@ -304,7 +347,7 @@ func reifyGetField(
 	to reflect.Value,
 	fieldType reflect.Type,
 ) Error {
-	p := parsePath(name, opts.opts.pathSep)
+	p := parsePathWithOpts(name, opts.opts)
 	value, err := p.GetValue(cfg, opts.opts)
 	if err != nil {
 		if err.Reason() != ErrMissing {
@@ -317,16 +360,20 @@ func reifyGetField(
 		// When fieldType is a pointer and the value is nil, return nil as the
 		// underlying type should not be allocated.
 		if fieldType.Kind() == reflect.Ptr {
-			if err := tryRecursiveValidate(to, opts.opts, opts.validators); err != nil {
-				return raiseValidation(cfg.ctx, cfg.metadata, name, err)
+			if !opts.opts.noValidate {
+				if err := tryRecursiveValidate(to, opts.opts, opts.validators); err != nil {
+					return raiseValidation(cfg.ctx, cfg.metadata, name, err)
+				}
 			}
 			return nil
 		}
 
 		// Primitive types return early when it doesn't implement the Initializer interface.
 		if fieldType.Kind() != reflect.Struct && !hasInitDefaults(fieldType) {
-			if err := tryRecursiveValidate(to, opts.opts, opts.validators); err != nil {
-				return raiseValidation(cfg.ctx, cfg.metadata, name, err)
+			if !opts.opts.noValidate {
+				if err := tryRecursiveValidate(to, opts.opts, opts.validators); err != nil {
+					return raiseValidation(cfg.ctx, cfg.metadata, name, err)
+				}
 			}
 			return nil
 		}
@@ -343,7 +390,9 @@ func reifyGetField(
 		return err
 	}
 
-	to.Set(pointerize(to.Type(), v.Type(), v))
+	if v.IsValid() {
+		to.Set(pointerize(to.Type(), v.Type(), v))
+	}
 	return nil
 }
 
@@ -592,22 +641,26 @@ func reifyDoArray(
 			if err != nil {
 				return reflect.Value{}, err
 			}
-			to.Index(idx).Set(v)
-		} else {
+			if v.IsValid() {
+				to.Index(idx).Set(v)
+			}
+		} else if !opts.opts.noValidate {
 			if err := tryRecursiveValidate(to.Index(idx), opts.opts, nil); err != nil {
 				return reflect.Value{}, raiseValidation(val.Context(), val.meta(), "", err)
 			}
 		}
 	}
 
-	if err := runValidators(to.Interface(), opts.validators); err != nil {
-		ctx := val.Context()
-		return reflect.Value{}, raiseValidation(ctx, val.meta(), "", err)
-	}
+	if !opts.opts.noValidate {
+		if err := runValidators(to.Interface(), opts.validators); err != nil {
+			ctx := val.Context()
+			return reflect.Value{}, raiseValidation(ctx, val.meta(), "", err)
+		}
 
-	if err := tryValidate(to); err != nil {
-		ctx := val.Context()
-		return reflect.Value{}, raiseValidation(ctx, val.meta(), "", err)
+		if err := tryValidate(to); err != nil {
+			ctx := val.Context()
+			return reflect.Value{}, raiseValidation(ctx, val.meta(), "", err)
+		}
 	}
 
 	return to, nil
@@ -668,12 +721,14 @@ func reifyPrimitive(
 		}
 	}
 
-	if err := runValidators(v.Interface(), opts.validators); err != nil {
-		return reflect.Value{}, raiseValidation(val.Context(), val.meta(), "", err)
-	}
+	if !opts.opts.noValidate {
+		if err := runValidators(v.Interface(), opts.validators); err != nil {
+			return reflect.Value{}, raiseValidation(val.Context(), val.meta(), "", err)
+		}
 
-	if err := tryValidate(v); err != nil {
-		return reflect.Value{}, raiseValidation(val.Context(), val.meta(), "", err)
+		if err := tryValidate(v); err != nil {
+			return reflect.Value{}, raiseValidation(val.Context(), val.meta(), "", err)
+		}
 	}
 
 	return pointerize(t, baseType, chaseValuePointers(v)), nil
@@ -714,7 +769,7 @@ func doReifyPrimitive(
 		if err != nil {
 			return reflect.Value{}, raiseConversion(opts.opts, val, err, "string")
 		}
-		return reflect.ValueOf(s), nil
+		return reflect.ValueOf(s).Convert(baseType), nil
 
 	case extras[baseType] != nil:
 		v, err := extras[baseType](opts, val, baseType)

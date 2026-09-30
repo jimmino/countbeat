@@ -18,10 +18,13 @@
 package mage
 
 import (
-	"io/ioutil"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"gopkg.in/yaml.v2"
 )
 
 var modulesDConfigTemplate = `
@@ -50,12 +53,12 @@ func GenerateDirModulesD() error {
 		}
 		moduleName := parts[1]
 
-		config, err := ioutil.ReadFile(f)
+		config, err := os.ReadFile(f)
 		if err != nil {
 			return err
 		}
 
-		data, err := Expand(modulesDConfigTemplate, map[string]interface{}{
+		data, err := Expand(modulesDConfigTemplate, map[string]any{
 			"Module": moduleName,
 			"Config": string(config),
 		})
@@ -64,10 +67,75 @@ func GenerateDirModulesD() error {
 		}
 
 		target := filepath.Join("modules.d", moduleName+".yml.disabled")
-		err = ioutil.WriteFile(createDir(target), []byte(data), 0644)
+		err = os.WriteFile(createDir(target), []byte(data), 0644)
 		if err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+type datasetDefinition struct {
+	Enabled *bool
+}
+
+type moduleDefinition struct {
+	Name     string                       `yaml:"module"`
+	Filesets map[string]datasetDefinition `yaml:",inline"`
+}
+
+// ValidateDirModulesD validates a modules.d directory containing the
+// <module>.yml.disabled files. It checks that the files are valid
+// yaml and conform to module definitions.
+func ValidateDirModulesD() error {
+	_, err := loadModulesD()
+	return err
+}
+
+// ValidateDirModulesDDatasetsDisabled ensures that all the datasets
+// are disabled by default.
+func ValidateDirModulesDDatasetsDisabled() error {
+	cfgs, err := loadModulesD()
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for path, cfg := range cfgs {
+		// A config.yml is a list of module configurations.
+		for modIdx, mod := range cfg {
+			// A module config is a map of datasets.
+			for dsName, ds := range mod.Filesets {
+				if ds.Enabled == nil || *ds.Enabled {
+					var entry string
+					if len(cfg) > 1 {
+						entry = fmt.Sprintf(" (entry #%d)", modIdx+1)
+					}
+					err = fmt.Errorf("in file '%s': %s module%s dataset %s must be explicitly disabled (needs `enabled: false`)",
+						path, mod.Name, entry, dsName)
+					errs = append(errs, err)
+				}
+			}
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func loadModulesD() (modules map[string][]moduleDefinition, err error) {
+	files, err := filepath.Glob("modules.d/*.disabled")
+	if err != nil {
+		return nil, err
+	}
+	modules = make(map[string][]moduleDefinition, len(files))
+	for _, file := range files {
+		contents, err := os.ReadFile(file)
+		if err != nil {
+			return nil, fmt.Errorf("reading %s: %w", file, err)
+		}
+		var cfg []moduleDefinition
+		if err = yaml.Unmarshal(contents, &cfg); err != nil {
+			return nil, fmt.Errorf("parsing %s as YAML: %w", file, err)
+		}
+		modules[file] = cfg
+	}
+	return modules, nil
 }

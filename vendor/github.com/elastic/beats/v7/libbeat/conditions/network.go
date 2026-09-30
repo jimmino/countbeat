@@ -20,12 +20,11 @@ package conditions
 import (
 	"fmt"
 	"net"
+	"slices"
 	"strings"
 
-	"github.com/pkg/errors"
-
-	"github.com/elastic/beats/v7/libbeat/common"
-	"github.com/elastic/beats/v7/libbeat/logp"
+	"github.com/elastic/elastic-agent-libs/logp"
+	"github.com/elastic/elastic-agent-libs/mapstr"
 )
 
 var (
@@ -96,32 +95,32 @@ func (m multiNetworkMatcher) String() string {
 	return strings.Join(names, " OR ")
 }
 
+func makeMatcher(network string) (networkMatcher, error) {
+	m := singleNetworkMatcher{name: network, netContainsFunc: namedNetworks[network]}
+	if m.netContainsFunc == nil {
+		subnet, err := parseCIDR(network)
+		if err != nil {
+			return nil, err
+		}
+		m.netContainsFunc = subnet.Contains
+	}
+	return m, nil
+}
+
+func invalidTypeError(field string, value any) error {
+	return fmt.Errorf("network condition attempted to set "+
+		"'%v' -> '%v' and encountered unexpected type '%T', only "+
+		"strings or []strings are allowed", field, value, value)
+}
+
 // NewNetworkCondition builds a new Network using the given configuration.
-func NewNetworkCondition(fields map[string]interface{}) (*Network, error) {
+func NewNetworkCondition(fields map[string]any, logger *logp.Logger) (*Network, error) {
 	cond := &Network{
 		fields: map[string]networkMatcher{},
-		log:    logp.NewLogger(logName),
+		log:    logger.Named(logName),
 	}
 
-	makeMatcher := func(network string) (networkMatcher, error) {
-		m := singleNetworkMatcher{name: network, netContainsFunc: namedNetworks[network]}
-		if m.netContainsFunc == nil {
-			subnet, err := parseCIDR(network)
-			if err != nil {
-				return nil, err
-			}
-			m.netContainsFunc = subnet.Contains
-		}
-		return m, nil
-	}
-
-	invalidTypeError := func(field string, value interface{}) error {
-		return fmt.Errorf("network condition attempted to set "+
-			"'%v' -> '%v' and encountered unexpected type '%T', only "+
-			"strings or []strings are allowed", field, value, value)
-	}
-
-	for field, value := range common.MapStr(fields).Flatten() {
+	for field, value := range mapstr.M(fields).Flatten() {
 		switch v := value.(type) {
 		case string:
 			m, err := makeMatcher(v)
@@ -129,7 +128,7 @@ func NewNetworkCondition(fields map[string]interface{}) (*Network, error) {
 				return nil, err
 			}
 			cond.fields[field] = m
-		case []interface{}:
+		case []any:
 			var matchers multiNetworkMatcher
 			for _, networkIfc := range v {
 				network, ok := networkIfc.(string)
@@ -159,15 +158,17 @@ func (c *Network) Check(event ValuesMap) bool {
 			return false
 		}
 
-		ip := extractIP(value)
-		if ip == nil {
+		ipList := extractIP(value)
+		if len(ipList) == 0 {
 			c.log.Debugf("Invalid IP address in field=%v for network condition", field)
 			return false
 		}
-
-		if !network.Contains(ip) {
+		// match on an "any" basis when we find multiple IPs in the event;
+		// if the network matcher returns true for any seen IP, consider it a match
+		if !slices.ContainsFunc(ipList, network.Contains) {
 			return false
 		}
+
 	}
 
 	return true
@@ -194,19 +195,30 @@ func (c *Network) String() string {
 // parseCIDR parses a network CIDR.
 func parseCIDR(value string) (*net.IPNet, error) {
 	_, mask, err := net.ParseCIDR(value)
-	return mask, errors.Wrap(err, "failed to parse CIDR, values must be "+
-		"an IP address and prefix length, like '192.0.2.0/24' or "+
-		"'2001:db8::/32', as defined in RFC 4632 and RFC 4291.")
+	if err != nil {
+		return mask, fmt.Errorf("failed to parse CIDR, values must be "+
+			"an IP address and prefix length, like '192.0.2.0/24' or "+
+			"'2001:db8::/32', as defined in RFC 4632 and RFC 4291: %w", err)
+	}
+	return mask, nil
 }
 
 // extractIP return an IP address if unk is an IP address string or a net.IP.
 // Otherwise it returns nil.
-func extractIP(unk interface{}) net.IP {
+func extractIP(unk any) []net.IP {
 	switch v := unk.(type) {
 	case string:
-		return net.ParseIP(v)
-	case net.IP:
+		return []net.IP{net.ParseIP(v)}
+	case []net.IP:
 		return v
+	case net.IP:
+		return []net.IP{v}
+	case []string:
+		parsed := make([]net.IP, len(v))
+		for i, rawIP := range v {
+			parsed[i] = net.ParseIP(rawIP)
+		}
+		return parsed
 	default:
 		return nil
 	}

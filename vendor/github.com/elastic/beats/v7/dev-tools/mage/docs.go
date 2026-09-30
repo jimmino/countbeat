@@ -32,7 +32,6 @@ import (
 	"syscall"
 
 	"github.com/magefile/mage/sh"
-	"github.com/pkg/errors"
 )
 
 const (
@@ -67,31 +66,17 @@ func DocsIndexFile(file string) DocsOption {
 // Docs holds the utilities for building documentation.
 var Docs = docsBuilder{}
 
-// FieldDocs generates docs/fields.asciidoc from the specified fields.yml file.
+// FieldDocs generates exported-fields.md from the specified fields.yml file.
 func (docsBuilder) FieldDocs(fieldsYML string) error {
-	// Run the docs_collector.py script.
-	ve, err := PythonVirtualenv()
+	docsDir, err := DocsDir()
 	if err != nil {
 		return err
 	}
 
-	python, err := LookVirtualenvPath(ve, pythonExe)
-	if err != nil {
-		return err
-	}
+	outputPath := filepath.Join(docsDir, "reference", BeatName)
 
-	esBeats, err := ElasticBeatsDir()
-	if err != nil {
-		return err
-	}
-
-	// TODO: Port this script to Go.
-	log.Println(">> Generating docs/fields.asciidoc for", BeatName)
-	return sh.Run(python, LibbeatDir("scripts/generate_fields_docs.py"),
-		fieldsYML,                     // Path to fields.yml.
-		BeatName,                      // Beat title.
-		esBeats,                       // Path to general beats folder.
-		"--output_path", OSSBeatDir()) // It writes to {output_path}/docs/fields.asciidoc.
+	log.Println(">> Generating exported-fields.md for", BeatName)
+	return GenerateFieldsDocs(fieldsYML, outputPath, BeatName)
 }
 
 func (b docsBuilder) AsciidocBook(opts ...DocsOption) error {
@@ -140,14 +125,18 @@ func (b docsBuilder) AsciidocBook(opts ...DocsOption) error {
 		srv := b.servePreview(htmlDir)
 		url := "http://" + srv.Addr
 		fmt.Println("Serving docs preview at", url)
-		b.openBrowser(url)
+		if err := b.openBrowser(url); err != nil {
+			return err
+		}
 
 		// Wait
 		fmt.Println("Ctrl+C to stop")
 		sigs := make(chan os.Signal, 1)
 		signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 		<-sigs
-		srv.Shutdown(context.Background())
+		if err := srv.Shutdown(context.Background()); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -178,7 +167,7 @@ func (docsBuilder) servePreview(dir string) *http.Server {
 
 	go func() {
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			panic(errors.Wrap(err, "failed to start docs preview"))
+			panic(fmt.Errorf("failed to start docs preview: %w", err))
 		}
 	}()
 

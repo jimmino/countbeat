@@ -10,10 +10,9 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"go/build"
 	"go/scanner"
 	"io"
-	"io/ioutil"
+	"io/fs"
 	"log"
 	"os"
 	"os/exec"
@@ -21,7 +20,10 @@ import (
 	"runtime"
 	"runtime/pprof"
 	"strings"
+	"testing"
 
+	"golang.org/x/telemetry/counter"
+	"golang.org/x/tools/internal/gocommand"
 	"golang.org/x/tools/internal/imports"
 )
 
@@ -43,14 +45,8 @@ var (
 		TabIndent: true,
 		Comments:  true,
 		Fragment:  true,
-		// This environment, and its caches, will be reused for the whole run.
 		Env: &imports.ProcessEnv{
-			GOPATH:      build.Default.GOPATH,
-			GOROOT:      build.Default.GOROOT,
-			GOFLAGS:     os.Getenv("GOFLAGS"),
-			GO111MODULE: os.Getenv("GO111MODULE"),
-			GOPROXY:     os.Getenv("GOPROXY"),
-			GOSUMDB:     os.Getenv("GOSUMDB"),
+			GocmdRunner: &gocommand.Runner{},
 		},
 	}
 	exitCode = 0
@@ -58,7 +54,7 @@ var (
 
 func init() {
 	flag.BoolVar(&options.AllErrors, "e", false, "report all errors (not just the first 10 on different lines)")
-	flag.StringVar(&options.Env.LocalPrefix, "local", "", "put imports beginning with this string after 3rd-party packages; comma-separated list")
+	flag.StringVar(&options.LocalPrefix, "local", "", "put imports beginning with this string after 3rd-party packages; comma-separated list")
 	flag.BoolVar(&options.FormatOnly, "format-only", false, "if true, don't fix imports and only format. In this mode, goimports is effectively gofmt, with the addition that imports are grouped into sections.")
 }
 
@@ -73,10 +69,10 @@ func usage() {
 	os.Exit(2)
 }
 
-func isGoFile(f os.FileInfo) bool {
+func isGoFile(d fs.DirEntry) bool {
 	// ignore non-Go files
-	name := f.Name()
-	return !f.IsDir() && !strings.HasPrefix(name, ".") && strings.HasSuffix(name, ".go")
+	name := d.Name()
+	return !d.IsDir() && !strings.HasPrefix(name, ".") && strings.HasSuffix(name, ".go")
 }
 
 // argumentType is which mode goimports was invoked as.
@@ -112,7 +108,7 @@ func processFile(filename string, in io.Reader, out io.Writer, argType argumentT
 		in = f
 	}
 
-	src, err := ioutil.ReadAll(in)
+	src, err := io.ReadAll(in)
 	if err != nil {
 		return err
 	}
@@ -160,7 +156,12 @@ func processFile(filename string, in io.Reader, out io.Writer, argType argumentT
 				// filename is "<standard input>"
 				return errors.New("can't use -w on stdin")
 			}
-			err = ioutil.WriteFile(filename, res, 0)
+			// On Windows, we need to re-set the permissions from the file. See golang/go#38225.
+			var perms os.FileMode
+			if fi, err := os.Stat(filename); err == nil {
+				perms = fi.Mode() & os.ModePerm
+			}
+			err = os.WriteFile(filename, res, perms)
 			if err != nil {
 				return err
 			}
@@ -185,8 +186,8 @@ func processFile(filename string, in io.Reader, out io.Writer, argType argumentT
 	return err
 }
 
-func visitFile(path string, f os.FileInfo, err error) error {
-	if err == nil && isGoFile(f) {
+func visitFile(path string, d fs.DirEntry, err error) error {
+	if err == nil && isGoFile(d) {
 		err = processFile(path, nil, os.Stdout, multipleArg)
 	}
 	if err != nil {
@@ -196,17 +197,23 @@ func visitFile(path string, f os.FileInfo, err error) error {
 }
 
 func walkDir(path string) {
-	filepath.Walk(path, visitFile)
+	filepath.WalkDir(path, visitFile)
 }
 
 func main() {
+	// Measure how many people still use goimports.
+	// (See https://go.dev/issue/78671 for one.)
+	counter.Open()
+	counter.Inc("tools/cmd:goimports")
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
 	// call gofmtMain in a separate function
 	// so that it can use defer and have them
 	// run before the exit.
 	gofmtMain()
-	os.Exit(exitCode)
+	if !testing.Testing() {
+		os.Exit(exitCode)
+	}
 }
 
 // parseFlags parses command line flags and returns the paths to process.
@@ -297,7 +304,7 @@ func gofmtMain() {
 }
 
 func writeTempFile(dir, prefix string, data []byte) (string, error) {
-	file, err := ioutil.TempFile(dir, prefix)
+	file, err := os.CreateTemp(dir, prefix)
 	if err != nil {
 		return "", err
 	}
@@ -363,8 +370,8 @@ func replaceTempFilename(diff []byte, filename string) ([]byte, error) {
 	}
 	// Always print filepath with slash separator.
 	f := filepath.ToSlash(filename)
-	bs[0] = []byte(fmt.Sprintf("--- %s%s", f+".orig", t0))
-	bs[1] = []byte(fmt.Sprintf("+++ %s%s", f, t1))
+	bs[0] = fmt.Appendf(nil, "--- %s%s", f+".orig", t0)
+	bs[1] = fmt.Appendf(nil, "+++ %s%s", f, t1)
 	return bytes.Join(bs, []byte{'\n'}), nil
 }
 

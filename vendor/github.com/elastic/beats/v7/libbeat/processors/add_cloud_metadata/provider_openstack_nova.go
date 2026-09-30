@@ -18,7 +18,8 @@
 package add_cloud_metadata
 
 import (
-	"github.com/elastic/beats/v7/libbeat/common"
+	conf "github.com/elastic/elastic-agent-libs/config"
+	"github.com/elastic/elastic-agent-libs/mapstr"
 )
 
 const (
@@ -32,16 +33,27 @@ const (
 // OpenStack Nova Metadata Service
 // Document https://docs.openstack.org/nova/latest/user/metadata-service.html
 var openstackNovaMetadataFetcher = provider{
-	Name: "openstack-nova",
+	Name:           "openstack-nova",
+	DefaultEnabled: true,
+	Create:         buildOpenstackNovaCreate("http"),
+}
 
-	Local: true,
+var openstackNovaSSLMetadataFetcher = provider{
+	Name:           "openstack-nova-ssl",
+	DefaultEnabled: true,
+	Create:         buildOpenstackNovaCreate("https"),
+}
 
-	Create: func(provider string, c *common.Config) (metadataFetcher, error) {
-		osSchema := func(m map[string]interface{}) common.MapStr {
-			return common.MapStr(m)
+func buildOpenstackNovaCreate(scheme string) func(provider string, c *conf.C) (metadataFetcher, error) {
+	return func(provider string, c *conf.C) (metadataFetcher, error) {
+		osSchema := func(m map[string]interface{}) mapstr.M {
+			m["service"] = mapstr.M{
+				"name": "Nova",
+			}
+			return mapstr.M{"cloud": m}
 		}
 
-		urls, err := getMetadataURLs(c, metadataHost, []string{
+		urls, err := getMetadataURLsWithScheme(c, scheme, metadataHost, []string{
 			osMetadataInstanceIDURI,
 			osMetadataInstanceTypeURI,
 			osMetadataHostnameURI,
@@ -71,5 +83,5 @@ var openstackNovaMetadataFetcher = provider{
 		}
 		fetcher := &httpMetadataFetcher{"openstack", nil, responseHandlers, osSchema}
 		return fetcher, nil
-	},
+	}
 }

@@ -58,12 +58,19 @@ var Test goTest = runGoTest
 
 // GetModuleName returns the name of the module.
 func GetModuleName() (string, error) {
-	lines, err := getLines(callGo(nil, "list", "-m"))
+	lines, err := getLines(callGo(
+		// Disabling the Go workspace prevents 'go list' from listing all
+		// modules within the workspace.
+		map[string]string{"GOWORK": "off"},
+		"list",
+		"-m"))
 	if err != nil {
 		return "", err
 	}
+
 	if len(lines) != 1 {
-		return "", fmt.Errorf("unexpected number of lines")
+		return "", fmt.Errorf("expected 'go list -m' to return 1 line, got %d",
+			len(lines))
 	}
 	return lines[0], nil
 }
@@ -83,6 +90,25 @@ func ListDeps(pkg string) ([]string, error) {
 	const tmpl = `{{if not .Standard}}{{.ImportPath}}{{end}}`
 
 	return getLines(callGo(nil, "list", "-deps", "-f", tmpl, pkg))
+}
+
+// ListDepsLocation calls `go list -dep` for every package spec given.
+func ListDepsLocation(pkg string) (map[string]string, error) {
+	const tmpl = `{{if not .Standard}}{{.ImportPath}};{{.Dir}}{{end}}`
+
+	lines, err := getLines(callGo(nil, "list", "-deps", "-f", tmpl, pkg))
+	if err != nil {
+		return nil, err
+	}
+	deps := make(map[string]string, len(lines))
+	for _, l := range lines {
+		parts := strings.Split(l, ";")
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("invalid number of parts")
+		}
+		deps[parts[0]] = parts[1]
+	}
+	return deps, nil
 }
 
 // ListTestFiles lists all go and cgo test files available in a package.
@@ -137,7 +163,7 @@ func HasTests(pkg string) (bool, error) {
 }
 
 func (goTest) WithCoverage(to string) ArgOpt {
-	return combine(flagArg("-cover", ""), flagArgIf("-test.coverprofile", to))
+	return combine(flagArg("-cover", ""), flagArgIf("--test.coverprofile", to))
 }
 func (goTest) Short(b bool) ArgOpt        { return flagBoolIf("-test.short", b) }
 func (goTest) Use(bin string) ArgOpt      { return extraArgIf("use", bin) }
@@ -196,10 +222,6 @@ func runVGo(cmd string, args *Args) error {
 		_, err := sh.Exec(env, os.Stdout, os.Stderr, cmd, args...)
 		return err
 	}, cmd, args)
-}
-
-func runGo(cmd string, args *Args) error {
-	return execGoWith(sh.RunWith, cmd, args)
 }
 
 func execGoWith(

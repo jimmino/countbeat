@@ -19,15 +19,14 @@ package pipeline
 
 import (
 	"flag"
-	"fmt"
+
+	"go.elastic.co/apm/v2"
 
 	"github.com/elastic/beats/v7/libbeat/beat"
-	"github.com/elastic/beats/v7/libbeat/common"
-	"github.com/elastic/beats/v7/libbeat/logp"
-	"github.com/elastic/beats/v7/libbeat/monitoring"
 	"github.com/elastic/beats/v7/libbeat/outputs"
 	"github.com/elastic/beats/v7/libbeat/publisher/processing"
-	"github.com/elastic/beats/v7/libbeat/publisher/queue"
+	"github.com/elastic/elastic-agent-libs/logp"
+	"github.com/elastic/elastic-agent-libs/monitoring"
 )
 
 // Global pipeline module for loading the main pipeline from a configuration object
@@ -43,12 +42,13 @@ type Monitors struct {
 	Metrics   *monitoring.Registry
 	Telemetry *monitoring.Registry
 	Logger    *logp.Logger
+	Tracer    *apm.Tracer
 }
 
 // OutputFactory is used by the publisher pipeline to create an output instance.
 // If the group returned can be empty. The pipeline will accept events, but
 // eventually block.
-type OutputFactory func(outputs.Observer) (string, outputs.Group, error)
+type outputFactory func(outputs.Observer) (string, outputs.Group, error)
 
 func init() {
 	flag.BoolVar(&publishDisabled, "N", false, "Disable actual publishing for testing")
@@ -56,6 +56,7 @@ func init() {
 
 // Load uses a Config object to create a new complete Pipeline instance with
 // configured queue and outputs. This is a non-blocking operation, and outputs should connect lazily.
+// Deprecated: Use LoadWithSettings
 func Load(
 	beatInfo beat.Info,
 	monitors Monitors,
@@ -92,17 +93,12 @@ func LoadWithSettings(
 
 	name := beatInfo.Name
 
-	queueBuilder, err := createQueueBuilder(config.Queue, monitors)
-	if err != nil {
-		return nil, err
-	}
-
 	out, err := loadOutput(monitors, makeOutput)
 	if err != nil {
 		return nil, err
 	}
 
-	p, err := New(beatInfo, monitors, queueBuilder, out, settings)
+	p, err := New(beatInfo, monitors, config.Queue, out, settings)
 	if err != nil {
 		return nil, err
 	}
@@ -113,13 +109,8 @@ func LoadWithSettings(
 
 func loadOutput(
 	monitors Monitors,
-	makeOutput OutputFactory,
+	makeOutput outputFactory,
 ) (outputs.Group, error) {
-	log := monitors.Logger
-	if log == nil {
-		log = logp.L()
-	}
-
 	if publishDisabled {
 		return outputs.Group{}, nil
 	}
@@ -135,11 +126,15 @@ func loadOutput(
 	if monitors.Metrics != nil {
 		metrics = monitors.Metrics.GetRegistry("output")
 		if metrics != nil {
-			metrics.Clear()
+			err := metrics.Clear()
+			if err != nil {
+				return outputs.Group{}, err
+			}
+
 		} else {
-			metrics = monitors.Metrics.NewRegistry("output")
+			metrics = monitors.Metrics.GetOrCreateRegistry("output")
 		}
-		outStats = outputs.NewStats(metrics)
+		outStats = outputs.NewStats(metrics, monitors.Logger)
 	}
 
 	outName, out, err := makeOutput(outStats)
@@ -153,41 +148,17 @@ func loadOutput(
 	if monitors.Telemetry != nil {
 		telemetry := monitors.Telemetry.GetRegistry("output")
 		if telemetry != nil {
-			telemetry.Clear()
+			err := telemetry.Clear()
+			if err != nil {
+				return outputs.Group{}, err
+			}
 		} else {
-			telemetry = monitors.Telemetry.NewRegistry("output")
+			telemetry = monitors.Telemetry.GetOrCreateRegistry("output")
 		}
 		monitoring.NewString(telemetry, "name").Set(outName)
+		monitoring.NewInt(telemetry, "batch_size").Set(int64(out.BatchSize))
+		monitoring.NewInt(telemetry, "clients").Set(int64(len(out.Clients)))
 	}
 
 	return out, nil
-}
-
-func createQueueBuilder(
-	config common.ConfigNamespace,
-	monitors Monitors,
-) (func(queue.ACKListener) (queue.Queue, error), error) {
-	queueType := defaultQueueType
-	if b := config.Name(); b != "" {
-		queueType = b
-	}
-
-	queueFactory := queue.FindFactory(queueType)
-	if queueFactory == nil {
-		return nil, fmt.Errorf("'%v' is no valid queue type", queueType)
-	}
-
-	queueConfig := config.Config()
-	if queueConfig == nil {
-		queueConfig = common.NewConfig()
-	}
-
-	if monitors.Telemetry != nil {
-		queueReg := monitors.Telemetry.NewRegistry("queue")
-		monitoring.NewString(queueReg, "name").Set(queueType)
-	}
-
-	return func(ackListener queue.ACKListener) (queue.Queue, error) {
-		return queueFactory(ackListener, monitors.Logger, queueConfig)
-	}, nil
 }

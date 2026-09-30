@@ -18,15 +18,16 @@
 package actions
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
-	"github.com/pkg/errors"
-
 	"github.com/elastic/beats/v7/libbeat/beat"
-	"github.com/elastic/beats/v7/libbeat/common"
 	"github.com/elastic/beats/v7/libbeat/processors"
 	"github.com/elastic/beats/v7/libbeat/processors/checks"
+	conf "github.com/elastic/elastic-agent-libs/config"
+	"github.com/elastic/elastic-agent-libs/logp"
+	"github.com/elastic/elastic-agent-libs/mapstr"
 )
 
 type includeFields struct {
@@ -40,13 +41,13 @@ func init() {
 			checks.AllowedFields("fields", "when")))
 }
 
-func newIncludeFields(c *common.Config) (processors.Processor, error) {
+func newIncludeFields(c *conf.C, log *logp.Logger) (beat.Processor, error) {
 	config := struct {
 		Fields []string `config:"fields"`
 	}{}
 	err := c.Unpack(&config)
 	if err != nil {
-		return nil, fmt.Errorf("fail to unpack the include_fields configuration: %s", err)
+		return nil, fmt.Errorf("fail to unpack the include_fields configuration: %w", err)
 	}
 
 	/* add read only fields if they are not yet */
@@ -67,7 +68,7 @@ func newIncludeFields(c *common.Config) (processors.Processor, error) {
 }
 
 func (f *includeFields) Run(event *beat.Event) (*beat.Event, error) {
-	filtered := common.MapStr{}
+	filtered := mapstr.M{}
 	var errs []string
 
 	for _, field := range f.Fields {
@@ -77,14 +78,14 @@ func (f *includeFields) Run(event *beat.Event) (*beat.Event, error) {
 		}
 
 		// Ignore ErrKeyNotFound errors
-		if err != nil && errors.Cause(err) != common.ErrKeyNotFound {
+		if err != nil && !errors.Is(err, mapstr.ErrKeyNotFound) {
 			errs = append(errs, err.Error())
 		}
 	}
 
 	event.Fields = filtered
 	if len(errs) > 0 {
-		return event, fmt.Errorf(strings.Join(errs, ", "))
+		return event, errors.New(strings.Join(errs, ", "))
 	}
 	return event, nil
 }

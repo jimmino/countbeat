@@ -15,20 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// package cloudid contains functions for parsing the cloud.id and cloud.auth
+// Package cloudid contains functions for parsing the cloud.id and cloud.auth
 // settings and modifying the configuration to take them into account.
 package cloudid
 
 import (
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
 
-	"github.com/pkg/errors"
-
-	"github.com/elastic/beats/v7/libbeat/common"
-	"github.com/elastic/beats/v7/libbeat/logp"
+	"github.com/elastic/elastic-agent-libs/config"
 )
 
 const defaultCloudPort = "443"
@@ -81,12 +79,12 @@ func (c *CloudID) Password() string {
 func (c *CloudID) decode() error {
 	var err error
 	if err = c.decodeCloudID(); err != nil {
-		return errors.Wrapf(err, "invalid cloud id '%v'", c.id)
+		return fmt.Errorf("invalid cloud id '%v': %w", c.id, err)
 	}
 
 	if c.auth != "" {
 		if err = c.decodeCloudAuth(); err != nil {
-			return errors.Wrap(err, "invalid cloud auth")
+			return fmt.Errorf("invalid cloud auth: %w", err)
 		}
 	}
 
@@ -106,19 +104,26 @@ func (c *CloudID) decodeCloudID() error {
 	// 2. base64 decode
 	decoded, err := base64.StdEncoding.DecodeString(cloudID)
 	if err != nil {
-		return errors.Wrapf(err, "base64 decoding failed on %s", cloudID)
+		return fmt.Errorf("base64 decoding failed on %s: %w", cloudID, err)
 	}
 
 	// 3. separate based on `$`
 	words := strings.Split(string(decoded), "$")
 	if len(words) < 3 {
-		return errors.Errorf("Expected at least 3 parts in %s", string(decoded))
+		return fmt.Errorf("Expected at least 3 parts in %s", string(decoded))
 	}
 
 	// 4. extract port from the ES and Kibana host, or use 443 as the default
 	host, port := extractPortFromName(words[0], defaultCloudPort)
 	esID, esPort := extractPortFromName(words[1], port)
 	kbID, kbPort := extractPortFromName(words[2], port)
+
+	// Reject components containing URL-special characters (#, @, ?, /).
+	for _, component := range []string{host, esID, kbID} {
+		if i := strings.IndexAny(component, "#@?/"); i >= 0 {
+			return fmt.Errorf("cloud ID component %q contains invalid character %q", component, component[i])
+		}
+	}
 
 	// 5. form the URLs
 	esURL := url.URL{Scheme: "https", Host: fmt.Sprintf("%s.%s:%s", esID, host, esPort)}
@@ -133,13 +138,13 @@ func (c *CloudID) decodeCloudID() error {
 // decodeCloudAuth splits the c.auth into c.username and c.password.
 func (c *CloudID) decodeCloudAuth() error {
 	cloudAuth := c.auth
-	idx := strings.Index(cloudAuth, ":")
-	if idx < 0 {
+	before, after, ok := strings.Cut(cloudAuth, ":")
+	if !ok {
 		return errors.New("cloud.auth setting doesn't contain `:` to split between username and password")
 	}
 
-	c.username = cloudAuth[0:idx]
-	c.password = cloudAuth[idx+1:]
+	c.username = before
+	c.password = after
 	return nil
 }
 
@@ -147,7 +152,7 @@ func (c *CloudID) decodeCloudAuth() error {
 // output.elasticsearch.hosts, output.elasticsearch.username, output.elasticsearch.password,
 // setup.kibana.host settings based on values derived from the cloud.id and cloud.auth
 // settings.
-func OverwriteSettings(cfg *common.Config) error {
+func OverwriteSettings(cfg *config.C) error {
 
 	cloudID, _ := cfg.String("cloud.id", -1)
 	cloudAuth, _ := cfg.String("cloud.auth", -1)
@@ -157,33 +162,30 @@ func OverwriteSettings(cfg *common.Config) error {
 		return nil
 	}
 
-	logp.Debug("cloudid", "cloud.id: %s, cloud.auth: %s", cloudID, cloudAuth)
 	if cloudID == "" {
-		return errors.New("cloud.auth specified but cloud.id is empty. Please specify both.")
+		return errors.New("cloud.auth specified but cloud.id is empty. Please specify both")
 	}
 
 	// cloudID overwrites
 	cid, err := NewCloudID(cloudID, cloudAuth)
 	if err != nil {
-		return errors.Errorf("Error decoding cloud.id: %v", err)
+		return fmt.Errorf("Error decoding cloud.id: %w", err)
 	}
 
-	logp.Info("Setting Elasticsearch and Kibana URLs based on the cloud id: output.elasticsearch.hosts=%s and setup.kibana.host=%s", cid.esURL, cid.kibURL)
-
-	esURLConfig, err := common.NewConfigFrom([]string{cid.ElasticsearchURL()})
+	esURLConfig, err := config.NewConfigFrom([]string{cid.ElasticsearchURL()})
 	if err != nil {
 		return err
 	}
 
 	// Before enabling the ES output, check that no other output is enabled
 	tmp := struct {
-		Output common.ConfigNamespace `config:"output"`
+		Output config.Namespace `config:"output"`
 	}{}
 	if err := cfg.Unpack(&tmp); err != nil {
 		return err
 	}
 	if out := tmp.Output; out.IsSet() && out.Name() != "elasticsearch" {
-		return errors.Errorf("The cloud.id setting enables the Elasticsearch output, but you already have the %s output enabled in the config", out.Name())
+		return fmt.Errorf("The cloud.id setting enables the Elasticsearch output, but you already have the %s output enabled in the config", out.Name())
 	}
 
 	err = cfg.SetChild("output.elasticsearch.hosts", -1, esURLConfig)

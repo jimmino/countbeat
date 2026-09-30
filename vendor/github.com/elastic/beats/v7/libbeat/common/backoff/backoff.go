@@ -17,18 +17,31 @@
 
 package backoff
 
+import (
+	"context"
+	"time"
+)
+
 // Backoff defines the interface for backoff strategies.
 type Backoff interface {
-	Wait() bool
+	// Wait blocks for a duration of time governed by the backoff strategy.
+	// Wait returns true when the backoff timer completes, or false if the
+	// context is cancelled before the timer expires.
+	Wait(ctx context.Context) bool
+
+	// Reset resets the backoff duration to an initial value governed by the backoff strategy.
 	Reset()
+
+	// Last returns the time when the last call to Wait returned
+	Last() time.Time
 }
 
 // WaitOnError is a convenience method, if an error is received it will block, if not errors is
 // received, the backoff will be resetted.
-func WaitOnError(b Backoff, err error) bool {
+func WaitOnError(ctx context.Context, b Backoff, err error) bool {
 	if err == nil {
 		b.Reset()
 		return true
 	}
-	return b.Wait()
+	return b.Wait(ctx)
 }

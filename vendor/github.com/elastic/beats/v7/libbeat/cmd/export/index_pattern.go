@@ -23,15 +23,15 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/elastic/beats/v7/libbeat/cmd/instance"
-	"github.com/elastic/beats/v7/libbeat/common"
 	"github.com/elastic/beats/v7/libbeat/kibana"
+	libversion "github.com/elastic/elastic-agent-libs/version"
 )
 
 // GenIndexPatternConfigCmd generates an index pattern for Kibana
 func GenIndexPatternConfigCmd(settings instance.Settings) *cobra.Command {
 	genTemplateConfigCmd := &cobra.Command{
 		Use:   "index-pattern",
-		Short: "Export kibana index pattern to stdout",
+		Short: "Export Kibana index pattern to stdout",
 		Run: func(cmd *cobra.Command, args []string) {
 			version, _ := cmd.Flags().GetString("es.version")
 
@@ -45,7 +45,7 @@ func GenIndexPatternConfigCmd(settings instance.Settings) *cobra.Command {
 			}
 
 			// Index pattern generation
-			v, err := common.NewVersion(version)
+			v, err := libversion.New(version)
 			if err != nil {
 				fatalf("Error creating version: %+v.", err)
 			}

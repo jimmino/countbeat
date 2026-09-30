@@ -21,20 +21,22 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/pkg/errors"
-
 	"github.com/elastic/beats/v7/libbeat/autodiscover/meta"
 	"github.com/elastic/beats/v7/libbeat/beat"
 	"github.com/elastic/beats/v7/libbeat/cfgfile"
 	"github.com/elastic/beats/v7/libbeat/common"
-	"github.com/elastic/beats/v7/libbeat/common/bus"
 	"github.com/elastic/beats/v7/libbeat/common/reload"
-	"github.com/elastic/beats/v7/libbeat/logp"
+	"github.com/elastic/beats/v7/pkg/autodiscover/bus"
+	conf "github.com/elastic/elastic-agent-libs/config"
+	"github.com/elastic/elastic-agent-libs/keystore"
+	"github.com/elastic/elastic-agent-libs/logp"
+	"github.com/elastic/elastic-agent-libs/mapstr"
+	"github.com/elastic/elastic-agent-libs/paths"
 )
 
 const (
-	// If a config reload fails after a new event, a new reload will be run after this period
-	retryPeriod = 10 * time.Second
+	// defaultDebouncePeriod is the time autodiscover will wait before reloading inputs
+	defaultDebouncePeriod = time.Second
 )
 
 // EventConfigurer is used to configure the creation of configuration objects
@@ -47,14 +49,14 @@ type EventConfigurer interface {
 
 	// CreateConfig creates a list of configurations from a bus.Event. The
 	// received event will have all keys defined in `EventFilter`.
-	CreateConfig(bus.Event) ([]*common.Config, error)
+	CreateConfig(bus.Event) ([]*conf.C, error)
 }
 
 // Autodiscover process, it takes a beat adapter and user config and runs autodiscover process, spawning
 // new modules when any configured providers does a match
 type Autodiscover struct {
 	bus             bus.Bus
-	defaultPipeline beat.Pipeline
+	defaultPipeline beat.PipelineConnector
 	factory         cfgfile.RunnerFactory
 	configurer      EventConfigurer
 	providers       []Provider
@@ -63,27 +65,22 @@ type Autodiscover struct {
 	meta            *meta.Map
 	listener        bus.Listener
 	logger          *logp.Logger
+	debouncePeriod  time.Duration
 }
 
 // NewAutodiscover instantiates and returns a new Autodiscover manager
-func NewAutodiscover(
-	name string,
-	pipeline beat.Pipeline,
-	factory cfgfile.RunnerFactory,
-	configurer EventConfigurer,
-	config *Config,
-) (*Autodiscover, error) {
-	logger := logp.NewLogger("autodiscover")
+func NewAutodiscover(name string, pipeline beat.PipelineConnector, factory cfgfile.RunnerFactory, configurer EventConfigurer, c *Config, keystore keystore.Keystore, logger *logp.Logger, path *paths.Path) (*Autodiscover, error) {
+	logger = logger.Named("autodiscover")
 
 	// Init Event bus
 	bus := bus.New(logger, name)
 
 	// Init providers
 	var providers []Provider
-	for _, providerCfg := range config.Providers {
-		provider, err := Registry.BuildProvider(bus, providerCfg)
+	for _, providerCfg := range c.Providers {
+		provider, err := Registry.BuildProvider(logger, name, bus, providerCfg, keystore, path)
 		if err != nil {
-			return nil, errors.Wrap(err, "error in autodiscover provider settings")
+			return nil, fmt.Errorf("error in autodiscover provider settings: %w", err)
 		}
 		logger.Debugf("Configured autodiscover provider: %s", provider)
 		providers = append(providers, provider)
@@ -95,10 +92,11 @@ func NewAutodiscover(
 		factory:         factory,
 		configurer:      configurer,
 		configs:         map[string]map[uint64]*reload.ConfigWithMeta{},
-		runners:         cfgfile.NewRunnerList("autodiscover", factory, pipeline),
+		runners:         cfgfile.NewRunnerList("autodiscover.cfgfile", factory, pipeline, logger),
 		providers:       providers,
 		meta:            meta.NewMap(),
 		logger:          logger,
+		debouncePeriod:  defaultDebouncePeriod,
 	}, nil
 }
 
@@ -125,6 +123,7 @@ func (a *Autodiscover) Start() {
 
 func (a *Autodiscover) worker() {
 	var updated, retry bool
+	t := time.NewTimer(defaultDebouncePeriod)
 
 	for {
 		select {
@@ -135,41 +134,60 @@ func (a *Autodiscover) worker() {
 			}
 
 			if _, ok := event["start"]; ok {
-				updated = a.handleStart(event)
+				// if updated is true, we don't want to set it back to false
+				if a.handleStart(event) {
+					updated = true
+				}
 			}
 			if _, ok := event["stop"]; ok {
-				updated = a.handleStop(event)
-			}
-
-		case <-time.After(retryPeriod):
-		}
-
-		if updated || retry {
-			if retry {
-				a.logger.Debug("Reloading existing autodiscover configs after error")
-			}
-
-			configs := []*reload.ConfigWithMeta{}
-			for _, list := range a.configs {
-				for _, c := range list {
-					configs = append(configs, c)
+				// if updated is true, we don't want to set it back to false
+				if a.handleStop(event) {
+					updated = true
 				}
 			}
 
-			err := a.runners.Reload(configs)
+		case <-t.C:
+			if updated || retry {
+				a.logger.Debugf("Reloading autodiscover configs reason: updated: %t, retry: %t", updated, retry)
 
-			// On error, make sure the next run also updates because some runners were not properly loaded
-			retry = err != nil
-			// reset updated status
-			updated = false
+				configs := []*reload.ConfigWithMeta{}
+				for _, list := range a.configs {
+					for _, c := range list {
+						configs = append(configs, c)
+					}
+				}
+
+				a.logger.Debugf("calling reload with %d config(s)", len(configs))
+				err := a.runners.Reload(configs)
+
+				// Cleanup metadata no longer in use
+				a.cleanupMetadata()
+
+				// reset updated status
+				updated = false
+
+				// On error, make sure the next run also updates because some runners were not properly loaded
+				retry = common.IsInputReloadable(err)
+				if err != nil && !retry {
+					a.logger.Errorw("all new inputs failed to start with a non-retriable error", err)
+				}
+				if retry {
+					// The recoverable errors that can lead to retry are related
+					// to the harvester state, so we need to give the publishing
+					// pipeline some time to finish flushing the events from that
+					// file. Hence we wait for 10x the normal debounce period.
+					t.Reset(10 * a.debouncePeriod)
+					continue
+				}
+			}
+
+			t.Reset(a.debouncePeriod)
 		}
 	}
 }
 
 func (a *Autodiscover) handleStart(event bus.Event) bool {
-	var updated bool
-
-	a.logger.Debugf("Got a start event: %v", event)
+	a.logger.Debugw("Got a start event.", "autodiscover.event", event)
 
 	eventID := getID(event)
 	if eventID == "" {
@@ -179,7 +197,7 @@ func (a *Autodiscover) handleStart(event bus.Event) bool {
 
 	// Ensure configs list exists for this instance
 	if _, ok := a.configs[eventID]; !ok {
-		a.configs[eventID] = map[uint64]*reload.ConfigWithMeta{}
+		a.configs[eventID] = make(map[uint64]*reload.ConfigWithMeta)
 	}
 
 	configs, err := a.configurer.CreateConfig(event)
@@ -189,42 +207,63 @@ func (a *Autodiscover) handleStart(event bus.Event) bool {
 	}
 
 	if a.logger.IsDebug() {
-
 		for _, c := range configs {
-			rc := map[string]interface{}{}
-			c.Unpack(&rc)
-
-			a.logger.Debugf("Generated config: %+v", rc)
+			a.logger.Debugf("Generated config: %+v", conf.DebugString(c, true))
 		}
 	}
+
+	var (
+		updated bool
+		newCfg  = make(map[uint64]*reload.ConfigWithMeta)
+	)
 
 	meta := a.getMeta(event)
 	for _, config := range configs {
 		hash, err := cfgfile.HashConfig(config)
 		if err != nil {
-			a.logger.Debugf("Could not hash config %v: %v", config, err)
-			continue
-		}
-
-		err = a.factory.CheckConfig(config)
-		if err != nil {
-			a.logger.Error(errors.Wrap(err, fmt.Sprintf("Auto discover config check failed for config '%s', won't start runner", common.DebugString(config, true))))
+			a.logger.Debugf("Could not hash config %v: %v", conf.DebugString(config, true), err)
 			continue
 		}
 
 		// Update meta no matter what
 		dynFields := a.meta.Store(hash, meta)
 
-		if a.configs[eventID][hash] != nil {
-			a.logger.Debugf("Config %v is already running", config)
+		if _, ok := newCfg[hash]; ok {
+			a.logger.Debugf("Config %v duplicated in start event", conf.DebugString(config, true))
 			continue
 		}
 
-		a.configs[eventID][hash] = &reload.ConfigWithMeta{
+		if cfg, ok := a.configs[eventID][hash]; ok {
+			a.logger.Debugf("Config %v is already running", conf.DebugString(config, true))
+			newCfg[hash] = cfg
+			continue
+		}
+
+		err = a.factory.CheckConfig(config)
+		if err != nil {
+			a.logger.Errorf(
+				"Auto discover config check failed for config '%s', won't start runner, err: %s",
+				conf.DebugString(config, true), err)
+			continue
+		}
+		newCfg[hash] = &reload.ConfigWithMeta{
 			Config: config,
 			Meta:   &dynFields,
 		}
+
 		updated = true
+	}
+
+	// If the new add event has lesser configs than the previous stable configuration then it means that there were
+	// configs that were removed in something like a resync event.
+	if len(newCfg) < len(a.configs[eventID]) {
+		updated = true
+	}
+
+	// By replacing the config's for eventID we make sure that all old configs that are no longer in use
+	// are stopped correctly. This will ensure that a resync event is handled correctly.
+	if updated {
+		a.configs[eventID] = newCfg
 	}
 
 	return updated
@@ -250,19 +289,43 @@ func (a *Autodiscover) handleStop(event bus.Event) bool {
 	return updated
 }
 
-func (a *Autodiscover) getMeta(event bus.Event) common.MapStr {
+// cleanupMetadata removes metadata for config hashes that are no longer active
+func (a *Autodiscover) cleanupMetadata() {
+	activeHashes := make(map[uint64]struct{})
+	for _, configs := range a.configs {
+		for hash := range configs {
+			activeHashes[hash] = struct{}{}
+		}
+	}
+
+	storedHashes := a.meta.Keys()
+	removedCount := 0
+	for _, hash := range storedHashes {
+		if _, ok := activeHashes[hash]; ok {
+			continue
+		}
+
+		a.meta.Remove(hash)
+		removedCount++
+	}
+
+	a.logger.Debugf("Metadata cleanup: %d before, %d after, %d removed",
+		len(storedHashes), len(activeHashes), removedCount)
+}
+
+func (a *Autodiscover) getMeta(event bus.Event) mapstr.M {
 	m := event["meta"]
 	if m == nil {
 		return nil
 	}
 
 	a.logger.Debugf("Got a meta field in the event")
-	meta, ok := m.(common.MapStr)
+	meta, ok := m.(mapstr.M)
 	if !ok {
 		a.logger.Errorf("Got a wrong meta field for event %v", event)
 		return nil
 	}
-	return meta
+	return meta.Clone()
 }
 
 // getID returns the event "id" field string if present

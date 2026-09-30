@@ -18,30 +18,41 @@
 package api
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
 
-	"github.com/elastic/beats/v7/libbeat/common"
-	"github.com/elastic/beats/v7/libbeat/logp"
-	"github.com/elastic/beats/v7/libbeat/monitoring"
+	"github.com/elastic/beats/v7/libbeat/beatmonitoring"
+	"github.com/elastic/elastic-agent-libs/config"
+	"github.com/elastic/elastic-agent-libs/logp"
+	"github.com/elastic/elastic-agent-libs/mapstr"
+	"github.com/elastic/elastic-agent-libs/monitoring"
 )
 
-type handlerFunc func(http.ResponseWriter, *http.Request)
-type lookupFunc func(string) *monitoring.Namespace
+type LookupFunc func(string) *monitoring.Registry
 
 // NewWithDefaultRoutes creates a new server with default API routes.
-func NewWithDefaultRoutes(log *logp.Logger, config *common.Config, ns lookupFunc) (*Server, error) {
-	mux := http.NewServeMux()
+func NewWithDefaultRoutes(log *logp.Logger, config *config.C, mon beatmonitoring.Monitoring) (*Server, error) {
+	api, err := New(log, config)
+	if err != nil {
+		return nil, err
+	}
 
-	mux.HandleFunc("/", makeRootAPIHandler(makeAPIHandler(ns("info"))))
-	mux.HandleFunc("/state", makeAPIHandler(ns("state")))
-	mux.HandleFunc("/stats", makeAPIHandler(ns("stats")))
-	mux.HandleFunc("/dataset", makeAPIHandler(ns("dataset")))
-	return New(log, mux, config)
+	err = errors.Join(
+		api.AttachHandler("/", makeRootAPIHandler(makeAPIHandler(mon.InfoRegistry()))),
+		api.AttachHandler("/state", makeAPIHandler(mon.StateRegistry())),
+		api.AttachHandler("/stats", makeAPIHandler(mon.StatsRegistry())),
+		api.AttachHandler("/dataset", makeAPIHandler(mon.InputsRegistry())),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return api, nil
 }
 
-func makeRootAPIHandler(handler handlerFunc) handlerFunc {
+func makeRootAPIHandler(handler http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
@@ -51,12 +62,12 @@ func makeRootAPIHandler(handler handlerFunc) handlerFunc {
 	}
 }
 
-func makeAPIHandler(ns *monitoring.Namespace) handlerFunc {
+func makeAPIHandler(registry *monitoring.Registry) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 
 		data := monitoring.CollectStructSnapshot(
-			ns.GetRegistry(),
+			registry,
 			monitoring.Full,
 			false,
 		)
@@ -65,11 +76,11 @@ func makeAPIHandler(ns *monitoring.Namespace) handlerFunc {
 	}
 }
 
-func prettyPrint(w http.ResponseWriter, data common.MapStr, u *url.URL) {
+func prettyPrint(w http.ResponseWriter, data mapstr.M, u *url.URL) {
 	query := u.Query()
 	if _, ok := query["pretty"]; ok {
-		fmt.Fprintf(w, data.StringToPrint())
+		fmt.Fprint(w, data.StringToPrint())
 	} else {
-		fmt.Fprintf(w, data.String())
+		fmt.Fprint(w, data.String())
 	}
 }

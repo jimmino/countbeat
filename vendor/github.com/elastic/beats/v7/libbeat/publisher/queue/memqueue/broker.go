@@ -18,220 +18,350 @@
 package memqueue
 
 import (
+	"context"
+	"io"
 	"sync"
 	"time"
 
-	"github.com/elastic/beats/v7/libbeat/common"
-	"github.com/elastic/beats/v7/libbeat/feature"
-	"github.com/elastic/beats/v7/libbeat/logp"
 	"github.com/elastic/beats/v7/libbeat/publisher/queue"
+	"github.com/elastic/elastic-agent-libs/logp"
 )
 
-type broker struct {
-	done chan struct{}
+// The string used to specify this queue in beats configurations.
+const QueueType = "mem"
 
-	logger logger
+const (
+	minInputQueueSize      = 20
+	maxInputQueueSizeRatio = 0.1
+)
 
-	bufSize int
+// broker is the main implementation type for the memory queue. An active queue
+// consists of two goroutines: runLoop, which handles all public API requests
+// and owns the buffer state, and ackLoop, which listens for acknowledgments of
+// consumed events and runs any appropriate completion handlers.
+type broker[T any] struct {
+	settings Settings
+	logger   *logp.Logger
 
+	ctx       context.Context
+	ctxCancel context.CancelFunc
+
+	// The ring buffer backing the queue. All buffer positions should be taken
+	// modulo the size of this array.
+	buf []queueEntry[T]
+
+	// wait group for queue workers (runLoop and ackLoop)
+	wg sync.WaitGroup
+
+	// ackWaitProducers tracks ack-tracking producers so their ACKWaitChan can
+	// be closed when the broker shuts down — after that the ackLoop delivers no
+	// further acks, so a producer closed with unacknowledged events would
+	// otherwise strand a waiter. Producers remove themselves once fully acked.
+	// Guarded by ackWaitMu.
+	//
+	// Note: this bookkeeping exists to satisfy the queue.Producer.ACKWaitChan
+	// contract for all queue implementations (issue #50103). The standalone
+	// (process) pipeline shutdown does not consume it — it waits on Queue.Done
+	// instead — so today it is exercised mainly by the shared-pool slabqueue
+	// path. It is kept here so the memory queue honors the same interface and
+	// is ready for callers that wait per-producer.
+	ackWaitMu        sync.Mutex
+	ackWaitProducers map[*ackProducer[T]]struct{}
+
+	// The factory used to create an event encoder when creating a producer
+	encoderFactory queue.EncoderFactory[T]
+
+	///////////////////////////
 	// api channels
-	events    chan pushRequest
-	requests  chan getRequest
-	pubCancel chan producerCancelRequest
 
+	// Producers send requests to pushChan to add events to the queue.
+	pushChan chan pushRequest[T]
+
+	// Consumers send requests to getChan to read events from the queue.
+	getChan chan getRequest[T]
+
+	// Close triggers a queue close by sending to closeChan.
+	// The value sent over this channel indicates if this is a force close.
+	closeChan chan bool
+
+	///////////////////////////
 	// internal channels
-	acks          chan int
-	scheduledACKs chan chanList
 
-	ackListener queue.ACKListener
+	// Batches sent to consumers are also collected and forwarded to ackLoop
+	// through this channel so ackLoop can monitor them for acknowledgments.
+	consumedChan chan batchList[T]
 
-	// wait group for worker shutdown
-	wg          sync.WaitGroup
-	waitOnClose bool
+	// When batches are acknowledged, ackLoop saves any metadata needed
+	// for producer callbacks and such, then notifies runLoop that it's
+	// safe to free these events and advance the queue by sending the
+	// acknowledged event count to this channel.
+	deleteChan chan int
+
+	// closingChan is closed when the queue has processed a close request.
+	// It's used to prevent producers from blocking on a closing queue.
+	closingChan chan struct{}
+
+	///////////////////////////////
+	// internal goroutine state
+
+	// The goroutine that manages the queue's core run state
+	runLoop *runLoop[T]
+
+	// The goroutine that manages ack notifications and callbacks
+	ackLoop *ackLoop[T]
 }
 
 type Settings struct {
-	ACKListener    queue.ACKListener
-	Events         int
-	FlushMinEvents int
-	FlushTimeout   time.Duration
-	WaitOnClose    bool
+	// The number of events the queue can hold.
+	Events int
+
+	// The most events that will ever be returned from one Get request.
+	MaxGetRequest int
+
+	// If positive, the amount of time the queue will wait to fill up
+	// a batch if a Get request asks for more events than we have.
+	FlushTimeout time.Duration
 }
 
-type ackChan struct {
-	next         *ackChan
-	ch           chan batchAckMsg
-	seq          uint
-	start, count int // number of events waiting for ACK
-	states       []clientState
+type queueEntry[T any] struct {
+	event     T
+	eventSize int
+	id        queue.EntryID
+
+	producer   *ackProducer[T]
+	producerID producerID // The order of this entry within its producer
 }
 
-type chanList struct {
-	head *ackChan
-	tail *ackChan
+type batch[T any] struct {
+	queue *broker[T]
+
+	// Next batch in the containing batchList
+	next *batch[T]
+
+	// Position and length of the events within the queue buffer
+	start, count int
+
+	// batch.Done() sends to doneChan, where ackLoop reads it and handles
+	// acknowledgment / cleanup. batch.Release() also sends to doneChan
+	// but with batchDoneMsg.cancelled=true; ackLoop captures that flag
+	// here so processACK can skip the producer ACK callback while still
+	// freeing the underlying buffer slots.
+	doneChan chan batchDoneMsg
+
+	// cancelled is set by ackLoop when this batch was Released (abandoned)
+	// rather than Done'd. Read by processACK to skip the producer ACK
+	// callback while still counting the events for deletion from the ring
+	// buffer.
+	cancelled bool
 }
 
-func init() {
-	queue.RegisterQueueType(
-		"mem",
-		create,
-		feature.MakeDetails(
-			"Memory queue",
-			"Buffer events in memory before sending to the output.",
-			feature.Stable))
+type batchList[T any] struct {
+	head *batch[T]
+	tail *batch[T]
 }
 
-func create(
-	ackListener queue.ACKListener, logger *logp.Logger, cfg *common.Config,
-) (queue.Queue, error) {
-	config := defaultConfig
-	if err := cfg.Unpack(&config); err != nil {
-		return nil, err
+// FactoryForSettings is a simple wrapper around NewQueue so a concrete
+// Settings object can be wrapped in a queue-agnostic interface for
+// later use by the pipeline.
+func FactoryForSettings[T any](settings Settings) queue.QueueFactory[T] {
+	return func(
+		logger *logp.Logger,
+		observer queue.Observer,
+		inputQueueSize int,
+		encoderFactory queue.EncoderFactory[T],
+	) (queue.Queue[T], error) {
+		return NewQueue(logger, observer, settings, inputQueueSize, encoderFactory), nil
 	}
-
-	if logger == nil {
-		logger = logp.L()
-	}
-
-	return NewQueue(logger, Settings{
-		ACKListener:    ackListener,
-		Events:         config.Events,
-		FlushMinEvents: config.FlushMinEvents,
-		FlushTimeout:   config.FlushTimeout,
-	}), nil
 }
 
 // NewQueue creates a new broker based in-memory queue holding up to sz number of events.
 // If waitOnClose is set to true, the broker will block on Close, until all internal
 // workers handling incoming messages and ACKs have been shut down.
-func NewQueue(
-	logger logger,
+func NewQueue[T any](
+	logger *logp.Logger,
+	observer queue.Observer,
 	settings Settings,
-) queue.Queue {
-	// define internal channel size for producer/client requests
-	// to the broker
-	chanSize := 20
+	inputQueueSize int,
+	encoderFactory queue.EncoderFactory[T],
+) *broker[T] {
+	b := newQueue(logger, observer, settings, inputQueueSize, encoderFactory)
 
-	var (
-		sz           = settings.Events
-		minEvents    = settings.FlushMinEvents
-		flushTimeout = settings.FlushTimeout
-	)
-
-	if minEvents < 1 {
-		minEvents = 1
-	}
-	if minEvents > 1 && flushTimeout <= 0 {
-		minEvents = 1
-		flushTimeout = 0
-	}
-	if minEvents > sz {
-		minEvents = sz
-	}
-
-	if logger == nil {
-		logger = logp.NewLogger("memqueue")
-	}
-
-	b := &broker{
-		done:   make(chan struct{}),
-		logger: logger,
-
-		// broker API channels
-		events:    make(chan pushRequest, chanSize),
-		requests:  make(chan getRequest),
-		pubCancel: make(chan producerCancelRequest, 5),
-
-		// internal broker and ACK handler channels
-		acks:          make(chan int),
-		scheduledACKs: make(chan chanList),
-
-		waitOnClose: settings.WaitOnClose,
-
-		ackListener: settings.ACKListener,
-	}
-
-	var eventLoop interface {
-		run()
-		processACK(chanList, int)
-	}
-
-	if minEvents > 1 {
-		eventLoop = newBufferingEventLoop(b, sz, minEvents, flushTimeout)
-	} else {
-		eventLoop = newDirectEventLoop(b, sz)
-	}
-
-	b.bufSize = sz
-	ack := newACKLoop(b, eventLoop.processACK)
-
+	// Start the queue workers
 	b.wg.Add(2)
 	go func() {
 		defer b.wg.Done()
-		eventLoop.run()
+		b.runLoop.run()
 	}()
 	go func() {
 		defer b.wg.Done()
-		ack.run()
+		b.ackLoop.run()
 	}()
 
 	return b
 }
 
-func (b *broker) Close() error {
-	close(b.done)
-	if b.waitOnClose {
-		b.wg.Wait()
+// newQueue does most of the work of creating a queue from the given
+// parameters, but doesn't start the runLoop or ackLoop workers. This
+// lets us perform more granular / deterministic tests by controlling
+// when the workers are active.
+func newQueue[T any](
+	logger *logp.Logger,
+	observer queue.Observer,
+	settings Settings,
+	inputQueueSize int,
+	encoderFactory queue.EncoderFactory[T],
+) *broker[T] {
+	if observer == nil {
+		observer = queue.NewQueueObserver(nil)
 	}
+	chanSize := AdjustInputQueueSize(inputQueueSize, settings.Events)
+
+	// Backwards compatibility: an old way to select synchronous queue
+	// behavior was to set "flush.min_events" to 0 or 1, in which case the
+	// timeout was disabled and the max get request was half the queue.
+	// (Otherwise, it would make sense to leave FlushTimeout unchanged here.)
+	if settings.MaxGetRequest <= 1 {
+		settings.FlushTimeout = 0
+		settings.MaxGetRequest = (settings.Events + 1) / 2
+	}
+
+	// Can't request more than the full queue
+	if settings.MaxGetRequest > settings.Events {
+		settings.MaxGetRequest = settings.Events
+	}
+
+	if logger == nil {
+		logger = logp.NewLogger("memqueue") //nolint:forbidigo // fallback logger when the caller does not provide one.
+	} else {
+		logger = logger.Named("memqueue")
+	}
+
+	b := &broker[T]{
+		settings: settings,
+		logger:   logger,
+
+		buf: make([]queueEntry[T], settings.Events),
+
+		encoderFactory: encoderFactory,
+
+		// broker API channels
+		pushChan:  make(chan pushRequest[T], chanSize),
+		getChan:   make(chan getRequest[T]),
+		closeChan: make(chan bool),
+
+		// internal runLoop and ackLoop channels
+		consumedChan: make(chan batchList[T]),
+		deleteChan:   make(chan int),
+		closingChan:  make(chan struct{}),
+
+		ackWaitProducers: make(map[*ackProducer[T]]struct{}),
+	}
+	b.ctx, b.ctxCancel = context.WithCancel(context.Background()) //nolint:gosec // G118 false positive: ctxCancel is stored on the broker and called during shutdown.
+
+	b.runLoop = newRunLoop(b, observer)
+	b.ackLoop = newACKLoop(b)
+
+	observer.MaxEvents(settings.Events)
+
+	return b
+}
+
+func (b *broker[T]) Close(force bool) error {
+	select {
+	case b.closeChan <- force:
+	case <-b.ctx.Done():
+	}
+
 	return nil
 }
 
-func (b *broker) BufferConfig() queue.BufferConfig {
+func (b *broker[T]) Done() <-chan struct{} {
+	return b.ctx.Done()
+}
+
+func (b *broker[T]) QueueType() string {
+	return QueueType
+}
+
+func (b *broker[T]) BufferConfig() queue.BufferConfig {
 	return queue.BufferConfig{
-		MaxEvents: b.bufSize,
+		MaxEvents: len(b.buf),
 	}
 }
 
-func (b *broker) Producer(cfg queue.ProducerConfig) queue.Producer {
-	return newProducer(b, cfg.ACK, cfg.OnDrop, cfg.DropOnCancel)
+func (b *broker[T]) Producer(cfg queue.ProducerConfig) queue.Producer[T] {
+	// If we were given an encoder factory to allow producers to encode
+	// events for output before they entered the queue, then create an
+	// encoder for the new producer.
+	var encoder queue.Encoder[T]
+	if b.encoderFactory != nil {
+		encoder = b.encoderFactory()
+	}
+	return newProducer(b, cfg.ACK, encoder)
 }
 
-func (b *broker) Consumer() queue.Consumer {
-	return newConsumer(b)
+// registerProducer adds an ack-tracking producer to the shutdown fan-out set.
+func (b *broker[T]) registerProducer(p *ackProducer[T]) {
+	b.ackWaitMu.Lock()
+	b.ackWaitProducers[p] = struct{}{}
+	b.ackWaitMu.Unlock()
 }
 
-var ackChanPool = sync.Pool{
-	New: func() interface{} {
-		return &ackChan{
-			ch: make(chan batchAckMsg, 1),
-		}
-	},
+// unregisterProducer removes a producer from the shutdown fan-out set, called
+// once its ackWait has been closed by its own ack accounting.
+func (b *broker[T]) unregisterProducer(p *ackProducer[T]) {
+	b.ackWaitMu.Lock()
+	delete(b.ackWaitProducers, p)
+	b.ackWaitMu.Unlock()
 }
 
-func newACKChan(seq uint, start, count int, states []clientState) *ackChan {
-	ch := ackChanPool.Get().(*ackChan)
-	ch.next = nil
-	ch.seq = seq
-	ch.start = start
-	ch.count = count
-	ch.states = states
-	return ch
+// closeProducerAckWaits closes the ackWait channel of every still-registered
+// producer. Called when the queue is shutting down and the ackLoop will
+// deliver no further acks, so a producer closed with unacknowledged events
+// does not strand a waiter. Snapshots under the lock and closes outside it.
+func (b *broker[T]) closeProducerAckWaits() {
+	b.ackWaitMu.Lock()
+	producers := b.ackWaitProducers
+	b.ackWaitProducers = make(map[*ackProducer[T]]struct{})
+	b.ackWaitMu.Unlock()
+
+	for p := range producers {
+		p.forceCloseAckWait()
+	}
 }
 
-func releaseACKChan(c *ackChan) {
-	c.next = nil
-	ackChanPool.Put(c)
+func (b *broker[T]) Get(count int) (queue.Batch[T], error) {
+	responseChan := make(chan *batch[T], 1)
+	select {
+	case <-b.ctx.Done():
+		return nil, io.EOF
+	case b.getChan <- getRequest[T]{
+		entryCount: count, responseChan: responseChan}:
+	}
+
+	// if request has been sent, we have to wait for a response
+	resp := <-responseChan
+	return resp, nil
 }
 
-func (l *chanList) prepend(ch *ackChan) {
-	ch.next = l.head
-	l.head = ch
+func newBatch[T any](queue *broker[T], start, count int) *batch[T] {
+	return &batch[T]{
+		queue:    queue,
+		start:    start,
+		count:    count,
+		doneChan: make(chan batchDoneMsg, 1),
+	}
+}
+
+func (l *batchList[T]) prepend(b *batch[T]) {
+	b.next = l.head
+	l.head = b
 	if l.tail == nil {
-		l.tail = ch
+		l.tail = b
 	}
 }
 
-func (l *chanList) concat(other *chanList) {
+func (l *batchList[T]) concat(other *batchList[T]) {
 	if other.head == nil {
 		return
 	}
@@ -245,56 +375,111 @@ func (l *chanList) concat(other *chanList) {
 	l.tail = other.tail
 }
 
-func (l *chanList) append(ch *ackChan) {
+func (l *batchList[T]) append(b *batch[T]) {
 	if l.head == nil {
-		l.head = ch
+		l.head = b
 	} else {
-		l.tail.next = ch
+		l.tail.next = b
 	}
-	l.tail = ch
+	l.tail = b
 }
 
-func (l *chanList) count() (elems, count int) {
-	for ch := l.head; ch != nil; ch = ch.next {
-		elems++
-		count += ch.count
-	}
-	return
-}
-
-func (l *chanList) empty() bool {
+func (l *batchList[T]) empty() bool {
 	return l.head == nil
 }
 
-func (l *chanList) front() *ackChan {
+func (l *batchList[T]) front() *batch[T] {
 	return l.head
 }
 
-func (l *chanList) channel() chan batchAckMsg {
+func (l *batchList[T]) nextBatchChannel() chan batchDoneMsg {
 	if l.head == nil {
 		return nil
 	}
-	return l.head.ch
+	return l.head.doneChan
 }
 
-func (l *chanList) pop() *ackChan {
+func (l *batchList[T]) pop() *batch[T] {
 	ch := l.head
 	if ch != nil {
 		l.head = ch.next
 		if l.head == nil {
 			l.tail = nil
 		}
+		ch.next = nil
 	}
 
-	ch.next = nil
 	return ch
 }
 
-func (l *chanList) reverse() {
+func (l *batchList[T]) reverse() {
 	tmp := *l
-	*l = chanList{}
+	*l = batchList[T]{}
 
 	for !tmp.empty() {
 		l.prepend(tmp.pop())
 	}
+}
+
+// AdjustInputQueueSize decides the size for the input queue.
+func AdjustInputQueueSize(requested, mainQueueSize int) (actual int) {
+	actual = requested
+	if max := int(float64(mainQueueSize) * maxInputQueueSizeRatio); mainQueueSize > 0 && actual > max {
+		actual = max
+	}
+	if actual < minInputQueueSize {
+		actual = minInputQueueSize
+	}
+	return actual
+}
+
+func (b *batch[T]) Count() int {
+	return b.count
+}
+
+// Return a pointer to the queueEntry for the i-th element of this batch
+func (b *batch[T]) rawEntry(i int) *queueEntry[T] {
+	// Indexes wrap around the end of the queue buffer
+	return &b.queue.buf[(b.start+i)%len(b.queue.buf)]
+}
+
+// Return the event referenced by the i-th element of this batch
+func (b *batch[T]) Entry(i int) T {
+	return b.rawEntry(i).event
+}
+
+func (b *batch[T]) FreeEntries() {
+	// This signals that the event data has been copied out of the batch, and is
+	// safe to free from the queue buffer, so set all the event pointers to nil.
+	var empty T
+	for i := 0; i < b.count; i++ {
+		index := (b.start + i) % len(b.queue.buf)
+		b.queue.buf[index].event = empty
+	}
+}
+
+func (b *batch[T]) Done() {
+	b.doneChan <- batchDoneMsg{}
+}
+
+// Release signals that the consumer is abandoning this batch — used by the
+// pipeline on shutdown when a batch has been read from the queue but
+// cannot be delivered. It removes the batch from ackLoop's pending list
+// (so subsequent batches' ACKs are not stalled behind it) and frees the
+// in-buffer slots, but does NOT fire producer ACK callbacks. This matches
+// memqueue's existing behaviour for batches abandoned by the consumer
+// not calling Done at all — except by making it explicit we also unblock
+// the ackLoop, which otherwise would sit forever on this batch's
+// doneChan and stall every batch queued behind it.
+//
+// Caller contract — IMPORTANT: see queue.Batch.Release. Release must
+// only be invoked when no further batches from the same producer will
+// be Done()'d; in this repo that means it is only safe from a
+// pipeline-wide shutdown path. Calling Release mid-flight leaves a
+// hole in the producer's ACK accounting (lastACK is not advanced past
+// the abandoned producer IDs by design, so a subsequent Done from the
+// same producer would over-count and falsely advance the input
+// registry).
+func (b *batch[T]) Release() {
+	b.doneChan <- batchDoneMsg{cancelled: true}
 }

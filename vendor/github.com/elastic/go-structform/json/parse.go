@@ -45,7 +45,8 @@ type Parser struct {
 	// preallocate stack memory for up to 32 nested arrays/objects
 	statesBuf [32]state
 
-	literalBuffer  []byte
+	literalBuffer []byte
+	// literalBuffer0 is used as a fast reset option for literalBuffer without allocation.
 	literalBuffer0 [64]byte
 
 	inEscape bool
@@ -239,6 +240,10 @@ func (p *Parser) feedUntil(b []byte) (int, bool, error) {
 
 		default:
 			return 0, false, errFailing
+		}
+
+		if err != nil {
+			break
 		}
 
 		reported = reported && len(p.states) == 0

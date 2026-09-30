@@ -18,10 +18,9 @@
 package arch
 
 import (
+	"fmt"
 	"runtime"
 	"strings"
-
-	"github.com/pkg/errors"
 )
 
 // Info contains Linux architecture information (name, audit arch, and syscall
@@ -41,6 +40,12 @@ var (
 		ID:             auditArchARM,
 		SyscallNumbers: syscallsARM,
 		SyscallNames:   invert(syscallsARM),
+	}
+	AARCH64 = &Info{
+		Name:           "aarch64",
+		ID:             auditArchAARCH64,
+		SyscallNumbers: syscallsAARCH64,
+		SyscallNames:   invert(syscallsAARCH64),
 	}
 	I386 = &Info{
 		Name:           "i386",
@@ -66,10 +71,6 @@ var (
 
 	// The following architectures are not fully implemented. Syscall tables
 	// need to be added for them (syscall number -> name mapping).
-	AARCH64 = &Info{
-		Name: "aarch64",
-		ID:   auditArchAARCH64,
-	}
 	PPC = &Info{
 		Name: "ppc",
 		ID:   auditArchPPC,
@@ -169,7 +170,7 @@ func GetInfo(name string) (*Info, error) {
 
 	arch, found := arches[name]
 	if !found || len(arch.SyscallNames) == 0 {
-		return nil, errors.Errorf("unsupported arch: %v", name)
+		return nil, fmt.Errorf("unsupported arch: %v", name)
 	}
 	return arch, nil
 }

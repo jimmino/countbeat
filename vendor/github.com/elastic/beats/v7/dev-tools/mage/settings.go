@@ -18,10 +18,12 @@
 package mage
 
 import (
+	_ "embed"
+	"errors"
 	"fmt"
 	"go/build"
-	"io/ioutil"
 	"log"
+	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -31,14 +33,15 @@ import (
 	"time"
 
 	"github.com/magefile/mage/sh"
-	"github.com/pkg/errors"
-	"golang.org/x/tools/go/vcs"
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
+	"gopkg.in/yaml.v3"
 
 	"github.com/elastic/beats/v7/dev-tools/mage/gotool"
 )
 
 const (
-	fpmVersion = "1.11.0"
+	fpmVersion = "1.13.1"
 
 	// Docker images. See https://github.com/elastic/golang-crossbuild.
 	beatsFPMImage = "docker.elastic.co/beats-dev/fpm"
@@ -60,11 +63,13 @@ var (
 	XPackDir     = "../x-pack"
 	RaceDetector = false
 	TestCoverage = false
-	UseVendor    = true
+	PLATFORMS    = EnvOr("PLATFORMS", "")
+	PACKAGES     = EnvOr("PACKAGES", "")
+	CI           = EnvOr("CI", "")
 
-	// CrossBuildMountModcache, if true, mounts $GOPATH/pkg/mod into
-	// the crossbuild images at /go/pkg/mod, read-only.
-	CrossBuildMountModcache = false
+	// CrossBuildMountModcache mounts $GOPATH/pkg/mod into
+	// the crossbuild images at /go/pkg/mod, read-only,  when set to true.
+	CrossBuildMountModcache = true
 
 	BeatName        = EnvOr("BEAT_NAME", filepath.Base(CWD()))
 	BeatServiceName = EnvOr("BEAT_SERVICE_NAME", BeatName)
@@ -72,26 +77,44 @@ var (
 	BeatDescription = EnvOr("BEAT_DESCRIPTION", "")
 	BeatVendor      = EnvOr("BEAT_VENDOR", "Elastic")
 	BeatLicense     = EnvOr("BEAT_LICENSE", "ASL 2.0")
-	BeatURL         = EnvOr("BEAT_URL", "https://www.elastic.co/products/beats/"+BeatName)
+	BeatURL         = EnvOr("BEAT_URL", "https://www.elastic.co/beats/"+BeatName)
 	BeatUser        = EnvOr("BEAT_USER", "root")
 
 	BeatProjectType ProjectType
 
-	Snapshot bool
+	Snapshot  bool
+	DevBuild  bool
+	FIPSBuild bool
+
+	//go:embed fips-settings.yaml
+	fipsConfigRaw []byte
+
+	FIPSConfig struct {
+		Beats   []string `yaml:"beats"`
+		Compile struct {
+			Env       map[string]string `yaml:"env"`
+			Tags      []string          `yaml:"tags"`
+			Platforms []string          `yaml:"platforms"`
+		} `yaml:"compile"`
+	}
 
 	versionQualified bool
 	versionQualifier string
 
-	FuncMap = map[string]interface{}{
+	caser = cases.Title(language.English, cases.NoLower)
+
+	FuncMap = map[string]any{
 		"beat_doc_branch":   BeatDocBranch,
 		"beat_version":      BeatQualifiedVersion,
 		"commit":            CommitHash,
+		"commit_short":      CommitHashShort,
 		"date":              BuildDate,
 		"elastic_beats_dir": ElasticBeatsDir,
 		"go_version":        GoVersion,
 		"repo":              GetProjectRepoInfo,
-		"title":             strings.Title,
+		"title":             caser.String,
 		"tolower":           strings.ToLower,
+		"contains":          strings.Contains,
 	}
 )
 
@@ -103,21 +126,32 @@ func init() {
 	var err error
 	RaceDetector, err = strconv.ParseBool(EnvOr("RACE_DETECTOR", "false"))
 	if err != nil {
-		panic(errors.Wrap(err, "failed to parse RACE_DETECTOR env value"))
+		panic(fmt.Errorf("failed to parse RACE_DETECTOR env value: %w", err))
 	}
 
 	TestCoverage, err = strconv.ParseBool(EnvOr("TEST_COVERAGE", "false"))
 	if err != nil {
-		panic(errors.Wrap(err, "failed to parse TEST_COVERAGE env value"))
-	}
-	UseVendor, err = strconv.ParseBool(EnvOr("USE_VENDOR", "true"))
-	if err != nil {
-		panic(errors.Wrap(err, "failed to parse USE_VENDOR env value"))
+		panic(fmt.Errorf("failed to parse TEST_COVERAGE env value: %w", err))
 	}
 
 	Snapshot, err = strconv.ParseBool(EnvOr("SNAPSHOT", "false"))
 	if err != nil {
-		panic(errors.Wrap(err, "failed to parse SNAPSHOT env value"))
+		panic(fmt.Errorf("failed to parse SNAPSHOT env value: %w", err))
+	}
+
+	DevBuild, err = strconv.ParseBool(EnvOr("DEV", "false"))
+	if err != nil {
+		panic(fmt.Errorf("failed to parse DEV env value: %w", err))
+	}
+
+	FIPSBuild, err = strconv.ParseBool(EnvOr("FIPS", "false"))
+	if err != nil {
+		panic(fmt.Errorf("failed to parse FIPS env value: %w", err))
+	}
+
+	err = yaml.Unmarshal(fipsConfigRaw, &FIPSConfig)
+	if err != nil {
+		panic(fmt.Errorf("failed to parse FIPS config: %w", err))
 	}
 
 	versionQualifier, versionQualified = os.LookupEnv("VERSION_QUALIFIER")
@@ -139,7 +173,7 @@ var ErrUnknownProjectType = fmt.Errorf("unknown ProjectType")
 // EnvMap returns map containing the common settings variables and all variables
 // from the environment. args are appended to the output prior to adding the
 // environment variables (so env vars have the highest precedence).
-func EnvMap(args ...map[string]interface{}) map[string]interface{} {
+func EnvMap(args ...map[string]any) map[string]any {
 	envMap := varMap(args...)
 
 	// Add the environment (highest precedence).
@@ -151,12 +185,14 @@ func EnvMap(args ...map[string]interface{}) map[string]interface{} {
 	return envMap
 }
 
-func varMap(args ...map[string]interface{}) map[string]interface{} {
-	data := map[string]interface{}{
+func varMap(args ...map[string]any) map[string]any {
+	data := map[string]any{
 		"GOOS":            GOOS,
 		"GOARCH":          GOARCH,
 		"GOARM":           GOARM,
 		"Platform":        Platform,
+		"PLATFORMS":       PLATFORMS,
+		"PACKAGES":        PACKAGES,
 		"BinaryExt":       BinaryExt,
 		"XPackDir":        XPackDir,
 		"BeatName":        BeatName,
@@ -168,14 +204,16 @@ func varMap(args ...map[string]interface{}) map[string]interface{} {
 		"BeatURL":         BeatURL,
 		"BeatUser":        BeatUser,
 		"Snapshot":        Snapshot,
+		"DEV":             DevBuild,
+		"FIPS":            FIPSBuild,
+		"FIPSConfig":      FIPSConfig,
 		"Qualifier":       versionQualifier,
+		"CI":              CI,
 	}
 
 	// Add the extra args to the map.
 	for _, m := range args {
-		for k, v := range m {
-			data[k] = v
-		}
+		maps.Copy(data, m)
 	}
 
 	return data
@@ -199,6 +237,10 @@ BeatLicense      = {{.BeatLicense}}
 BeatURL          = {{.BeatURL}}
 BeatUser         = {{.BeatUser}}
 VersionQualifier = {{.Qualifier}}
+PLATFORMS        = {{.PLATFORMS}}
+PACKAGES         = {{.PACKAGES}}
+CI               = {{.CI}}
+FIPSConfig       = {{.FIPSConfig}}
 
 ## Functions
 
@@ -241,6 +283,15 @@ func CommitHash() (string, error) {
 		commitHash, err = sh.Output("git", "rev-parse", "HEAD")
 	})
 	return commitHash, err
+}
+
+// CommitHashShort returns the short length git commit hash.
+func CommitHashShort() (string, error) {
+	shortHash, err := CommitHash()
+	if len(shortHash) > 6 {
+		shortHash = shortHash[:6]
+	}
+	return shortHash, err
 }
 
 var (
@@ -286,7 +337,7 @@ func findElasticBeatsDir() (string, error) {
 	if repo.IsElasticBeats() {
 		return repo.RootDir, nil
 	}
-	return listModuleDir(elasticBeatsModulePath)
+	return gotool.ListModuleCacheDir(elasticBeatsModulePath)
 }
 
 var (
@@ -338,6 +389,14 @@ func BeatQualifiedVersion() (string, error) {
 		return version, nil
 	}
 	return version + "-" + versionQualifier, nil
+}
+
+func BeatMajorMinorVersion() string {
+	if v, _ := BeatQualifiedVersion(); v != "" {
+		parts := strings.SplitN(v, ".", 3)
+		return parts[0] + "." + parts[1]
+	}
+	return ""
 }
 
 // BeatVersion returns the Beat's version. The value can be overridden by
@@ -418,7 +477,7 @@ func getBuildVariableSources() *BuildVariableSources {
 		return buildVariableSources
 	}
 
-	panic(errors.Errorf("magefile must call devtools.SetBuildVariableSources() "+
+	panic(fmt.Errorf("magefile must call devtools.SetBuildVariableSources() "+
 		"because it is not an elastic beat (repo=%+v)", repo.RootImportPath))
 }
 
@@ -449,7 +508,7 @@ type BuildVariableSources struct {
 }
 
 func (s *BuildVariableSources) expandVar(in string) (string, error) {
-	return expandTemplate("inline", in, map[string]interface{}{
+	return expandTemplate("inline", in, map[string]any{
 		"elastic_beats_dir": ElasticBeatsDir,
 	})
 }
@@ -461,9 +520,9 @@ func (s *BuildVariableSources) GetBeatVersion() (string, error) {
 		return "", err
 	}
 
-	data, err := ioutil.ReadFile(file)
+	data, err := os.ReadFile(file)
 	if err != nil {
-		return "", errors.Wrapf(err, "failed to read beat version file=%v", file)
+		return "", fmt.Errorf("failed to read beat version file=%v: %w", file, err)
 	}
 
 	if s.BeatVersionParser == nil {
@@ -479,9 +538,9 @@ func (s *BuildVariableSources) GetGoVersion() (string, error) {
 		return "", err
 	}
 
-	data, err := ioutil.ReadFile(file)
+	data, err := os.ReadFile(file)
 	if err != nil {
-		return "", errors.Wrapf(err, "failed to read go version file=%v", file)
+		return "", fmt.Errorf("failed to read go version file=%v: %w", file, err)
 	}
 
 	if s.GoVersionParser == nil {
@@ -497,9 +556,9 @@ func (s *BuildVariableSources) GetDocBranch() (string, error) {
 		return "", err
 	}
 
-	data, err := ioutil.ReadFile(file)
+	data, err := os.ReadFile(file)
 	if err != nil {
-		return "", errors.Wrapf(err, "failed to read doc branch file=%v", file)
+		return "", fmt.Errorf("failed to read doc branch file=%v: %w", file, err)
 	}
 
 	if s.DocBranchParser == nil {
@@ -615,7 +674,7 @@ func getProjectRepoInfoWithModules() (*ProjectRepoInfo, error) {
 	}
 
 	if rootDir == "" {
-		return nil, errors.Errorf("failed to find root dir of module file: %v", errs)
+		return nil, fmt.Errorf("failed to find root dir of module file: %v", errs)
 	}
 
 	rootImportPath, err := gotool.GetModuleName()
@@ -658,7 +717,7 @@ func getProjectRepoInfoUnderGopath() (*ProjectRepoInfo, error) {
 	}
 
 	for _, srcDir := range srcDirs {
-		_, root, err := vcs.FromDir(cwd, srcDir)
+		root, err := fromDir(cwd, srcDir)
 		if err != nil {
 			// Try the next gopath.
 			errs = append(errs, err.Error())
@@ -669,12 +728,12 @@ func getProjectRepoInfoUnderGopath() (*ProjectRepoInfo, error) {
 	}
 
 	if rootDir == "" {
-		return nil, errors.Errorf("error while determining root directory: %v", errs)
+		return nil, fmt.Errorf("error while determining root directory: %v", errs)
 	}
 
 	subDir, err := filepath.Rel(rootDir, cwd)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to get relative path to repo root")
+		return nil, fmt.Errorf("failed to get relative path to repo root: %w", err)
 	}
 
 	rootImportPath, err := gotool.GetModuleName()
@@ -691,6 +750,66 @@ func getProjectRepoInfoUnderGopath() (*ProjectRepoInfo, error) {
 	}, nil
 }
 
+var vcsList = []string{
+	"hg",
+	"git",
+	"svn",
+	"bzr",
+}
+
+// this method has been adapted from vcs.FromDir from golang.org/x/tools/go/vcs
+//
+// the body of the method was kept as is but the extra return value
+// has been removed since it was unused.
+func fromDir(dir, srcRoot string) (root string, err error) {
+	// Clean and double-check that dir is in (a subdirectory of) srcRoot.
+	dir = filepath.Clean(dir)
+	srcRoot = filepath.Clean(srcRoot)
+	if len(dir) <= len(srcRoot) || dir[len(srcRoot)] != filepath.Separator {
+		return "", fmt.Errorf("directory %q is outside source root %q", dir, srcRoot)
+	}
+
+	var vcsRet string
+	var rootRet string
+
+	origDir := dir
+	for len(dir) > len(srcRoot) {
+		for _, vcs := range vcsList {
+			if _, err := os.Stat(filepath.Join(dir, "."+vcs)); err == nil {
+				root := filepath.ToSlash(dir[len(srcRoot)+1:])
+				// Record first VCS we find, but keep looking,
+				// to detect mistakes like one kind of VCS inside another.
+				if vcsRet == "" {
+					vcsRet = vcs
+					rootRet = root
+					continue
+				}
+				// Allow .git inside .git, which can arise due to submodules.
+				if vcsRet == vcs && vcs == "git" {
+					continue
+				}
+				// Otherwise, we have one VCS inside a different VCS.
+				return "", fmt.Errorf("directory %q uses %s, but parent %q uses %s",
+					filepath.Join(srcRoot, rootRet), vcsRet, filepath.Join(srcRoot, root), vcs)
+			}
+		}
+
+		// Move to parent.
+		ndir := filepath.Dir(dir)
+		if len(ndir) >= len(dir) {
+			// Shouldn't happen, but just in case, stop.
+			break
+		}
+		dir = ndir
+	}
+
+	if vcsRet != "" {
+		return rootRet, nil
+	}
+
+	return "", fmt.Errorf("directory %q is not using a known version control system", origDir)
+}
+
 func extractCanonicalRootImportPath(rootImportPath string) string {
 	// In order to be compatible with go modules, the root import
 	// path of any module at major version v2 or higher must include
@@ -704,12 +823,14 @@ func extractCanonicalRootImportPath(rootImportPath string) string {
 }
 
 func listSrcGOPATHs() ([]string, error) {
+	gopaths := filepath.SplitList(build.Default.GOPATH)
+
 	var (
-		cwd     = CWD()
-		errs    []string
-		srcDirs []string
+		cwd  = CWD()
+		errs []string
 	)
-	for _, gopath := range filepath.SplitList(build.Default.GOPATH) {
+	srcDirs := make([]string, 0, len(gopaths))
+	for _, gopath := range gopaths {
 		gopath = filepath.Clean(gopath)
 
 		if !strings.HasPrefix(cwd, gopath) {
@@ -726,7 +847,7 @@ func listSrcGOPATHs() ([]string, error) {
 	}
 
 	if len(srcDirs) == 0 {
-		return srcDirs, errors.Errorf("failed to find any GOPATH %v", errs)
+		return srcDirs, fmt.Errorf("failed to find any GOPATH %v", errs)
 	}
 
 	return srcDirs, nil

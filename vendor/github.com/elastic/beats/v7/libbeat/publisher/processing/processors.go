@@ -18,15 +18,19 @@
 package processing
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/elastic/beats/v7/libbeat/beat"
 	"github.com/elastic/beats/v7/libbeat/common"
-	"github.com/elastic/beats/v7/libbeat/logp"
 	"github.com/elastic/beats/v7/libbeat/outputs/codec/json"
 	"github.com/elastic/beats/v7/libbeat/processors"
+	"github.com/elastic/elastic-agent-libs/logp"
+	"github.com/elastic/elastic-agent-libs/mapstr"
+	"github.com/elastic/elastic-agent-libs/paths"
 )
 
 type group struct {
@@ -40,15 +44,20 @@ type processorFn struct {
 	fn   func(event *beat.Event) (*beat.Event, error)
 }
 
-func newGeneralizeProcessor(keepNull bool) *processorFn {
-	logger := logp.NewLogger("publisher_processing")
+func newGeneralizeProcessor(keepNull bool, logger *logp.Logger) *processorFn {
+	logger = logger.Named("publisher_processing")
+	g := common.NewGenericEventConverter(keepNull, logger)
 	return newProcessor("generalizeEvent", func(event *beat.Event) (*beat.Event, error) {
 		// Filter out empty events. Empty events are still reported by ACK callbacks.
 		if len(event.Fields) == 0 {
 			return nil, nil
 		}
 
-		g := common.NewGenericEventConverter(keepNull)
+		// data streams require @timestamp field
+		if event.Timestamp.IsZero() {
+			event.Timestamp = time.Now()
+		}
+
 		fields := g.Convert(event.Fields)
 		if fields == nil {
 			logger.Error("fail to convert to generic event")
@@ -71,14 +80,28 @@ func newGroup(title string, log *logp.Logger) *group {
 	}
 }
 
-func (p *group) add(processor processors.Processor) {
+func (p *group) add(processor beat.Processor) {
 	if processor != nil {
 		p.list = append(p.list, processor)
 	}
 }
 
+func (p *group) Close() error {
+	if p == nil {
+		return nil
+	}
+	var errs []error
+	for _, processor := range p.list {
+		err := processors.Close(processor)
+		if err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
 func (p *group) String() string {
-	var s []string
+	s := make([]string, 0, len(p.list))
 	for _, p := range p.list {
 		s = append(s, p.String())
 	}
@@ -92,6 +115,17 @@ func (p *group) String() string {
 
 func (p *group) All() []beat.Processor {
 	return p.list
+}
+
+func (p *group) SetPaths(paths *paths.Path) error {
+	var err error
+	for _, processor := range p.list {
+		pathSetter, ok := processor.(processors.PathSetter)
+		if ok {
+			err = errors.Join(err, pathSetter.SetPaths(paths))
+		}
+	}
+	return err
 }
 
 func (p *group) Run(event *beat.Event) (*beat.Event, error) {
@@ -134,7 +168,7 @@ func newAnnotateProcessor(name string, fn func(*beat.Event)) *processorFn {
 func (p *processorFn) String() string                         { return p.name }
 func (p *processorFn) Run(e *beat.Event) (*beat.Event, error) { return p.fn(e) }
 
-func clientEventMeta(meta common.MapStr, needsCopy bool) *processorFn {
+func clientEventMeta(meta mapstr.M, needsCopy bool) *processorFn {
 	fn := func(event *beat.Event) { addMeta(event, meta) }
 	if needsCopy {
 		fn = func(event *beat.Event) { addMeta(event, meta.Clone()) }
@@ -142,19 +176,18 @@ func clientEventMeta(meta common.MapStr, needsCopy bool) *processorFn {
 	return newAnnotateProcessor("@metadata", fn)
 }
 
-func addMeta(event *beat.Event, meta common.MapStr) {
+func addMeta(event *beat.Event, meta mapstr.M) {
 	if event.Meta == nil {
 		event.Meta = meta
 	} else {
-		event.Meta.Clone()
 		event.Meta.DeepUpdate(meta)
 	}
 }
 
 func makeAddDynMetaProcessor(
 	name string,
-	meta *common.MapStrPointer,
-	checkCopy func(m common.MapStr) bool,
+	meta *mapstr.Pointer,
+	checkCopy func(m mapstr.M) bool,
 ) *processorFn {
 	return newAnnotateProcessor(name, func(event *beat.Event) {
 		dynFields := meta.Get()
@@ -176,6 +209,10 @@ func debugPrintProcessor(info beat.Info, log *logp.Logger) *processorFn {
 		EscapeHTML: false,
 	})
 	return newProcessor("debugPrint", func(event *beat.Event) (*beat.Event, error) {
+		if !log.IsDebug() {
+			return event, nil
+		}
+
 		mux.Lock()
 		defer mux.Unlock()
 
@@ -184,17 +221,17 @@ func debugPrintProcessor(info beat.Info, log *logp.Logger) *processorFn {
 			return event, nil
 		}
 
-		log.Debugf("Publish event: %s", b)
+		log.Debugw(fmt.Sprintf("Publish event: %s", b), logp.TypeKey, logp.EventType)
 		return event, nil
 	})
 }
 
-func hasKey(m common.MapStr, key string) bool {
+func hasKey(m mapstr.M, key string) bool {
 	_, exists := m[key]
 	return exists
 }
 
-func hasKeyAnyOf(m, builtin common.MapStr) bool {
+func hasKeyAnyOf(m, builtin mapstr.M) bool {
 	for k := range builtin {
 		if hasKey(m, k) {
 			return true

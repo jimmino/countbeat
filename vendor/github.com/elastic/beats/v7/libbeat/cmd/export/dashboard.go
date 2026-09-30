@@ -18,26 +18,30 @@
 package export
 
 import (
-	"fmt"
 	"path/filepath"
 
 	"github.com/spf13/cobra"
 
 	"github.com/elastic/beats/v7/libbeat/cmd/instance"
-	"github.com/elastic/beats/v7/libbeat/common"
 	"github.com/elastic/beats/v7/libbeat/dashboards"
-	"github.com/elastic/beats/v7/libbeat/kibana"
+	"github.com/elastic/beats/v7/libbeat/version"
+	"github.com/elastic/elastic-agent-libs/config"
+	kbn "github.com/elastic/elastic-agent-libs/kibana"
 )
 
 // GenDashboardCmd is the command used to export a dashboard.
 func GenDashboardCmd(settings instance.Settings) *cobra.Command {
 	genTemplateConfigCmd := &cobra.Command{
 		Use:   "dashboard",
-		Short: "Export defined dashboard to stdout",
+		Short: "Export dashboards to files",
 		Run: func(cmd *cobra.Command, args []string) {
 			dashboard, _ := cmd.Flags().GetString("id")
 			yml, _ := cmd.Flags().GetString("yml")
-			decode, _ := cmd.Flags().GetBool("decode")
+			folder, _ := cmd.Flags().GetString("folder")
+
+			if len(folder) == 0 {
+				fatalf("--folder must be specified")
+			}
 
 			b, err := instance.NewInitializedBeat(settings)
 			if err != nil {
@@ -46,10 +50,16 @@ func GenDashboardCmd(settings instance.Settings) *cobra.Command {
 
 			// Use empty config to use default configs if not set
 			if b.Config.Kibana == nil {
-				b.Config.Kibana = common.NewConfig()
+				b.Config.Kibana = config.NewConfig()
 			}
 
-			client, err := kibana.NewKibanaClient(b.Config.Kibana)
+			// Initialize kibana config. If username and password is set in
+			// elasticsearch output config but not in kibana, initKibanaConfig
+			// will attach the username and password into kibana config as a
+			// part of the initialization.
+			initConfig := instance.InitKibanaConfig(b.Config)
+
+			client, err := kbn.NewKibanaClient(initConfig, b.Info.Beat, version.GetDefaultVersion(), version.Commit(), version.BuildTime().String())
 			if err != nil {
 				fatalf("Error creating Kibana client: %+v.\n", err)
 			}
@@ -61,9 +71,7 @@ func GenDashboardCmd(settings instance.Settings) *cobra.Command {
 					fatalf("Error exporting dashboards from yml: %+v.\n", err)
 				}
 				for i, r := range results {
-					if decode {
-						r = dashboards.DecodeExported(r)
-					}
+					r = dashboards.DecodeExported(r, b.Info.Logger)
 
 					err = dashboards.SaveToFile(r, info.Dashboards[i].File, filepath.Dir(yml), client.GetVersion())
 					if err != nil {
@@ -81,17 +89,20 @@ func GenDashboardCmd(settings instance.Settings) *cobra.Command {
 					fatalf("Error exporting dashboard: %+v.\n", err)
 				}
 
-				if decode {
-					result = dashboards.DecodeExported(result)
+				result = dashboards.DecodeExported(result, b.Info.Logger)
+
+				err = dashboards.SaveToFolder(result, folder, client.GetVersion())
+				if err != nil {
+					fatalf("Error saving assets to folder '%s' : %+v.\n", folder, err)
 				}
-				fmt.Println(result.StringToPrint())
+
 			}
 		},
 	}
 
 	genTemplateConfigCmd.Flags().String("id", "", "Dashboard id")
-	genTemplateConfigCmd.Flags().String("yml", "", "Yaml file containing list of dashboard ID and filename pairs")
-	genTemplateConfigCmd.Flags().Bool("decode", false, "Decode exported dashboard")
+	genTemplateConfigCmd.Flags().String("yml", "", "YAML file containing dashboard ID and filename pairs")
+	genTemplateConfigCmd.Flags().String("folder", "", "Target folder to save exported assets")
 
 	return genTemplateConfigCmd
 }

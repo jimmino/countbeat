@@ -372,6 +372,9 @@ func (c cfgSub) reify(opts *options) (interface{}, error) {
 	arr := c.c.fields.array()
 
 	switch {
+	case len(fields) == 0 && len(arr) == 0 && arr != nil:
+		// preserve empty arrays
+		return []interface{}{}, nil
 	case len(fields) == 0 && len(arr) == 0:
 		return nil, nil
 	case len(fields) > 0 && len(arr) == 0:
@@ -556,6 +559,11 @@ func (s spliceDynValue) String() string {
 func parseValue(p *cfgPrimitive, opts *options, str string, parseCfg parse.Config) (value, error) {
 	if opts.noParse {
 		return nil, raiseNoParse(p.ctx, p.meta())
+	}
+
+	// only set IgnoreCommas if the default has been changed.
+	if opts.ignoreCommas {
+		parseCfg.IgnoreCommas = opts.ignoreCommas
 	}
 
 	ifc, err := parse.ValueWithConfig(str, parseCfg)

@@ -5,8 +5,9 @@ import (
 	"time"
 
 	"github.com/elastic/beats/v7/libbeat/beat"
-	"github.com/elastic/beats/v7/libbeat/common"
-	"github.com/elastic/beats/v7/libbeat/logp"
+	conf "github.com/elastic/elastic-agent-libs/config"
+	"github.com/elastic/elastic-agent-libs/logp"
+	"github.com/elastic/elastic-agent-libs/mapstr"
 
 	"github.com/jimmino/countbeat/config"
 )
@@ -16,10 +17,11 @@ type countbeat struct {
 	done   chan struct{}
 	config config.Config
 	client beat.Client
+	logger *logp.Logger
 }
 
 // New creates an instance of countbeat.
-func New(b *beat.Beat, cfg *common.Config) (beat.Beater, error) {
+func New(b *beat.Beat, cfg *conf.C) (beat.Beater, error) {
 	c := config.DefaultConfig
 	if err := cfg.Unpack(&c); err != nil {
 		return nil, fmt.Errorf("Error reading config file: %v", err)
@@ -28,13 +30,14 @@ func New(b *beat.Beat, cfg *common.Config) (beat.Beater, error) {
 	bt := &countbeat{
 		done:   make(chan struct{}),
 		config: c,
+		logger: b.Info.Logger.Named("countbeat"),
 	}
 	return bt, nil
 }
 
 // Run starts countbeat.
 func (bt *countbeat) Run(b *beat.Beat) error {
-	logp.Info("countbeat is running! Hit CTRL-C to stop it.")
+	bt.logger.Info("countbeat is running! Hit CTRL-C to stop it.")
 
 	var err error
 	bt.client, err = b.Publisher.Connect()
@@ -53,13 +56,13 @@ func (bt *countbeat) Run(b *beat.Beat) error {
 
 		event := beat.Event{
 			Timestamp: time.Now(),
-			Fields: common.MapStr{
+			Fields: mapstr.M{
 				"type":    b.Info.Name,
 				"counter": counter,
 			},
 		}
 		bt.client.Publish(event)
-		logp.Info("Event sent")
+		bt.logger.Info("Event sent")
 		counter++
 	}
 }

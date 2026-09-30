@@ -22,22 +22,21 @@ import (
 	"sync"
 	"time"
 
+	"github.com/elastic/elastic-agent-libs/logp"
+	"github.com/elastic/elastic-agent-libs/mapstr"
+	"github.com/elastic/elastic-agent-libs/version"
 	"github.com/elastic/go-ucfg/yaml"
 
 	"github.com/elastic/beats/v7/libbeat/beat"
-	"github.com/elastic/beats/v7/libbeat/common"
 	"github.com/elastic/beats/v7/libbeat/common/fmtstr"
 	"github.com/elastic/beats/v7/libbeat/mapping"
 )
 
 var (
 	// Defaults used in the template
-	defaultDateDetection         = false
-	defaultTotalFieldsLimit      = 10000
-	defaultNumberOfRoutingShards = 30
-
-	// Array to store dynamicTemplate parts in
-	dynamicTemplates []common.MapStr
+	defaultDateDetection           = false
+	defaultTotalFieldsLimit        = 12500
+	defaultMaxDocvalueFieldsSearch = 200
 
 	defaultFields []string
 )
@@ -45,52 +44,62 @@ var (
 // Template holds information for the ES template.
 type Template struct {
 	sync.Mutex
-	name        string
-	pattern     string
-	beatVersion common.Version
-	beatName    string
-	esVersion   common.Version
-	config      TemplateConfig
-	migration   bool
-	order       int
+	name            string
+	pattern         string
+	elasticLicensed bool
+	beatVersion     version.V
+	beatName        string
+	esVersion       version.V
+	config          TemplateConfig
+	migration       bool
+	priority        int
+	isServerless    bool
+	logger          *logp.Logger
 }
 
 // New creates a new template instance
 func New(
+	isServerless bool,
 	beatVersion string,
 	beatName string,
-	esVersion common.Version,
+	elasticLicensed bool,
+	esVersion version.V,
 	config TemplateConfig,
 	migration bool,
+	log *logp.Logger,
 ) (*Template, error) {
-	bV, err := common.NewVersion(beatVersion)
+	bV, err := version.New(beatVersion)
 	if err != nil {
 		return nil, err
 	}
 
 	name := config.Name
+	if config.JSON.Enabled {
+		name = config.JSON.Name
+	}
+
 	if name == "" {
 		name = fmt.Sprintf("%s-%s", beatName, bV.String())
 	}
 
 	pattern := config.Pattern
 	if pattern == "" {
-		pattern = name + "-*"
+		pattern = name + "*"
 	}
 
 	event := &beat.Event{
-		Fields: common.MapStr{
+		Fields: mapstr.M{
 			// beat object was left in for backward compatibility reason for older configs.
-			"beat": common.MapStr{
+			"beat": mapstr.M{
 				"name":    beatName,
 				"version": bV.String(),
 			},
-			"agent": common.MapStr{
+			"agent": mapstr.M{
 				"name":    beatName,
 				"version": bV.String(),
 			},
 			// For the Beats that have an observer role
-			"observer": common.MapStr{
+			"observer": mapstr.M{
 				"name":    beatName,
 				"version": bV.String(),
 			},
@@ -122,24 +131,26 @@ func New(
 	}
 
 	return &Template{
-		pattern:     pattern,
-		name:        name,
-		beatVersion: *bV,
-		esVersion:   esVersion,
-		beatName:    beatName,
-		config:      config,
-		migration:   migration,
-		order:       config.Order,
+		pattern:         pattern,
+		name:            name,
+		elasticLicensed: elasticLicensed,
+		beatVersion:     *bV,
+		esVersion:       esVersion,
+		beatName:        beatName,
+		config:          config,
+		migration:       migration,
+		priority:        config.Priority,
+		isServerless:    isServerless,
+		logger:          log,
 	}, nil
 }
 
-func (t *Template) load(fields mapping.Fields) (common.MapStr, error) {
+func (t *Template) load(fields mapping.Fields) (mapstr.M, error) {
 
 	// Locking to make sure dynamicTemplates and defaultFields is not accessed in parallel
 	t.Lock()
 	defer t.Unlock()
 
-	dynamicTemplates = nil
 	defaultFields = nil
 
 	var err error
@@ -151,18 +162,20 @@ func (t *Template) load(fields mapping.Fields) (common.MapStr, error) {
 	}
 
 	// Start processing at the root
-	properties := common.MapStr{}
-	processor := Processor{EsVersion: t.esVersion, Migration: t.migration}
-	if err := processor.Process(fields, nil, properties); err != nil {
+	properties := mapstr.M{}
+	analyzers := mapstr.M{}
+	processor := Processor{EsVersion: t.esVersion, ElasticLicensed: t.elasticLicensed, Migration: t.migration}
+	if err := processor.Process(fields, nil, properties, analyzers); err != nil {
 		return nil, err
 	}
-	output := t.Generate(properties, dynamicTemplates)
+
+	output := t.Generate(properties, analyzers, processor.dynamicTemplates)
 
 	return output, nil
 }
 
 // LoadFile loads the the template from the given file path
-func (t *Template) LoadFile(file string) (common.MapStr, error) {
+func (t *Template) LoadFile(file string) (mapstr.M, error) {
 	fields, err := mapping.LoadFieldsYaml(file)
 	if err != nil {
 		return nil, err
@@ -172,7 +185,7 @@ func (t *Template) LoadFile(file string) (common.MapStr, error) {
 }
 
 // LoadBytes loads the template from the given byte array
-func (t *Template) LoadBytes(data []byte) (common.MapStr, error) {
+func (t *Template) LoadBytes(data []byte) (mapstr.M, error) {
 	fields, err := loadYamlByte(data)
 	if err != nil {
 		return nil, err
@@ -182,22 +195,27 @@ func (t *Template) LoadBytes(data []byte) (common.MapStr, error) {
 }
 
 // LoadMinimal loads the template only with the given configuration
-func (t *Template) LoadMinimal() (common.MapStr, error) {
-	keyPattern, patterns := buildPatternSettings(t.esVersion, t.GetPattern())
-	m := common.MapStr{
-		keyPattern: patterns,
-		"order":    t.order,
-		"settings": common.MapStr{
-			"index": t.config.Settings.Index,
-		},
-	}
+func (t *Template) LoadMinimal() mapstr.M {
+	templ := mapstr.M{}
 	if t.config.Settings.Source != nil {
-		m["mappings"] = buildMappings(
-			t.beatVersion, t.esVersion, t.beatName,
+		templ["mappings"] = buildMappings(
+			t.beatVersion, t.beatName,
 			nil, nil,
-			common.MapStr(t.config.Settings.Source))
+			mapstr.M(t.config.Settings.Source))
 	}
-	return m, nil
+	// delete default settings not available on serverless
+	if _, ok := t.config.Settings.Index["number_of_shards"]; ok && t.isServerless {
+		delete(t.config.Settings.Index, "number_of_shards")
+	}
+	templ["settings"] = mapstr.M{
+		"index": t.config.Settings.Index,
+	}
+	return mapstr.M{
+		"template":       templ,
+		"data_stream":    struct{}{},
+		"priority":       t.priority,
+		"index_patterns": []string{t.GetPattern()},
+	}
 }
 
 // GetName returns the name of the template
@@ -212,41 +230,51 @@ func (t *Template) GetPattern() string {
 
 // Generate generates the full template
 // The default values are taken from the default variable.
-func (t *Template) Generate(properties common.MapStr, dynamicTemplates []common.MapStr) common.MapStr {
-	keyPattern, patterns := buildPatternSettings(t.esVersion, t.GetPattern())
-	return common.MapStr{
-		keyPattern: patterns,
-		"order":    t.order,
-		"mappings": buildMappings(
-			t.beatVersion, t.esVersion, t.beatName,
-			properties,
-			append(dynamicTemplates, buildDynTmpl(t.esVersion)),
-			common.MapStr(t.config.Settings.Source)),
-		"settings": common.MapStr{
-			"index": buildIdxSettings(
-				t.esVersion,
-				t.config.Settings.Index,
-			),
-		},
-	}
+func (t *Template) Generate(properties, analyzers mapstr.M, dynamicTemplates []mapstr.M) mapstr.M {
+	tmpl := t.generateComponent(properties, analyzers, dynamicTemplates)
+	tmpl["data_stream"] = struct{}{}
+	tmpl["priority"] = t.priority
+	tmpl["index_patterns"] = []string{t.GetPattern()}
+	return tmpl
+
 }
 
-func buildPatternSettings(ver common.Version, pattern string) (string, interface{}) {
-	if ver.Major < 6 {
-		return "template", pattern
+func (t *Template) generateComponent(properties, analyzers mapstr.M, dynamicTemplates []mapstr.M) mapstr.M {
+	m := mapstr.M{
+		"template": mapstr.M{
+			"mappings": buildMappings(
+				t.beatVersion, t.beatName,
+				properties,
+				append(dynamicTemplates, buildDynTmpl(t.esVersion)),
+				mapstr.M(t.config.Settings.Source)),
+			"settings": mapstr.M{
+				"index": buildIdxSettings(
+					t.esVersion,
+					t.config.Settings.Index,
+					t.isServerless,
+					t.logger,
+				),
+			},
+		},
 	}
-	return "index_patterns", []string{pattern}
+	if len(t.config.Settings.Lifecycle) > 0 {
+		m.Put("template.lifecycle", t.config.Settings.Lifecycle)
+	}
+	if len(analyzers) != 0 {
+		m.Put("template.settings.analysis.analyzer", analyzers)
+	}
+	return m
 }
 
 func buildMappings(
-	beatVersion, esVersion common.Version,
+	beatVersion version.V,
 	beatName string,
-	properties common.MapStr,
-	dynTmpls []common.MapStr,
-	source common.MapStr,
-) common.MapStr {
-	mapping := common.MapStr{
-		"_meta": common.MapStr{
+	properties mapstr.M,
+	dynTmpls []mapstr.M,
+	source mapstr.M,
+) mapstr.M {
+	mapping := mapstr.M{
+		"_meta": mapstr.M{
 			"version": beatVersion.String(),
 			"beat":    beatName,
 		},
@@ -259,70 +287,44 @@ func buildMappings(
 		mapping["_source"] = source
 	}
 
-	major := esVersion.Major
-	switch {
-	case major == 2:
-		mapping.Put("_all.norms.enabled", false)
-		mapping = common.MapStr{
-			"_default_": mapping,
-		}
-	case major < 6:
-		mapping = common.MapStr{
-			"_default_": mapping,
-		}
-	case major == 6:
-		mapping = common.MapStr{
-			"doc": mapping,
-		}
-	case major >= 7:
-		// keep typeless structure
-	}
-
 	return mapping
 }
 
-func buildDynTmpl(ver common.Version) common.MapStr {
-	strMapping := common.MapStr{
-		"ignore_above": 1024,
-		"type":         "keyword",
-	}
-	if ver.Major == 2 {
-		strMapping["type"] = "string"
-		strMapping["index"] = "not_analyzed"
-	}
-
-	return common.MapStr{
-		"strings_as_keyword": common.MapStr{
-			"mapping":            strMapping,
+func buildDynTmpl(ver version.V) mapstr.M {
+	return mapstr.M{
+		"strings_as_keyword": mapstr.M{
+			"mapping": mapstr.M{
+				"ignore_above": 1024,
+				"type":         "keyword",
+			},
 			"match_mapping_type": "string",
 		},
 	}
 }
 
-func buildIdxSettings(ver common.Version, userSettings common.MapStr) common.MapStr {
-	indexSettings := common.MapStr{
+func buildIdxSettings(ver version.V, userSettings mapstr.M, isServerless bool, logger *logp.Logger) mapstr.M {
+	indexSettings := mapstr.M{
 		"refresh_interval": "5s",
-		"mapping": common.MapStr{
-			"total_fields": common.MapStr{
+		"mapping": mapstr.M{
+			"total_fields": mapstr.M{
 				"limit": defaultTotalFieldsLimit,
 			},
 		},
 	}
 
-	// number_of_routing shards is only supported for ES version >= 6.1
-	// If ES >= 7.0 we can exclude this setting as well.
-	version61, _ := common.NewVersion("6.1.0")
-	if !ver.LessThan(version61) && ver.Major < 7 {
-		indexSettings.Put("number_of_routing_shards", defaultNumberOfRoutingShards)
-	}
+	// copy defaultFields, as defaultFields is shared global slice.
+	fields := make([]string, len(defaultFields))
+	copy(fields, defaultFields)
+	fields = append(fields, "fields.*")
 
-	if ver.Major >= 7 {
-		// copy defaultFields, as defaultFields is shared global slice.
-		fields := make([]string, len(defaultFields))
-		copy(fields, defaultFields)
-		fields = append(fields, "fields.*")
+	indexSettings.Put("query.default_field", fields)
 
-		indexSettings.Put("query.default_field", fields)
+	// deal with settings that aren't available on serverless
+	if isServerless {
+		logger.Infof("remote instance is serverless, number_of_shards and max_docvalue_fields_search will be skipped in index template")
+		userSettings.Delete("number_of_shards")
+	} else {
+		indexSettings.Put("max_docvalue_fields_search", defaultMaxDocvalueFieldsSearch)
 	}
 
 	indexSettings.DeepUpdate(userSettings)

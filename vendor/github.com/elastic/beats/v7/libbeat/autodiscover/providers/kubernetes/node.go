@@ -15,23 +15,28 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//go:build linux || darwin || windows
+
 package kubernetes
 
 import (
 	"fmt"
 	"time"
 
-	"github.com/gofrs/uuid"
+	"github.com/elastic/beats/v7/pkg/autodiscover/utils"
+
+	"github.com/gofrs/uuid/v5"
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	k8s "k8s.io/client-go/kubernetes"
 
-	"github.com/elastic/beats/v7/libbeat/autodiscover/builder"
-	"github.com/elastic/beats/v7/libbeat/common"
-	"github.com/elastic/beats/v7/libbeat/common/bus"
-	"github.com/elastic/beats/v7/libbeat/common/kubernetes"
-	"github.com/elastic/beats/v7/libbeat/common/kubernetes/metadata"
-	"github.com/elastic/beats/v7/libbeat/common/safemapstr"
-	"github.com/elastic/beats/v7/libbeat/logp"
+	"github.com/elastic/beats/v7/pkg/autodiscover/bus"
+	"github.com/elastic/beats/v7/pkg/autodiscover/kubernetes"
+	"github.com/elastic/beats/v7/pkg/autodiscover/kubernetes/metadata"
+
+	"github.com/elastic/elastic-agent-libs/config"
+	"github.com/elastic/elastic-agent-libs/logp"
+	"github.com/elastic/elastic-agent-libs/mapstr"
 )
 
 type node struct {
@@ -39,44 +44,63 @@ type node struct {
 	config  *Config
 	metagen metadata.MetaGen
 	logger  *logp.Logger
-	publish func(bus.Event)
+	publish func([]bus.Event)
 	watcher kubernetes.Watcher
 }
 
 // NewNodeEventer creates an eventer that can discover and process node objects
-func NewNodeEventer(uuid uuid.UUID, cfg *common.Config, client k8s.Interface, publish func(event bus.Event)) (Eventer, error) {
-	logger := logp.NewLogger("autodiscover.node")
+func NewNodeEventer(
+	uuid uuid.UUID,
+	cfg *config.C,
+	client k8s.Interface,
+	publish func(event []bus.Event),
+	logger *logp.Logger) (Eventer, error) {
 
+	logger = logger.Named("node")
 	config := defaultConfig()
 	err := cfg.Unpack(&config)
 	if err != nil {
 		return nil, err
 	}
 
+	// log warning about any unsupported params
+	config.checkUnsupportedParams(logger)
+
 	// Ensure that node is set correctly whenever the scope is set to "node". Make sure that node is empty
 	// when cluster scope is enforced.
 	if config.Scope == "node" {
-		config.Node = kubernetes.DiscoverKubernetesNode(logger, config.Node, kubernetes.IsInCluster(config.KubeConfig), client)
+		nd := &kubernetes.DiscoverKubernetesNodeParams{
+			ConfigHost:  config.Node,
+			Client:      client,
+			IsInCluster: kubernetes.IsInCluster(config.KubeConfig),
+			HostUtils:   &kubernetes.DefaultDiscoveryUtils{},
+		}
+		config.Node, err = kubernetes.DiscoverKubernetesNode(logger, nd)
+		if err != nil {
+			return nil, fmt.Errorf("could not discover kubernetes node: %w", err)
+		}
 	} else {
 		config.Node = ""
 	}
 
 	logger.Debugf("Initializing a new Kubernetes watcher using node: %v", config.Node)
 
-	watcher, err := kubernetes.NewWatcher(client, &kubernetes.Node{}, kubernetes.WatchOptions{
-		SyncTimeout: config.SyncPeriod,
-		Node:        config.Node,
-	}, nil)
+	watcher, err := kubernetes.NewNamedWatcher("node", client, &kubernetes.Node{}, kubernetes.WatchOptions{
+		SyncTimeout:  config.SyncPeriod,
+		Node:         config.Node,
+		IsUpdated:    isUpdated,
+		HonorReSyncs: true,
+	}, nil, logger)
 
 	if err != nil {
-		return nil, fmt.Errorf("couldn't create watcher for %T due to error %+v", &kubernetes.Node{}, err)
+		return nil, fmt.Errorf("couldn't create watcher for %T due to error %w", &kubernetes.Node{}, err)
 	}
 
 	p := &node{
 		config:  config,
 		uuid:    uuid,
 		publish: publish,
-		metagen: metadata.NewNodeMetadataGenerator(cfg, watcher.Store()),
+		metagen: metadata.NewNodeMetadataGenerator(cfg, watcher.Store(), client),
 		logger:  logger,
 		watcher: watcher,
 	}
@@ -86,14 +110,18 @@ func NewNodeEventer(uuid uuid.UUID, cfg *common.Config, client k8s.Interface, pu
 }
 
 // OnAdd ensures processing of node objects that are newly created
-func (n *node) OnAdd(obj interface{}) {
+func (n *node) OnAdd(obj any) {
 	n.logger.Debugf("Watcher Node add: %+v", obj)
-	n.emit(obj.(*kubernetes.Node), "start")
+	n.emit(obj.(*kubernetes.Node), "start") //nolint // existing check
 }
 
 // OnUpdate ensures processing of node objects that are updated
-func (n *node) OnUpdate(obj interface{}) {
-	node := obj.(*kubernetes.Node)
+func (n *node) OnUpdate(obj any) {
+	node, ok := obj.(*kubernetes.Node)
+	if !ok {
+		n.logger.Errorf("Unexpected type expecting *kubernetes.Node: %+v", obj)
+		return
+	}
 	if node.GetObjectMeta().GetDeletionTimestamp() != nil {
 		n.logger.Debugf("Watcher Node update (terminating): %+v", obj)
 		// Node is terminating, don't reload its configuration and ignore the event as long as node is Ready.
@@ -103,16 +131,20 @@ func (n *node) OnUpdate(obj interface{}) {
 		time.AfterFunc(n.config.CleanupTimeout, func() { n.emit(node, "stop") })
 	} else {
 		n.logger.Debugf("Watcher Node update: %+v", obj)
-		// TODO: figure out how to avoid stop starting when node status is periodically being updated by kubelet
 		n.emit(node, "stop")
 		n.emit(node, "start")
 	}
 }
 
 // OnDelete ensures processing of node objects that are deleted
-func (n *node) OnDelete(obj interface{}) {
+func (n *node) OnDelete(obj any) {
 	n.logger.Debugf("Watcher Node delete: %+v", obj)
-	time.AfterFunc(n.config.CleanupTimeout, func() { n.emit(obj.(*kubernetes.Node), "stop") })
+	time.AfterFunc(n.config.CleanupTimeout, func() {
+		node, ok := obj.(*kubernetes.Node)
+		if ok {
+			n.emit(node, "stop")
+		}
+	})
 }
 
 // GenerateHints creates hints needed for hints builder
@@ -120,15 +152,17 @@ func (n *node) GenerateHints(event bus.Event) bus.Event {
 	// Try to build a config with enabled builders. Send a provider agnostic payload.
 	// Builders are Beat specific.
 	e := bus.Event{}
-	var annotations common.MapStr
-	var kubeMeta common.MapStr
+	var annotations mapstr.M
+	var kubeMeta mapstr.M
 	rawMeta, ok := event["kubernetes"]
 	if ok {
-		kubeMeta = rawMeta.(common.MapStr)
-		// The builder base config can configure any of the field values of kubernetes if need be.
-		e["kubernetes"] = kubeMeta
-		if rawAnn, ok := kubeMeta["annotations"]; ok {
-			annotations = rawAnn.(common.MapStr)
+		kubeMeta, ok = rawMeta.(mapstr.M)
+		if ok {
+			// The builder base config can configure any of the field values of kubernetes if need be.
+			e["kubernetes"] = kubeMeta
+			if rawAnn, ok := kubeMeta["annotations"]; ok {
+				annotations = rawAnn.(mapstr.M) //nolint:errcheck // type validated by map lookup
+			}
 		}
 	}
 	if host, ok := event["host"]; ok {
@@ -138,7 +172,11 @@ func (n *node) GenerateHints(event bus.Event) bus.Event {
 		e["port"] = port
 	}
 
-	hints := builder.GenerateHints(annotations, "", n.config.Prefix)
+	hints, incorrecthints := utils.GenerateHints(annotations, "", n.config.Prefix, true, AllSupportedHints)
+	// We check whether the provided annotation follows the supported format and vocabulary. The check happens for annotations that have prefix co.elastic
+	for _, value := range incorrecthints {
+		n.logger.Debugf("provided hint: %s/%s is not in the supported list", n.config.Prefix, value)
+	}
 	n.logger.Debugf("Generated hints %+v", hints)
 	if len(hints) != 0 {
 		e["hints"] = hints
@@ -167,14 +205,21 @@ func (n *node) emit(node *kubernetes.Node, flag string) {
 		return
 	}
 
+	// If the node is not in ready state then dont monitor it unless its a stop event
+	if !isNodeReady(node) && flag != "stop" {
+		return
+	}
+
 	eventID := fmt.Sprint(node.GetObjectMeta().GetUID())
 	meta := n.metagen.Generate(node)
 
-	kubemeta := meta.Clone()
+	kubemetaMap, _ := meta.GetValue("kubernetes")
+	kubemeta, _ := kubemetaMap.(mapstr.M)
+	kubemeta = kubemeta.Clone()
 	// Pass annotations to all events so that it can be used in templating and by annotation builders.
-	annotations := common.MapStr{}
+	annotations := mapstr.M{}
 	for k, v := range node.GetObjectMeta().GetAnnotations() {
-		safemapstr.Put(annotations, k, v)
+		ShouldPut(annotations, k, v, n.logger)
 	}
 	kubemeta["annotations"] = annotations
 	event := bus.Event{
@@ -183,11 +228,42 @@ func (n *node) emit(node *kubernetes.Node, flag string) {
 		flag:         true,
 		"host":       host,
 		"kubernetes": kubemeta,
-		"meta": common.MapStr{
-			"kubernetes": meta,
-		},
+		"meta":       meta,
 	}
-	n.publish(event)
+	n.publish([]bus.Event{event})
+}
+
+func isUpdated(o, n any) bool {
+	old, _ := o.(*kubernetes.Node)
+	new, _ := n.(*kubernetes.Node)
+
+	// Consider as not update in case one of the two objects is not a Node
+	if old == nil || new == nil {
+		return true
+	}
+
+	// This is a resync. It is not an update
+	if old.ResourceVersion == new.ResourceVersion {
+		return false
+	}
+
+	// If the old object and new object are different
+	oldCopy := old.DeepCopy()
+	oldCopy.ResourceVersion = ""
+
+	newCopy := new.DeepCopy()
+	newCopy.ResourceVersion = ""
+
+	// If the old object and new object are different in either meta or spec then there is a valid change
+	if !equality.Semantic.DeepEqual(oldCopy.Spec, newCopy.Spec) || !equality.Semantic.DeepEqual(oldCopy.ObjectMeta, newCopy.ObjectMeta) {
+		return true
+	}
+
+	// If there is a change in the node status then there is a valid change.
+	if isNodeReady(old) != isNodeReady(new) {
+		return true
+	}
+	return false
 }
 
 func getAddress(node *kubernetes.Node) string {
@@ -199,6 +275,12 @@ func getAddress(node *kubernetes.Node) string {
 
 	for _, address := range node.Status.Addresses {
 		if address.Type == v1.NodeInternalIP && address.Address != "" {
+			return address.Address
+		}
+	}
+
+	for _, address := range node.Status.Addresses {
+		if address.Type == v1.NodeHostName && address.Address != "" {
 			return address.Address
 		}
 	}

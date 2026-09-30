@@ -77,7 +77,7 @@ var (
 
 	ErrPointerRequired = errors.New("pointer required for unpacking configurations")
 
-	ErrArraySizeMistach = errors.New("Array size mismatch")
+	ErrArraySizeMismatch = errors.New("Array size mismatch")
 
 	ErrExpectedObject = errors.New("expected object")
 
@@ -120,6 +120,7 @@ func (e baseError) Reason() error { return e.reason }
 func (e baseError) Class() error  { return e.class }
 func (e baseError) Trace() string { return "" }
 func (e baseError) Path() string  { return e.path }
+func (e baseError) Unwrap() error { return e.reason }
 
 func (e baseError) Message() string {
 	if e.message == "" {
@@ -295,7 +296,7 @@ func raiseToTypeNotSupported(opts *options, v value, goT reflect.Type) Error {
 }
 
 func raiseArraySize(ctx context, meta *Meta, n int, to int) Error {
-	reason := ErrArraySizeMistach
+	reason := ErrArraySizeMismatch
 	message := fmt.Sprintf("array of length %v does not meet required length %v",
 		n, to)
 

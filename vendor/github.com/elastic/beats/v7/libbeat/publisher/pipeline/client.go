@@ -19,37 +19,52 @@ package pipeline
 
 import (
 	"sync"
+	"sync/atomic"
 
 	"github.com/elastic/beats/v7/libbeat/beat"
-	"github.com/elastic/beats/v7/libbeat/common/atomic"
-	"github.com/elastic/beats/v7/libbeat/logp"
+	"github.com/elastic/beats/v7/libbeat/processors"
 	"github.com/elastic/beats/v7/libbeat/publisher"
 	"github.com/elastic/beats/v7/libbeat/publisher/queue"
+	"github.com/elastic/elastic-agent-libs/logp"
 )
 
+var _ beat.Client = (*client)(nil)
+
+// client implements beat.Client interface
 // client connects a beat with the processors and pipeline queue.
 //
-// TODO: All ackers currently drop any late incoming ACK. Some beats still might
-//       be interested in handling/waiting for event ACKs more globally
-//       -> add support for not dropping pending ACKs
+// Shutdown is two-stage. Close (stage one, called by the client's owner) stops
+// accepting new events and closes the queue producer, then returns immediately;
+// acknowledgments for already-published events keep flowing. disconnect (stage
+// two, called only by the owning Pipeline) stops accepting acknowledgments and
+// drops all references to the client. Splitting the two lets a Beater close its
+// inputs without blocking, while the Pipeline owns when acknowledgments are
+// finalized — see issues #50104 and #49794.
 type client struct {
-	pipeline   *Pipeline
+	logger     *logp.Logger
 	processors beat.Processor
-	producer   queue.Producer
+	producer   queue.Producer[publisher.Event]
 	mutex      sync.Mutex
-	acker      acker
 
-	eventFlags   publisher.EventFlags
-	canDrop      bool
-	reportEvents bool
+	eventFlags publisher.EventFlags
+	canDrop    bool
 
 	// Open state, signaling, and sync primitives for coordinating client Close.
-	isOpen    atomic.Bool   // set to false during shutdown, such that no new events will be accepted anymore.
-	closeOnce sync.Once     // closeOnce ensure that the client shutdown sequence is only executed once
-	closeRef  beat.CloseRef // extern closeRef for sending a signal that the client should be closed.
-	done      chan struct{} // the done channel will be closed if the closeReg gets closed, or Close is run.
+	isOpen       atomic.Bool // set to false during shutdown, such that no new events will be accepted anymore.
+	disconnected atomic.Bool // set the first time disconnect runs, so the second stage is idempotent.
 
-	eventer beat.ClientEventer
+	// onRemove, if set, unregisters this client from its owning Pipeline. It is
+	// run once, from disconnect.
+	onRemove func()
+
+	// requestFinalize, if set, hands this client to the owning Pipeline's reaper after
+	// Close so it is finalized (stage two) as soon as its events drain, instead
+	// of lingering until the whole pipeline disconnects. Run once, from Close.
+	requestFinalize func()
+
+	observer       observer
+	eventListener  beat.EventListener
+	clientListener beat.ClientListener
 }
 
 func (c *client) PublishAll(events []beat.Event) {
@@ -72,7 +87,6 @@ func (c *client) publish(e beat.Event) {
 	var (
 		event   = &e
 		publish = true
-		log     = c.pipeline.monitors.Logger
 	)
 
 	c.onNewEvent()
@@ -89,9 +103,9 @@ func (c *client) publish(e beat.Event) {
 		event, err = c.processors.Run(event)
 		publish = event != nil
 		if err != nil {
-			// TODO: introduce dead-letter queue?
-
-			log.Errorf("Failed to publish event: %v", err)
+			// If we introduce a dead-letter queue, this is where we should
+			// route the event to it.
+			c.logger.Errorf("Failed to publish event: %v", err)
 		}
 	}
 
@@ -99,15 +113,9 @@ func (c *client) publish(e beat.Event) {
 		e = *event
 	}
 
-	open := c.acker.addEvent(e, publish)
-	if !open {
-		// client is closing down -> report event as dropped and return
-		c.onDroppedOnPublish(e)
-		return
-	}
-
+	c.eventListener.AddEvent(e, publish)
 	if !publish {
-		c.onFilteredOut(e)
+		c.onFilteredOut()
 		return
 	}
 
@@ -117,119 +125,104 @@ func (c *client) publish(e beat.Event) {
 		Flags:   c.eventFlags,
 	}
 
-	if c.reportEvents {
-		c.pipeline.waitCloser.inc()
-	}
-
 	var published bool
 	if c.canDrop {
-		published = c.producer.TryPublish(pubEvent)
+		_, published = c.producer.TryPublish(pubEvent)
 	} else {
-		published = c.producer.Publish(pubEvent)
+		_, published = c.producer.Publish(pubEvent)
 	}
 
 	if published {
 		c.onPublished()
 	} else {
 		c.onDroppedOnPublish(e)
-		if c.reportEvents {
-			c.pipeline.waitCloser.dec(1)
-		}
 	}
 }
 
+// Close performs stage one of shutdown: it stops the client from accepting new
+// events and closes the underlying queue producer, then returns immediately. It
+// does NOT wait for acknowledgments — acks for already-published events keep
+// flowing through the event listener until the owning Pipeline calls disconnect.
+//
+// Note: unlike before, Close no longer blocks for ClientConfig.WaitClose. The
+// pipeline-level shutdown (Pipeline.Disconnect, bounded by its context) is now
+// responsible for waiting on outstanding acknowledgments.
 func (c *client) Close() error {
-	log := c.logger()
+	// Hold the mutex so any in-progress Publish finishes before we flip isOpen.
+	c.mutex.Lock()
+	if !c.isOpen.Swap(false) {
+		c.mutex.Unlock()
+		return nil
+	}
+	c.onClosing()
+	c.mutex.Unlock()
 
-	// first stop ack handling. ACK handler might block on wait (with timeout), waiting
-	// for pending events to be ACKed.
-	c.doClose()
-	log.Debug("client: wait for acker to finish")
-	c.acker.wait()
-	log.Debug("client: acker shut down")
+	c.logger.Debug("client: close queue producer")
+	c.producer.Close()
+	c.logger.Debug("client: done producer close")
+
+	// Processors only run on the publish path, which is now closed, so it is
+	// safe to release them here rather than deferring to disconnect.
+	if c.processors != nil {
+		c.logger.Debug("client: closing processors")
+		err := processors.Close(c.processors)
+		if err != nil {
+			c.logger.Errorf("client: error closing processors: %v", err)
+		}
+		c.logger.Debug("client: done closing processors")
+	}
+
+	// Hand off to the pipeline reaper to finalize (stage two) once this
+	// client's already-published events are acknowledged. The Pipeline also
+	// finalizes any still-registered client on Disconnect, so this is a
+	// best-effort early cleanup.
+	if c.requestFinalize != nil {
+		c.requestFinalize()
+	}
 	return nil
 }
 
-func (c *client) doClose() {
-	c.closeOnce.Do(func() {
-		close(c.done)
-
-		log := c.logger()
-
-		c.isOpen.Store(false)
-		c.onClosing()
-
-		log.Debug("client: closing acker")
-		c.acker.close() // this must trigger a direct/indirect call to 'unlink'
-	})
-}
-
-// unlink is the final step of closing a client. It must be executed only after
-// it is guaranteed that the underlying acker has been closed and will not
-// accept any new publish or ACK events.
-// This method is normally registered with the ACKer and triggered by it.
-func (c *client) unlink() {
-	log := c.logger()
-	log.Debug("client: done closing acker")
-
-	n := c.producer.Cancel() // close connection to queue
-	log.Debugf("client: cancelled %v events", n)
-
-	if c.reportEvents {
-		log.Debugf("client: remove client events")
-		if n > 0 {
-			c.pipeline.waitCloser.dec(n)
-		}
+// disconnect performs stage two of shutdown: it stops accepting acknowledgments
+// and drops all references to the client so a restarting pipeline cannot collide
+// with it or leak it. It is invoked exactly once by the owning Pipeline (never
+// by user code) and is idempotent.
+func (c *client) disconnect() {
+	if c.disconnected.Swap(true) {
+		return
 	}
-
+	c.eventListener.ClientClosed()
+	c.logger.Debug("client: done closing acker")
 	c.onClosed()
-}
-
-func (c *client) logger() *logp.Logger {
-	return c.pipeline.monitors.Logger
+	if c.onRemove != nil {
+		c.onRemove()
+	}
 }
 
 func (c *client) onClosing() {
-	c.pipeline.observer.clientClosing()
-	if c.eventer != nil {
-		c.eventer.Closing()
-	}
+	c.clientListener.Closing()
 }
 
 func (c *client) onClosed() {
-	c.pipeline.observer.clientClosed()
-	if c.eventer != nil {
-		c.eventer.Closed()
-	}
+	c.observer.clientClosed()
+	c.clientListener.Closed()
 }
 
 func (c *client) onNewEvent() {
-	c.pipeline.observer.newEvent()
+	c.observer.newEvent()
+	c.clientListener.NewEvent()
 }
 
 func (c *client) onPublished() {
-	c.pipeline.observer.publishedEvent()
-	if c.eventer != nil {
-		c.eventer.Published()
-	}
+	c.observer.publishedEvent()
+	c.clientListener.Published()
 }
 
-func (c *client) onFilteredOut(e beat.Event) {
-	log := c.logger()
-
-	log.Debugf("Pipeline client receives callback 'onFilteredOut' for event: %+v", e)
-	c.pipeline.observer.filteredEvent()
-	if c.eventer != nil {
-		c.eventer.FilteredOut(e)
-	}
+func (c *client) onFilteredOut() {
+	c.observer.filteredEvent()
+	c.clientListener.Filtered()
 }
 
 func (c *client) onDroppedOnPublish(e beat.Event) {
-	log := c.logger()
-
-	log.Debugf("Pipeline client receives callback 'onDroppedOnPublish' for event: %+v", e)
-	c.pipeline.observer.failedPublishEvent()
-	if c.eventer != nil {
-		c.eventer.DroppedOnPublish(e)
-	}
+	c.observer.failedPublishEvent()
+	c.clientListener.DroppedOnPublish(e)
 }

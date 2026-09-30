@@ -19,23 +19,32 @@ package api
 
 import "os"
 
-// Config is the configuration for the API endpoint.
-type Config struct {
-	Enabled            bool   `config:"enabled"`
-	Host               string `config:"host"`
-	Port               int    `config:"port"`
-	User               string `config:"named_pipe.user"`
-	SecurityDescriptor string `config:"named_pipe.security_descriptor"`
+// StateInspectorConfig holds the configuration for the state store inspector.
+type StateInspectorConfig struct {
+	Enabled bool `config:"enabled"`
 }
 
-var (
-	// DefaultConfig is the default configuration used by the API endpoint.
-	DefaultConfig = Config{
-		Enabled: false,
-		Host:    "localhost",
-		Port:    5066,
-	}
-)
+// DebugConfig holds the configuration for debugging endpoints.
+type DebugConfig struct {
+	StateInspector StateInspectorConfig `config:"state_inspector"`
+}
+
+// Config is the configuration for the API endpoint.
+type Config struct {
+	Enabled            bool        `config:"enabled"`
+	Host               string      `config:"host"`
+	Port               int         `config:"port"`
+	User               string      `config:"named_pipe.user"`
+	SecurityDescriptor string      `config:"named_pipe.security_descriptor"`
+	Debug              DebugConfig `config:"debug"`
+}
+
+// DefaultConfig is the default configuration used by the API endpoint.
+var DefaultConfig = Config{
+	Enabled: false,
+	Host:    "localhost",
+	Port:    5066,
+}
 
 // File mode for the socket file, owner of the process can do everything, member of the group can read.
-const socketFileMode = os.FileMode(0740)
+const socketFileMode = os.FileMode(0o740)

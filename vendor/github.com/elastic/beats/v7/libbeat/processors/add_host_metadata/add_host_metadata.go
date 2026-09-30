@@ -18,108 +18,213 @@
 package add_host_metadata
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"time"
 
-	"github.com/pkg/errors"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+
+	"github.com/elastic/elastic-agent-libs/monitoring"
+	"github.com/elastic/go-sysinfo"
+	"github.com/elastic/go-sysinfo/types"
 
 	"github.com/elastic/beats/v7/libbeat/beat"
-	"github.com/elastic/beats/v7/libbeat/common"
-	"github.com/elastic/beats/v7/libbeat/logp"
-	"github.com/elastic/beats/v7/libbeat/metric/system/host"
+	"github.com/elastic/beats/v7/libbeat/features"
+	"github.com/elastic/beats/v7/libbeat/otel/otelmap"
 	"github.com/elastic/beats/v7/libbeat/processors"
-	jsprocessor "github.com/elastic/beats/v7/libbeat/processors/script/javascript/module/processor"
+	jsprocessor "github.com/elastic/beats/v7/libbeat/processors/script/javascript/module/processor/registry"
 	"github.com/elastic/beats/v7/libbeat/processors/util"
-	"github.com/elastic/go-sysinfo"
+	"github.com/elastic/elastic-agent-libs/config"
+	"github.com/elastic/elastic-agent-libs/logp"
+	"github.com/elastic/elastic-agent-libs/mapstr"
+	"github.com/elastic/elastic-agent-system-metrics/metric/system/host"
+)
+
+const processorName = "add_host_metadata"
+const logName = "processor." + processorName
+
+var (
+	reg *monitoring.Registry
 )
 
 func init() {
-	processors.RegisterPlugin("add_host_metadata", New)
+	processors.RegisterPlugin(processorName, New)
 	jsprocessor.RegisterPlugin("AddHostMetadata", New)
+
+	reg = monitoring.Default.GetOrCreateRegistry(logName, monitoring.DoNotReport)
+}
+
+var _ processors.PdataProcessor = (*addHostMetadata)(nil)
+
+type metrics struct {
+	FQDNLookupFailed *monitoring.Int
+}
+
+// Interfaces to make mocking getting the hostname easier
+type hostInfo interface {
+	Info() types.HostInfo
+	FQDNWithContext(context.Context) (string, error)
+}
+
+type hostInfoFactory func() (hostInfo, error)
+
+type hostMetadataCache struct {
+	sync.Mutex
+	lastUpdate time.Time
+	data       mapstr.Pointer
 }
 
 type addHostMetadata struct {
-	lastUpdate struct {
-		time.Time
-		sync.Mutex
-	}
-	data    common.MapStrPointer
-	geoData common.MapStr
-	config  Config
-	logger  *logp.Logger
+	// One cache for standard hostname, one for FQDN
+	caches          [2]hostMetadataCache
+	geoData         mapstr.M
+	config          Config
+	logger          *logp.Logger
+	metrics         metrics
+	hostInfoFactory hostInfoFactory
 }
 
-const (
-	processorName = "add_host_metadata"
-)
-
 // New constructs a new add_host_metadata processor.
-func New(cfg *common.Config) (processors.Processor, error) {
-	config := defaultConfig()
-	if err := cfg.Unpack(&config); err != nil {
-		return nil, errors.Wrapf(err, "fail to unpack the %v configuration", processorName)
+func New(cfg *config.C, log *logp.Logger) (beat.Processor, error) {
+	c := defaultConfig()
+	if err := cfg.Unpack(&c); err != nil {
+		return nil, fmt.Errorf("fail to unpack the %v configuration: %w", processorName, err)
 	}
 
 	p := &addHostMetadata{
-		config: config,
-		data:   common.NewMapStrPointer(nil),
-		logger: logp.NewLogger("add_host_metadata"),
+		caches: [2]hostMetadataCache{
+			{data: mapstr.NewPointer(nil)},
+			{data: mapstr.NewPointer(nil)},
+		},
+		config: c,
+		logger: log.Named(logName),
+		metrics: metrics{
+			FQDNLookupFailed: monitoring.NewInt(reg, "fqdn_lookup_failed"),
+		},
+		hostInfoFactory: func() (hostInfo, error) { return sysinfo.Host() },
 	}
-	p.loadData()
+	// Fetch and cache the initial host data.
+	if _, err := p.loadData(features.FQDN()); err != nil {
+		return nil, fmt.Errorf("failed to load data: %w", err)
+	}
 
-	if config.Geo != nil {
-		geoFields, err := util.GeoConfigToMap(*config.Geo)
+	if c.Geo != nil {
+		geoFields, err := util.GeoConfigToMap(*c.Geo)
 		if err != nil {
 			return nil, err
 		}
-		p.geoData = common.MapStr{"host": common.MapStr{"geo": geoFields}}
+		p.geoData = mapstr.M{"host": mapstr.M{"geo": geoFields}}
 	}
 
 	return p, nil
 }
 
-// Run enriches the given event with the host meta data
+// Run enriches the given event with the host metadata
 func (p *addHostMetadata) Run(event *beat.Event) (*beat.Event, error) {
-	err := p.loadData()
-	if err != nil {
-		return nil, err
+	// check replace_host_fields field
+	if !p.config.ReplaceFields && skipAddingHostMetadata(event) {
+		return event, nil
 	}
 
-	event.Fields.DeepUpdate(p.data.Get().Clone())
+	data, err := p.loadData(features.FQDN())
+	if err != nil {
+		return nil, fmt.Errorf("error loading data during event update: %w", err)
+	}
+
+	// Superficially this clone seems unnecessary, but it seems to have been
+	// applied as a fix a long time ago -- possibly there can be later processors
+	// or changes to an event that would affect the cached data?
+	event.Fields.DeepUpdate(data.Clone())
 
 	if len(p.geoData) > 0 {
-		event.Fields.DeepUpdate(p.geoData)
+		event.Fields.DeepUpdate(p.geoData.Clone())
 	}
 	return event, nil
 }
 
-func (p *addHostMetadata) expired() bool {
-	if p.config.CacheTTL <= 0 {
-		return true
-	}
+// Ideally we'd be able to implement the Closer interface here and
+// deregister the callback.  But processors that can be used with the
+// `script` processor are not allowed to implement the Closer
+// interface (@see https://github.com/elastic/beats/pull/16349).
+//func (p *addHostMetadata) Close() error {
+//	features.RemoveFQDNOnChangeCallback(processorName)
+//	return nil
+//}
 
-	p.lastUpdate.Lock()
-	defer p.lastUpdate.Unlock()
-
-	if p.lastUpdate.Add(p.config.CacheTTL).After(time.Now()) {
-		return false
+func (p *addHostMetadata) cacheForFQDN(useFQDN bool) *hostMetadataCache {
+	if useFQDN {
+		return &p.caches[1]
 	}
-	p.lastUpdate.Time = time.Now()
-	return true
+	return &p.caches[0]
 }
 
-func (p *addHostMetadata) loadData() error {
-	if !p.expired() {
-		return nil
+func timestampExpired(timestamp time.Time, ttl time.Duration) bool {
+	if ttl <= 0 {
+		return true
 	}
+	return timestamp.Add(ttl).Before(time.Now())
+}
 
-	h, err := sysinfo.Host()
+// loadData update's the processor's associated host metadata
+func (p *addHostMetadata) loadData(useFQDN bool) (mapstr.M, error) {
+	cache := p.cacheForFQDN(useFQDN)
+	cache.Lock()
+	defer cache.Unlock()
+
+	data := cache.data.Get()
+	var err error
+	if data == nil || timestampExpired(cache.lastUpdate, p.config.CacheTTL) {
+		// Data is absent or expired, refresh it.
+		data, err = p.fetchData(useFQDN)
+		if err == nil {
+			cache.data.Set(data)
+		}
+		// Backwards compatibility (for now): cache timestamp is updated even if
+		// the update fails (falls back on the last successful update, and avoids
+		// blocking the pipeline when there are issues with the hostname).
+		cache.lastUpdate = time.Now()
+	}
+	return data, err
+}
+
+func (p *addHostMetadata) fetchData(useFQDN bool) (mapstr.M, error) {
+	h, err := p.hostInfoFactory()
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("error collecting host info: %w", err)
 	}
 
-	data := host.MapHostInfo(h.Info())
+	hInfo := h.Info()
+	hostname := hInfo.Hostname
+
+	if useFQDN {
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
+		defer cancel()
+
+		fqdn, err := h.FQDNWithContext(ctx)
+		if err != nil {
+			// FQDN lookup is "best effort". If it fails, we monitor the failure, fallback to
+			// the OS-reported hostname, and move on.
+			p.metrics.FQDNLookupFailed.Inc()
+			p.logger.Warnf(
+				"unable to lookup FQDN (failed attempt counter: %d): %s, using hostname = %s as FQDN",
+				p.metrics.FQDNLookupFailed.Get(),
+				err.Error(),
+				hostname,
+			)
+		} else {
+			hostname = fqdn
+		}
+	}
+
+	data := host.MapHostInfo(hInfo, hostname)
+
+	if override := beat.GetHostnameOverride(); override != "" {
+		if _, err := data.Put("host.name", override); err != nil {
+			return nil, fmt.Errorf("could not set host.name override: %w", err)
+		}
+	}
+
 	if p.config.NetInfoEnabled {
 		// IP-address and MAC-address
 		var ipList, hwList, err = util.GetNetInfo()
@@ -128,21 +233,97 @@ func (p *addHostMetadata) loadData() error {
 		}
 
 		if len(ipList) > 0 {
-			data.Put("host.ip", ipList)
+			if _, err := data.Put("host.ip", ipList); err != nil {
+				return nil, fmt.Errorf("could not set host.ip: %w", err)
+			}
 		}
 		if len(hwList) > 0 {
-			data.Put("host.mac", hwList)
+			if _, err := data.Put("host.mac", hwList); err != nil {
+				return nil, fmt.Errorf("could not set host.mac: %w", err)
+			}
 		}
 	}
 
 	if p.config.Name != "" {
-		data.Put("host.name", p.config.Name)
+		if _, err := data.Put("host.name", p.config.Name); err != nil {
+			return nil, fmt.Errorf("could not set host.name: %w", err)
+		}
 	}
-	p.data.Set(data)
-	return nil
+
+	return data, nil
+}
+
+// RunPdata enriches the given pcommon.Map directly with host metadata, avoiding
+// the round-trip conversion to/from mapstr.M used by the standard Run path.
+func (p *addHostMetadata) RunPdata(body pcommon.Map) (bool, error) {
+	if !p.config.ReplaceFields && skipAddingHostMetadataPdata(body) {
+		return false, nil
+	}
+
+	data, err := p.loadData(features.FQDN())
+	if err != nil {
+		return false, fmt.Errorf("error loading data during event update: %w", err)
+	}
+
+	if err := otelmap.MergeMapstrIntoPdata(data, body, true); err != nil {
+		return false, fmt.Errorf("error merging host metadata: %w", err)
+	}
+
+	if len(p.geoData) > 0 {
+		if err := otelmap.MergeMapstrIntoPdata(p.geoData, body, true); err != nil {
+			return false, fmt.Errorf("error merging geo data: %w", err)
+		}
+	}
+	return false, nil
+}
+
+func skipAddingHostMetadataPdata(body pcommon.Map) bool {
+	hostVal, ok := body.Get("host")
+	if !ok || hostVal.Type() != pcommon.ValueTypeMap {
+		return false
+	}
+	hostMap := hostVal.Map()
+	_, hasName := hostMap.Get("name")
+	return hostMap.Len() > 0 && (!hasName || hostMap.Len() != 1)
 }
 
 func (p *addHostMetadata) String() string {
 	return fmt.Sprintf("%v=[netinfo.enabled=[%v], cache.ttl=[%v]]",
 		processorName, p.config.NetInfoEnabled, p.config.CacheTTL)
+}
+
+func skipAddingHostMetadata(event *beat.Event) bool {
+	// If host fields exist(besides host.name added by libbeat) in event, skip add_host_metadata.
+	hostFields, err := event.Fields.GetValue("host")
+
+	// Don't skip if there are no fields
+	if err != nil || hostFields == nil {
+		return false
+	}
+
+	switch m := hostFields.(type) {
+	case mapstr.M:
+		// if "name" is the only field, don't skip
+		hasName, _ := m.HasKey("name")
+		if hasName && len(m) == 1 {
+			return false
+		}
+		return true
+	case map[string]any:
+		hostMapStr := mapstr.M(m)
+		// if "name" is the only field, don't skip
+		hasName, _ := hostMapStr.HasKey("name")
+		if hasName && len(m) == 1 {
+			return false
+		}
+		return true
+	case map[string]string:
+		// if "name" is the only field, don't skip
+		if m["name"] != "" && len(m) == 1 {
+			return false
+		}
+		return true
+	default:
+		return false
+	}
 }

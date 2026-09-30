@@ -21,6 +21,8 @@
 package outputs
 
 import (
+	"context"
+
 	"github.com/elastic/beats/v7/libbeat/publisher"
 )
 
@@ -34,7 +36,8 @@ type Client interface {
 	// Using Retry/Cancelled a client can return a batch of unprocessed events to
 	// the publisher pipeline. The publisher pipeline (if configured by the output
 	// factory) will take care of retrying/dropping events.
-	Publish(publisher.Batch) error
+	// Context is intended for carrying request-scoped values, not for cancellation.
+	Publish(context.Context, publisher.Batch) error
 
 	// String identifies the client type and endpoint.
 	String() string
@@ -54,5 +57,5 @@ type Connectable interface {
 	// The connection attempt shall report an error if no connection could been
 	// established within the given time interval. A timeout value of 0 == wait
 	// forever.
-	Connect() error
+	Connect(context.Context) error
 }

@@ -28,22 +28,18 @@ import (
 )
 
 const (
-	//DashboardKey used for registering dashboards in setup cmd
+	// DashboardKey used for registering dashboards in setup cmd
 	DashboardKey = "dashboards"
-	//PipelineKey used for registering pipelines in setup cmd
+	// PipelineKey used for registering pipelines in setup cmd
 	PipelineKey = "pipelines"
-	//IndexManagementKey used for loading all components related to ES index management in setup cmd
+	// IndexManagementKey used for loading all components related to ES index management in setup cmd
 	IndexManagementKey = "index-management"
-
-	//TemplateKey used for loading template in setup cmd
-	//
-	//Deprecated: use IndexManagementKey instead
-	TemplateKey = "template"
-
-	//ILMPolicyKey used for loading ilm in setup cmd
-	//
-	//Deprecated: use IndexManagementKey instead
-	ILMPolicyKey = "ilm-policy"
+	// EnableAllFilesetsKey enables all modules and filesets regardless of config
+	EnableAllFilesetsKey = "enable-all-filesets"
+	// ForceEnableModuleFilesets enables all the filesets contained
+	// in the modules that have been explicitly enabled.  The
+	// requires "modules" to be used.
+	ForceEnableModuleFilesets = "force-enable-module-filesets"
 )
 
 func genSetupCmd(settings instance.Settings, beatCreator beat.Creator) *cobra.Command {
@@ -54,44 +50,43 @@ func genSetupCmd(settings instance.Settings, beatCreator beat.Creator) *cobra.Co
 
  * Index mapping template in Elasticsearch to ensure fields are mapped.
  * Kibana dashboards (where available).
- * ML jobs (where available).
  * Ingest pipelines (where available).
  * ILM policy (for Elasticsearch 6.5 and newer).
 `,
 		Run: func(cmd *cobra.Command, args []string) {
-			beat, err := instance.NewBeat(settings.Name, settings.IndexPrefix, settings.Version)
+			beat, err := instance.NewBeat(settings.Name, settings.IndexPrefix, settings.Version, settings.ElasticLicensed, settings.Initialize)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error initializing beat: %s\n", err)
 				os.Exit(1)
 			}
 
-			var registeredFlags = map[string]bool{
-				DashboardKey:       false,
-				PipelineKey:        false,
-				IndexManagementKey: false,
-				TemplateKey:        false,
-				ILMPolicyKey:       false,
+			registeredFlags := map[string]bool{
+				DashboardKey:              false,
+				PipelineKey:               false,
+				IndexManagementKey:        false,
+				EnableAllFilesetsKey:      false,
+				ForceEnableModuleFilesets: false,
 			}
-			var setupAll = true
+			setupAll := true
 
 			// create collection with registered flags and their values
 			for k := range registeredFlags {
 				val, err := cmd.Flags().GetBool(k)
-				//if flag is not registered, an error is thrown
+				// if flag is not registered, an error is thrown
 				if err != nil {
 					delete(registeredFlags, k)
 					continue
 				}
 				registeredFlags[k] = val
 
-				//if any flag is set via cmd line then only this flag should be run
+				// if any flag is set via cmd line then only this flag should be run
 				if val {
 					setupAll = false
 				}
 			}
 
-			//create the struct to pass on
-			var s = instance.SetupSettings{}
+			// create the struct to pass on
+			s := instance.SetupSettings{}
 			for k, v := range registeredFlags {
 				if setupAll || v {
 					switch k {
@@ -101,10 +96,10 @@ func genSetupCmd(settings instance.Settings, beatCreator beat.Creator) *cobra.Co
 						s.Pipeline = true
 					case IndexManagementKey:
 						s.IndexManagement = true
-					case ILMPolicyKey:
-						s.ILMPolicy = true
-					case TemplateKey:
-						s.Template = true
+					case EnableAllFilesetsKey:
+						s.EnableAllFilesets = true
+					case ForceEnableModuleFilesets:
+						s.ForceEnableModuleFilesets = true
 					}
 				}
 			}
@@ -119,10 +114,8 @@ func genSetupCmd(settings instance.Settings, beatCreator beat.Creator) *cobra.Co
 	setup.Flags().Bool(PipelineKey, false, "Setup Ingest pipelines")
 	setup.Flags().Bool(IndexManagementKey, false,
 		"Setup all components related to Elasticsearch index management, including template, ilm policy and rollover alias")
-	setup.Flags().Bool(TemplateKey, false, "Setup index template")
-	setup.Flags().MarkDeprecated(TemplateKey, fmt.Sprintf("please use --%s instead", IndexManagementKey))
-	setup.Flags().Bool(ILMPolicyKey, false, "Setup ILM policy")
-	setup.Flags().MarkDeprecated(ILMPolicyKey, fmt.Sprintf("please use --%s instead", IndexManagementKey))
+	setup.Flags().Bool("enable-all-filesets", false, "Behave as if all modules and filesets had been enabled")
+	setup.Flags().Bool("force-enable-module-filesets", false, "Behave as if all filesets, within enabled modules, are enabled")
 
 	return &setup
 }

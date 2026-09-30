@@ -17,37 +17,41 @@
 
 package memqueue
 
-import "github.com/elastic/beats/v7/libbeat/publisher"
+import "github.com/elastic/beats/v7/libbeat/publisher/queue"
 
 // producer -> broker API
 
-type pushRequest struct {
-	event publisher.Event
-	seq   uint32
-	state *produceState
-}
+type pushRequest[T any] struct {
+	event T
 
-type producerCancelRequest struct {
-	state *produceState
-	resp  chan producerCancelResponse
-}
+	// The event's encoded size in bytes if the configured output supports
+	// early encoding, 0 otherwise.
+	eventSize int
 
-type producerCancelResponse struct {
-	removed int
+	// The producer that generated this event, or nil if this producer does
+	// not require ack callbacks.
+	producer *ackProducer[T]
+
+	// The index of the event in this producer only. Used to condense
+	// multiple acknowledgments for a producer to a single callback call.
+	producerID producerID
+	resp       chan queue.EntryID
 }
 
 // consumer -> broker API
 
-type getRequest struct {
-	sz   int              // request sz events from the broker
-	resp chan getResponse // channel to send response to
+type getRequest[T any] struct {
+	entryCount   int            // request entryCount events from the broker
+	responseChan chan *batch[T] // channel to send response to
 }
 
-type getResponse struct {
-	ack *ackChan
-	buf []publisher.Event
+// batchDoneMsg is the message sent on a batch's doneChan. The cancelled
+// flag distinguishes a successful completion (set by batch.Done — fire
+// ACK callbacks) from an abandonment (set by batch.Release — remove the
+// batch from pendingBatches and signal deleteChan, but do NOT fire ACK
+// callbacks). The latter exists so the pipeline can reclaim queue-side
+// resources at shutdown without telling input ackers that abandoned
+// events were delivered.
+type batchDoneMsg struct {
+	cancelled bool
 }
-
-type batchAckMsg struct{}
-
-type batchCancelRequest struct{ ack *ackChan }

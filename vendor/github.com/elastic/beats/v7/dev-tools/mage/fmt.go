@@ -25,7 +25,6 @@ import (
 
 	"github.com/magefile/mage/mg"
 	"github.com/magefile/mage/sh"
-	"github.com/pkg/errors"
 
 	"github.com/elastic/beats/v7/dev-tools/mage/gotool"
 )
@@ -50,11 +49,10 @@ func Format() {
 	mg.Deps(GoImports, PythonAutopep8)
 }
 
-// GoImports executes goimports against all .go files in and below the CWD. It
-// ignores vendor/ directories.
+// GoImports executes goimports against all .go files in and below the CWD.
 func GoImports() error {
 	goFiles, err := FindFilesRecursive(func(path string, _ os.FileInfo) bool {
-		return filepath.Ext(path) == ".go" && !strings.Contains(path, "vendor/")
+		return filepath.Ext(path) == ".go"
 	})
 	if err != nil {
 		return err
@@ -64,19 +62,10 @@ func GoImports() error {
 	}
 
 	fmt.Println(">> fmt - goimports: Formatting Go code")
-	if UseVendor {
-		if err := gotool.Install(
-			gotool.Install.Vendored(),
-			gotool.Install.Package(filepath.Join(GoImportsImportPath)),
-		); err != nil {
-			return err
-		}
-	} else {
-		if err := gotool.Get(
-			gotool.Get.Package(filepath.Join(GoImportsImportPath)),
-		); err != nil {
-			return err
-		}
+	if err := gotool.Install(
+		gotool.Install.Package(filepath.Join(GoImportsImportPath)),
+	); err != nil {
+		return err
 	}
 
 	args := append(
@@ -91,9 +80,7 @@ func GoImports() error {
 // ignores build/ directories.
 func PythonAutopep8() error {
 	pyFiles, err := FindFilesRecursive(func(path string, _ os.FileInfo) bool {
-		return filepath.Ext(path) == ".py" &&
-			!strings.Contains(path, "build/") &&
-			!strings.Contains(path, "vendor/")
+		return filepath.Ext(path) == ".py" && !strings.Contains(path, "build/")
 	})
 	if err != nil {
 		return err
@@ -103,7 +90,7 @@ func PythonAutopep8() error {
 	}
 
 	fmt.Println(">> fmt - autopep8: Formatting Python code")
-	ve, err := PythonVirtualenv()
+	ve, err := PythonVirtualenv(false)
 	if err != nil {
 		return err
 	}
@@ -138,8 +125,10 @@ func AddLicenseHeaders() error {
 		license = "ASL2"
 	case "Elastic", "Elastic License":
 		license = "Elastic"
+	case "Elasticv2", "Elastic License 2.0":
+		license = "Elasticv2"
 	default:
-		return errors.Errorf("unknown license type %v", BeatLicense)
+		return fmt.Errorf("unknown license type %v", BeatLicense)
 	}
 
 	licenser := gotool.Licenser

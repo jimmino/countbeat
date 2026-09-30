@@ -22,21 +22,29 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/elastic/beats/v7/libbeat/common"
-	"github.com/elastic/beats/v7/libbeat/common/bus"
+	"github.com/elastic/beats/v7/pkg/autodiscover/bus"
+	"github.com/elastic/elastic-agent-libs/config"
+	"github.com/elastic/elastic-agent-libs/keystore"
+	"github.com/elastic/elastic-agent-libs/logp"
+	"github.com/elastic/elastic-agent-libs/paths"
+	"github.com/elastic/go-ucfg"
 )
 
 // Builder provides an interface by which configs can be built from provider metadata
 type Builder interface {
 	// CreateConfig creates a config from hints passed from providers
-	CreateConfig(event bus.Event) []*common.Config
+	CreateConfig(event bus.Event, options ...ucfg.Option) []*config.C
 }
 
-// Builders is a list of Builder objects
-type Builders []Builder
+// builders is a struct of Builder list objects and a `keystoreProvider`, which
+// has access to a keystores registry
+type Builders struct {
+	builders         []Builder
+	keystoreProvider bus.KeystoreProvider
+}
 
 // BuilderConstructor is a func used to generate a Builder object
-type BuilderConstructor func(*common.Config) (Builder, error)
+type BuilderConstructor func(c *config.C, logger *logp.Logger, paths *paths.Path) (Builder, error)
 
 // AddBuilder registers a new BuilderConstructor
 func (r *registry) AddBuilder(name string, builder BuilderConstructor) error {
@@ -71,7 +79,7 @@ func (r *registry) GetBuilder(name string) BuilderConstructor {
 }
 
 // BuildBuilder reads provider configuration and instantiate one
-func (r *registry) BuildBuilder(c *common.Config) (Builder, error) {
+func (r *registry) BuildBuilder(logger *logp.Logger, c *config.C, paths *paths.Path) (Builder, error) {
 	var config BuilderConfig
 	err := c.Unpack(&config)
 	if err != nil {
@@ -83,15 +91,24 @@ func (r *registry) BuildBuilder(c *common.Config) (Builder, error) {
 		return nil, fmt.Errorf("unknown autodiscover builder %s", config.Type)
 	}
 
-	return builder(c)
+	return builder(c, logger, paths)
 }
 
 // GetConfig creates configs for all builders initialized.
-func (b Builders) GetConfig(event bus.Event) []*common.Config {
-	configs := []*common.Config{}
+func (b Builders) GetConfig(event bus.Event) []*config.C {
+	configs := []*config.C{}
+	var opts []ucfg.Option
 
-	for _, builder := range b {
-		if config := builder.CreateConfig(event); config != nil {
+	if b.keystoreProvider != nil {
+		k8sKeystore := b.keystoreProvider.GetKeystore(event)
+		if k8sKeystore != nil {
+			opts = []ucfg.Option{
+				ucfg.Resolve(keystore.ResolverWrap(k8sKeystore)),
+			}
+		}
+	}
+	for _, builder := range b.builders {
+		if config := builder.CreateConfig(event, opts...); config != nil {
 			configs = append(configs, config...)
 		}
 	}
@@ -100,26 +117,35 @@ func (b Builders) GetConfig(event bus.Event) []*common.Config {
 }
 
 // NewBuilders instances the given list of builders. hintsCfg holds `hints` settings
-// for simplified mode (single 'hints' builder)
-func NewBuilders(bConfigs []*common.Config, hintsCfg *common.Config) (Builders, error) {
+// for simplified mode (single 'hints' builder), `keystoreProvider` has access to keystore registry
+func NewBuilders(
+	logger *logp.Logger,
+	bConfigs []*config.C,
+	hintsCfg *config.C,
+	keystoreProvider bus.KeystoreProvider,
+	paths *paths.Path,
+) (Builders, error) {
 	var builders Builders
 	if hintsCfg.Enabled() {
 		if len(bConfigs) > 0 {
-			return nil, errors.New("hints.enabled is incompatible with manually defining builders")
+			return Builders{}, errors.New("hints.enabled is incompatible with manually defining builders")
 		}
 
 		// pass rest of hints settings to the builder
-		hintsCfg.SetString("type", -1, "hints")
+		err := hintsCfg.SetString("type", -1, "hints")
+		if err != nil {
+			return Builders{}, fmt.Errorf("autodiscover NewBuilder: could not set 'type' to 'hints' on hints config: %w", err)
+		}
 		bConfigs = append(bConfigs, hintsCfg)
 	}
 
 	for _, bcfg := range bConfigs {
-		builder, err := Registry.BuildBuilder(bcfg)
+		builder, err := Registry.BuildBuilder(logger, bcfg, paths)
 		if err != nil {
-			return nil, err
+			return Builders{}, err
 		}
-		builders = append(builders, builder)
+		builders.builders = append(builders.builders, builder)
 	}
-
+	builders.keystoreProvider = keystoreProvider
 	return builders, nil
 }

@@ -18,37 +18,24 @@
 package kafka
 
 import (
-	"errors"
-	"time"
+	"fmt"
 
-	"github.com/Shopify/sarama"
+	"go.uber.org/zap"
 
 	"github.com/elastic/beats/v7/libbeat/beat"
-	"github.com/elastic/beats/v7/libbeat/common"
-	"github.com/elastic/beats/v7/libbeat/logp"
+	"github.com/elastic/beats/v7/libbeat/common/kafka"
 	"github.com/elastic/beats/v7/libbeat/outputs"
 	"github.com/elastic/beats/v7/libbeat/outputs/codec"
 	"github.com/elastic/beats/v7/libbeat/outputs/outil"
+	"github.com/elastic/elastic-agent-libs/config"
+	"github.com/elastic/elastic-agent-libs/logp"
 )
 
 const (
-	defaultWaitRetry = 1 * time.Second
-
-	// NOTE: maxWaitRetry has no effect on mode, as logstash client currently does
-	// not return ErrTempBulkFailure
-	defaultMaxWaitRetry = 60 * time.Second
-
 	logSelector = "kafka"
 )
 
-var (
-	errNoTopicSet = errors.New("No topic configured")
-	errNoHosts    = errors.New("No hosts configured")
-)
-
 func init() {
-	sarama.Logger = kafkaLogger{log: logp.NewLogger(logSelector)}
-
 	outputs.RegisterType("kafka", makeKafka)
 }
 
@@ -56,27 +43,24 @@ func makeKafka(
 	_ outputs.IndexManager,
 	beat beat.Info,
 	observer outputs.Observer,
-	cfg *common.Config,
+	cfg *config.C,
 ) (outputs.Group, error) {
-	log := logp.NewLogger(logSelector)
+	log := beat.Logger.Named(logSelector)
+	kafka.SetSaramaLogger(log.WithOptions(zap.AddCallerSkip(1)))
+
 	log.Debug("initialize kafka output")
 
-	config, err := readConfig(cfg)
+	kConfig, err := ReadConfig(cfg)
 	if err != nil {
 		return outputs.Fail(err)
 	}
 
-	topic, err := outil.BuildSelectorFromConfig(cfg, outil.Settings{
-		Key:              "topic",
-		MultiKey:         "topics",
-		EnableSingleOnly: true,
-		FailEmpty:        true,
-	})
+	topic, err := buildTopicSelector(cfg, log)
 	if err != nil {
 		return outputs.Fail(err)
 	}
 
-	libCfg, err := newSaramaConfig(log, config)
+	libCfg, err := newSaramaConfig(log, kConfig)
 	if err != nil {
 		return outputs.Fail(err)
 	}
@@ -86,19 +70,39 @@ func makeKafka(
 		return outputs.Fail(err)
 	}
 
-	codec, err := codec.CreateEncoder(beat, config.Codec)
+	codec, err := codec.CreateEncoder(beat, kConfig.Codec)
 	if err != nil {
 		return outputs.Fail(err)
 	}
 
-	client, err := newKafkaClient(observer, hosts, beat.IndexPrefix, config.Key, topic, codec, libCfg)
+	client, err := newKafkaClient(observer, hosts, beat.IndexPrefix, kConfig.Key, topic, kConfig.Headers, codec, libCfg, beat.Logger)
 	if err != nil {
 		return outputs.Fail(err)
 	}
 
 	retry := 0
-	if config.MaxRetries < 0 {
+	if kConfig.MaxRetries < 0 {
 		retry = -1
 	}
-	return outputs.Success(config.BulkMaxSize, retry, client)
+	return outputs.Success(kConfig.Queue, kConfig.BulkMaxSize, retry, nil, beat.Logger, beat.Paths, client)
+}
+
+// buildTopicSelector builds the topic selector for standalone Beat and when
+// running under Elastic-Agent based on cfg.
+//
+// When running standalone the topic selector works as expected and documented.
+// When running under Elastic-Agent, dynamic topic selection is also supported
+func buildTopicSelector(cfg *config.C, logger *logp.Logger) (outil.Selector, error) {
+
+	if cfg == nil {
+		return outil.Selector{}, fmt.Errorf("Kafka config cannot be nil") //nolint:staticcheck //Keep old behavior
+	}
+
+	return outil.BuildSelectorFromConfig(cfg, outil.Settings{
+		Key:              "topic",
+		MultiKey:         "topics",
+		EnableSingleOnly: true,
+		FailEmpty:        true,
+		Case:             outil.SelectorKeepCase,
+	}, logger)
 }
