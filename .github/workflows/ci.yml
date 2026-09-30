@@ -1,0 +1,142 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  schedule:
+    # Weekly, to catch newly published vulnerabilities in unchanged code.
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Build and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: go.mod is tidy
+        run: go mod tidy -diff
+
+      - name: vendor/ matches go.mod
+        run: |
+          go mod verify
+          go mod vendor
+          git diff --exit-code --stat -- vendor
+          test -z "$(git status --porcelain -- vendor)"
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l $(git ls-files '*.go' | grep -v '^vendor/'))
+          if [ -n "$unformatted" ]; then echo "Run gofmt on:"; echo "$unformatted"; exit 1; fi
+
+      - name: go vet
+        run: |
+          go vet ./...
+          go vet -tags mage magefile.go
+
+      - name: Test
+        run: go test -race ./...
+
+      - name: Build
+        run: go build ./...
+
+  generated:
+    name: Generated files up to date
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Regenerate fields.yml, include/fields.go, configs and docs
+        run: make update
+
+      - name: No changes
+        run: |
+          git status --porcelain
+          test -z "$(git status --porcelain)" || { git diff --stat; echo "Run 'make update' and commit the result."; exit 1; }
+
+  govulncheck:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Scan
+        run: |
+          go run golang.org/x/vuln/cmd/govulncheck@latest -format json ./... > govulncheck.json
+          # Fail only on vulnerabilities in code countbeat actually calls,
+          # minus reviewed false positives.
+          called=$(jq -r 'select(.finding) | .finding | select(.trace[0].function) | .osv' govulncheck.json | sort -u)
+          allowed=$(grep -o '^GO-[0-9]*-[0-9]*' .github/govulncheck-allowlist.txt || true)
+          unexpected=$(comm -23 <(echo "$called" | sed '/^$/d') <(echo "$allowed" | sort -u))
+          go run golang.org/x/vuln/cmd/govulncheck@latest ./... || true
+          if [ -n "$unexpected" ]; then
+            echo "::error::Reachable vulnerabilities: $(echo $unexpected)"
+            exit 1
+          fi
+
+  integration:
+    name: Elasticsearch integration
+    runs-on: ubuntu-latest
+    services:
+      elasticsearch:
+        # Keep in step with the libbeat version in go.mod.
+        image: docker.elastic.co/elasticsearch/elasticsearch:9.5.4
+        env:
+          discovery.type: single-node
+          xpack.security.enabled: "false"
+          ES_JAVA_OPTS: -Xms1g -Xmx1g
+        ports:
+          - 9200:9200
+        options: >-
+          --health-cmd "curl -fs http://localhost:9200/_cluster/health?wait_for_status=yellow"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        run: go build -o countbeat .
+
+      - name: Set up index template and data stream
+        run: ./countbeat setup --index-management -e -c countbeat.yml --path.data "$RUNNER_TEMP/data"
+
+      - name: Publish events for 20s
+        run: |
+          timeout 20 ./countbeat -e -c countbeat.yml --path.data "$RUNNER_TEMP/data" \
+            -E countbeat.period=250ms > countbeat.log 2>&1 || [ $? -eq 124 ]
+          if grep -E '"log.level":"(error|fatal)"' countbeat.log; then exit 1; fi
+
+      - name: Verify documents in Elasticsearch
+        run: |
+          curl -fsS -XPOST 'localhost:9200/countbeat-*/_refresh' > /dev/null
+          count=$(curl -fsS 'localhost:9200/countbeat-*/_count' | jq .count)
+          echo "Indexed documents: $count"
+          [ "$count" -gt 0 ]
+          type=$(curl -fsS 'localhost:9200/countbeat-*/_mapping/field/counter' | jq -r '[.[].mappings.counter.mapping.counter.type][0]')
+          echo "counter mapped as: $type"
+          [ "$type" = long ]
+
+      - name: Upload countbeat log
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: countbeat-log
+          path: countbeat.log
