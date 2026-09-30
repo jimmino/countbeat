@@ -16,7 +16,6 @@ import (
 type countbeat struct {
 	done   chan struct{}
 	config config.Config
-	client beat.Client
 	logger *logp.Logger
 }
 
@@ -39,13 +38,14 @@ func New(b *beat.Beat, cfg *conf.C) (beat.Beater, error) {
 func (bt *countbeat) Run(b *beat.Beat) error {
 	bt.logger.Info("countbeat is running! Hit CTRL-C to stop it.")
 
-	var err error
-	bt.client, err = b.Publisher.Connect()
+	client, err := b.Publisher.Connect()
 	if err != nil {
 		return err
 	}
+	defer client.Close()
 
 	ticker := time.NewTicker(bt.config.Period)
+	defer ticker.Stop()
 	counter := 1
 	for {
 		select {
@@ -61,7 +61,7 @@ func (bt *countbeat) Run(b *beat.Beat) error {
 				"counter": counter,
 			},
 		}
-		bt.client.Publish(event)
+		client.Publish(event)
 		bt.logger.Info("Event sent")
 		counter++
 	}
@@ -69,6 +69,5 @@ func (bt *countbeat) Run(b *beat.Beat) error {
 
 // Stop stops countbeat.
 func (bt *countbeat) Stop() {
-	bt.client.Close()
 	close(bt.done)
 }

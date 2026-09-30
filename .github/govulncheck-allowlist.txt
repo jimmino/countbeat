@@ -1,0 +1,6 @@
+# Reviewed govulncheck false positives. One ID per line, followed by the reason.
+# Re-check each entry whenever github.com/elastic/beats/v7 is bumped.
+
+GO-2023-2413  CVE-2023-49922, "fixed in v7.17.16". beats/v7 is pinned by pseudo-version
+              (v7.0.0-alpha2.0.<date>), which sorts below v7.17.16 in semver, but the fix
+              (elastic/beats#37330) is present in libbeat/processors/script/javascript/session.go.

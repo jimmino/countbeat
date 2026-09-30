@@ -1,20 +1,42 @@
-BEAT_NAME=countbeat
-BEAT_PATH=github.com/jimmino/countbeat
-BEAT_GOPATH=$(firstword $(subst :, ,${GOPATH}))
-SYSTEM_TESTS=false
-TEST_ENVIRONMENT=false
-ES_BEATS_IMPORT_PATH=github.com/elastic/beats/v7
-ES_BEATS?=./vendor/${ES_BEATS_IMPORT_PATH}
-LIBBEAT_MAKEFILE=$(ES_BEATS)/libbeat/scripts/Makefile
-GOPACKAGES=$(shell go list ${BEAT_PATH}/... | grep -v /tools)
-GOBUILD_FLAGS=-i -ldflags "-X ${ES_BEATS_IMPORT_PATH}/libbeat/version.buildTime=$(NOW) -X ${ES_BEATS_IMPORT_PATH}/libbeat/version.commit=$(COMMIT_ID)"
-MAGE_IMPORT_PATH=github.com/magefile/mage
-NO_COLLECT=true
-CHECK_HEADERS_DISABLED=true
+# Thin wrapper around mage (https://magefile.org/); see `make help` or magefile.go.
+# mage is run from vendor/, so it does not need to be installed.
+MAGE := go run github.com/magefile/mage
 
-# Path to the libbeat Makefile
--include $(LIBBEAT_MAKEFILE)
+.DEFAULT_GOAL := build
 
-.PHONY: copy-vendor
-copy-vendor:
-	mage vendorUpdate
+.PHONY: build
+build: ## Build the countbeat binary
+	$(MAGE) build
+
+.PHONY: test
+test: ## Run unit tests
+	go test -race ./...
+
+.PHONY: update
+update: ## Regenerate fields.yml, include/fields.go, configs and field docs
+	$(MAGE) update
+
+.PHONY: check
+check: ## Format code, regenerate files and fail on uncommitted changes
+	$(MAGE) check
+
+.PHONY: fmt
+fmt: ## Format source code
+	$(MAGE) fmt
+
+.PHONY: clean
+clean: ## Remove build artifacts
+	$(MAGE) clean
+
+.PHONY: package
+package: ## Build distribution packages (requires Docker)
+	$(MAGE) package
+
+.PHONY: vendor
+vendor: ## Tidy go.mod and refresh vendor/
+	go mod tidy
+	go mod vendor
+
+.PHONY: help
+help: ## Show this help
+	@grep -E '^[a-z]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-10s %s\n", $$1, $$2}'
