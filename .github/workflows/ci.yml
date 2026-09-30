@@ -60,10 +60,12 @@ jobs:
       - name: Regenerate fields.yml, include/fields.go, configs and docs
         run: make update
 
+      # include/fields.go is excluded: its compressed bytes depend on the Go
+      # version; TestFieldsGoMatchesFieldsYml checks its content instead.
       - name: No changes
         run: |
-          git status --porcelain
-          test -z "$(git status --porcelain)" || { git diff --stat; echo "Run 'make update' and commit the result."; exit 1; }
+          changes=$(git status --porcelain -- . ':!include/fields.go')
+          test -z "$changes" || { echo "$changes"; git diff --stat; echo "Run 'make update' and commit the result."; exit 1; }
 
   govulncheck:
     name: govulncheck
