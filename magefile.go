@@ -4,6 +4,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -18,9 +19,22 @@ import (
 )
 
 func init() {
+	// dev-tools locates the beats sources with `go list -m`, which returns
+	// nothing in vendor mode, and vendor/ lacks the non-Go files it needs
+	// (fields.yml, config templates). Point it at the module cache instead.
+	out, err := sh.Output("go", "mod", "download", "-json", "github.com/elastic/beats/v7")
+	if err != nil {
+		panic(err)
+	}
+	var mod struct{ Dir string }
+	if err := json.Unmarshal([]byte(out), &mod); err != nil {
+		panic(err)
+	}
+	devtools.SetElasticBeatsDir(mod.Dir)
+
 	devtools.SetBuildVariableSources(devtools.DefaultBeatBuildVariableSources)
 
-	devtools.BeatDescription = "One sentence description of the Beat."
+	devtools.BeatDescription = "Countbeat periodically publishes an event carrying an incrementing counter."
 	devtools.BeatVendor = "Peter Cesnek"
 	devtools.BeatProjectType = devtools.CommunityProject
 }
@@ -45,8 +59,8 @@ func Package() {
 }
 
 // Update updates the generated files (aka make update).
-func Update() error {
-	return sh.Run("make", "update")
+func Update() {
+	mg.SerialDeps(Fields, FieldsGo, Config, FieldDocs)
 }
 
 // Fields generates a fields.yml for the Beat.
@@ -54,9 +68,21 @@ func Fields() error {
 	return devtools.GenerateFieldsYAML()
 }
 
+// FieldsGo generates include/fields.go, which embeds fields.yml in the binary.
+func FieldsGo() error {
+	return devtools.GenerateAllInOneFieldsGo()
+}
+
+// FieldDocs generates docs/fields.asciidoc from fields.yml.
+func FieldDocs() error {
+	return devtools.Docs.FieldDocs("fields.yml")
+}
+
 // Config generates both the short/reference/docker configs.
 func Config() error {
-	return devtools.Config(devtools.AllConfigTypes, devtools.ConfigFileParams{}, ".")
+	p := devtools.DefaultConfigFileParams()
+	p.Templates = append(p.Templates, devtools.OSSBeatDir("_meta/config/*.tmpl"))
+	return devtools.Config(devtools.AllConfigTypes, p, ".")
 }
 
 // Clean cleans all generated files and build artifacts.

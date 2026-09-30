@@ -1,116 +1,102 @@
-# {Beat}
+# Countbeat
 
-Welcome to {Beat}.
+Countbeat is a [Beat](https://www.elastic.co/beats/) built on libbeat that publishes an
+event with an incrementing `counter` field every `countbeat.period` (default `1s`).
 
-Ensure that this folder is at the following location:
-`${GOPATH}/src/github.com/jimmino/countbeat`
+## Requirements
 
-## Getting Started with {Beat}
+* [Go](https://go.dev/dl/) — the version in `go.mod` or newer
+* [Docker](https://www.docker.com/), only for `make package`
 
-### Requirements
+Dependencies are vendored in `vendor/`, so builds work offline. Build tooling is
+[mage](https://magefile.org/), run from `vendor/` through the `Makefile`, so you don't need to install it.
 
-* [Golang](https://golang.org/dl/) 1.7
-
-### Init Project
-To get running with {Beat} and also install the
-dependencies, run the following command:
-
-```
-make setup
-```
-
-It will create a clean git history for each major step. Note that you can always rewrite the history if you wish before pushing your changes.
-
-To push {Beat} in the git repository, run the following commands:
-
-```
-git remote set-url origin https://github.com/jimmino/countbeat
-git push origin master
-```
-
-For further development, check out the [beat developer guide](https://www.elastic.co/guide/en/beats/libbeat/current/new-beat.html).
-
-### Build
-
-To build the binary for {Beat} run the command below. This will generate a binary
-in the same directory with the name countbeat.
+## Build
 
 ```
 make
 ```
 
+This builds the `countbeat` binary in the repository root. `go build .` also works.
 
-### Run
-
-To run {Beat} with debugging output enabled, run:
-
-```
-./countbeat -c countbeat.yml -e -d "*"
-```
-
-
-### Test
-
-To test {Beat}, run the following command:
+## Run
 
 ```
-make testsuite
+./countbeat -c countbeat.yml -e
 ```
 
-alternatively:
+To send events to stdout instead of Elasticsearch:
+
 ```
-make unit-tests
-make system-tests
-make integration-tests
-make coverage-report
+./countbeat -c countbeat.yml -e -E output.elasticsearch.enabled=false -E output.console.enabled=true
 ```
 
-The test coverage is reported in the folder `./build/coverage/`
+To load the index template and data stream into Elasticsearch before the first run:
 
-### Update
+```
+./countbeat setup --index-management -c countbeat.yml -e
+```
 
-Each beat has a template for the mapping in elasticsearch and a documentation for the fields
-which is automatically generated based on `fields.yml` by running the following command.
+## Configuration
+
+| Setting            | Default | Description                  |
+|--------------------|---------|------------------------------|
+| `countbeat.period` | `1s`    | How often an event is sent.  |
+
+The shipped configs (`countbeat.yml`, `countbeat.reference.yml`, `countbeat.docker.yml`) are
+generated from `_meta/config/*.tmpl` and libbeat's templates. Edit the templates, not the
+generated files.
+
+## Test
+
+```
+make test
+```
+
+CI (`.github/workflows/ci.yml`) also does the following:
+
+* runs `govulncheck`, weekly as well as on every PR;
+* checks that generated files are up to date;
+* runs an integration test against Elasticsearch.
+
+## Update generated files
+
+After changing `_meta/fields.yml` or `_meta/config/*.tmpl`, or after bumping libbeat, run:
 
 ```
 make update
 ```
 
+This regenerates `fields.yml`, `include/fields.go`, the `countbeat*.yml` configs and
+`docs/reference/`.
 
-### Cleanup
+## Upgrading libbeat
 
-To clean  {Beat} source code, run the following command:
-
-```
-make fmt
-```
-
-To clean up the build directory and generated artifacts, run:
+Beats releases are tagged `v8.x`/`v9.x`, but the Go module path is `github.com/elastic/beats/v7`.
+You therefore have to pin a release by commit:
 
 ```
-make clean
+go get github.com/elastic/beats/v7@$(gh api repos/elastic/beats/commits/v9.5.4 --jq .sha)
+make vendor
+make update
 ```
 
+Then do the following:
 
-### Clone
-
-To clone {Beat} from the git repository, run the following commands:
-
-```
-mkdir -p ${GOPATH}/src/github.com/jimmino/countbeat
-git clone https://github.com/jimmino/countbeat ${GOPATH}/src/github.com/jimmino/countbeat
-```
-
-
-For further development, check out the [beat developer guide](https://www.elastic.co/guide/en/beats/libbeat/current/new-beat.html).
-
+1. Copy the `replace` block from beats' `go.mod` at that tag into ours. Go does not apply the
+   `replace` directives of dependencies.
+2. Update the Elasticsearch image version in the CI integration job.
+3. Re-check the entries in `.github/govulncheck-allowlist.txt`.
 
 ## Packaging
 
-The beat frameworks provides tools to crosscompile and package your beat for different platforms. This requires [docker](https://www.docker.com/) and vendoring as described above. To build packages of your beat, run the following command:
-
 ```
-make release
+make package
 ```
 
-This will fetch and create all images required for the build process. The whole process to finish can take several minutes.
+This cross-compiles and builds distribution packages in `build/distributions`. It requires Docker.
+Use `PLATFORMS` to limit the target platforms and `SNAPSHOT=true` for snapshot builds.
+
+## Other targets
+
+Run `make help` to list all targets.
